@@ -1,0 +1,35 @@
+.DS_Store
+Thumbs.db
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+id_rsa*
+credentials*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# JavaScript / frontend
+node_modules/
+dist/
+build/
+.next/
+.vite/
+coverage/
+
+# IDE and local tooling
+.idea/
+.vscode/
+*.log
