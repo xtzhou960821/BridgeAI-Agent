@@ -7395,11 +7395,11 @@ GRANT EXECUTE ON FUNCTION bridgeai_audit.event_details_are_safe(JSONB)
 
 | 查询路径 | 谓词／排序 | 决策 | 写放大控制 |
 |---|---|---|---|
-| 项目任务列表 | `organization_id, project_id, status` 等值，`updated_at DESC` | 复用 `ix_workflow_tasks_scope_status` | 已覆盖边界、状态和时间；只有真实计划证明回表是主要成本时才增加有限 `INCLUDE` |
+| 项目任务列表 | `organization_id, project_id, status` 等值，`updated_at DESC, id DESC` seek | 新增 `ix_workflow_tasks_scope_status_seek_v2` | 既有索引缺少同时间戳的 `id` tie-break；新索引通过观察窗后再决定是否替换旧索引 |
 | 多期病害 | 项目／资产／稳定病害，按 `observed_at` | 复用 `ix_damage_observations_entity_time`、`ix_damage_measurements_trend` | 部分索引只收 confirmed 关联；current revision 由既有组合唯一索引点查 |
 | 当前报告版本 | 项目、`report_code`，再按 current pointer 联接 | 复用 `uq_reports_project_code`、`uq_report_revisions_id_scope_report_revision` | 两步均是唯一点查，不再建等价 current 索引 |
 | 待复核 | 项目、`pending/claimed`、priority/due time | 复用 `ix_workflow_reviews_pending` | 只有热集合入索引；领取仍由受控写入、锁和 lease 完成 |
-| Outbox Claim | `pending/retry`、到期时间，按 available/created/id | 复用 `ix_outbox_events_claim` | 与 8.20 `FOR UPDATE SKIP LOCKED` 顺序一致 |
+| Outbox Claim | 租户／项目内 `pending/retry`、到期时间，按 available/created/id | 新增 `ix_outbox_events_claim_scope_v2` | 组织、项目必须作为前导列，避免每个 Worker 扫描其他租户的热集合 |
 | 空间范围 | 组织／项目／资产 + `&&` + `ST_Intersects` | 复用 scope B-tree 与 `ix_spatial_locations_geom_4490` GiST | 标准列为 `geom_4490 geometry(Geometry,4490)`；不以 EPSG:4490 角度计算米制距离 |
 | 名称模糊查找 | 项目内 `lower(assets.name) % lower(:query)` | 新增 `pg_trgm` GIN | 只覆盖有明确入口的资产名；构件别名先用精确 `alias_code`，不为全部 text 建 Trigram |
 | 顺序追加事件 | 月分区内时间范围 | 大分区才启用 BRIN | 只用于与物理写入顺序高相关的 `occurred_at/server_recorded_at`；相关性下降或分区很小时不建 |
@@ -7422,7 +7422,16 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_workflow_reviews_node_execution_fk
 CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_report_revisions_workflow_run_fk
     ON bridgeai_report.report_revisions
        (workflow_run_id, organization_id, project_id, workflow_task_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_workflow_tasks_scope_status_seek_v2
+    ON bridgeai_workflow.workflow_tasks
+       (organization_id, project_id, status, updated_at DESC, id DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_outbox_events_claim_scope_v2
+    ON bridgeai_core.outbox_events
+       (organization_id, project_id, available_at, created_at, id)
+    WHERE status IN ('pending', 'retry');
 ```
+
+`ix_workflow_tasks_scope_status_seek_v2` 与 `ix_outbox_events_claim_scope_v2` 先以新名称并行上线；只有原样查询合同在完整观察窗持续命中新索引、写放大可接受且旧索引无其他登记消费者时，才在独立非事务 revision 中 `DROP INDEX CONCURRENTLY` 旧索引。不得以改名或同名 `IF NOT EXISTS` 跳过有效性检查。
 
 fresh install 可在业务写入前直接于分区父表建 BRIN；PostgreSQL 会为已有及后续新建分区维护匹配子索引。在线父表不能使用 `CREATE INDEX CONCURRENTLY`：须先逐个子表并发建索引，再将子索引 `ATTACH PARTITION` 到父索引。
 
@@ -7437,6 +7446,36 @@ CREATE INDEX IF NOT EXISTS ix_data_access_events_recorded_brin
     ON bridgeai_audit.data_access_events
     USING BRIN (server_recorded_at) WITH (pages_per_range = 32, autosummarize = on);
 ```
+
+在线已有分区不能执行上面的父表 DDL，也不能对父表使用 `CONCURRENTLY`。以 `workflow_events` 已有 `2026_08` 和 DEFAULT 子表为例，完整在线链为：先建立仅含目录定义的父索引，再在事务外逐子表并发建同定义索引，最后短事务逐一 ATTACH；实际迁移必须从 `pg_partition_tree()` 枚举**全部**叶子，包括 DEFAULT，不能只执行示例中的两个子表。
+
+```sql
+-- 1. 短事务；ON ONLY 不扫描子表，父索引在所有叶子 ATTACH 前保持 invalid。
+CREATE INDEX ix_workflow_events_occurred_brin_v2
+    ON ONLY bridgeai_workflow.workflow_events
+    USING BRIN (occurred_at) WITH (pages_per_range = 32, autosummarize = on);
+
+-- 2. 每条都在独立 autocommit 连接执行，不得位于事务块。
+CREATE INDEX CONCURRENTLY ix_workflow_events_2026_08_occurred_brin_v2
+    ON bridgeai_workflow.workflow_events_2026_08
+    USING BRIN (occurred_at) WITH (pages_per_range = 32, autosummarize = on);
+CREATE INDEX CONCURRENTLY ix_workflow_events_default_occurred_brin_v2
+    ON bridgeai_workflow.workflow_events_default
+    USING BRIN (occurred_at) WITH (pages_per_range = 32, autosummarize = on);
+
+-- 3. 短事务；对枚举出的每个叶子重复 ATTACH。
+ALTER INDEX bridgeai_workflow.ix_workflow_events_occurred_brin_v2
+    ATTACH PARTITION bridgeai_workflow.ix_workflow_events_2026_08_occurred_brin_v2;
+ALTER INDEX bridgeai_workflow.ix_workflow_events_occurred_brin_v2
+    ATTACH PARTITION bridgeai_workflow.ix_workflow_events_default_occurred_brin_v2;
+
+-- 4. 只有全部叶子都已附着时父索引才应 valid；否则阻断发布。
+SELECT indexrelid::regclass AS index_name, indisvalid, indisready
+FROM pg_index
+WHERE indexrelid = 'bridgeai_workflow.ix_workflow_events_occurred_brin_v2'::regclass;
+```
+
+`audit_events/server_recorded_at` 与 `data_access_events/server_recorded_at` 使用同一 `ON ONLY → child CONCURRENTLY → ALTER INDEX ... ATTACH PARTITION` 模板。新增月分区时必须先为其创建并附着匹配子索引，或在父索引已 valid 时由 `CREATE TABLE ... PARTITION OF` 自动生成；任何叶子缺失都会使父索引 invalid。
 
 ### 8.22.2 真实查询合同
 
@@ -7543,14 +7582,18 @@ LIMIT 20;
 ```sql
 ANALYZE bridgeai_workflow.workflow_tasks;
 EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, VERBOSE)
-SELECT id, status, updated_at
+SELECT id, thread_id, task_type, status, current_node, progress,
+       requested_at, updated_at, version
 FROM bridgeai_workflow.workflow_tasks
 WHERE organization_id = :organization_id
   AND project_id = :project_id
   AND status = :status
-ORDER BY updated_at DESC
-LIMIT 50;
+  AND (updated_at, id) < (:cursor_updated_at, :cursor_id)
+ORDER BY updated_at DESC, id DESC
+LIMIT :page_size;
 ```
+
+Q1 必须另有至少 100,000 行共享同一 `updated_at` 的 tie-break fixture；验收计划应直接使用 `ix_workflow_tasks_scope_status_seek_v2`，不得出现为了 LIMIT 而扫描／排序整个同时间戳集合。Q5 使用至少 100,000 条其他租户到期事件与目标租户小热集，计划必须以 `ix_outbox_events_claim_scope_v2` 的组织／项目前导条件定位，`Rows Removed by Filter` 不得随其他租户积压线性增长。
 
 验收须解释分区剪枝、计划节点和读块，不强制所有查询都是 Index Scan：小表或低选择率参数使用 Seq Scan 可以正确。当实际／估算行持续相差一个数量级时，先检查倾斜、`ANALYZE` 和扩展统计。覆盖索引的 `INCLUDE` 只放稳定、小型、高频返回列；JSONB、正文和高频更新列默认不放入。
 
@@ -7598,10 +7641,61 @@ SELECT 'audit_events_default', count(*), min(server_recorded_at), max(server_rec
 FROM bridgeai_audit.audit_events_default
 UNION ALL
 SELECT 'data_access_events_default', count(*), min(server_recorded_at), max(server_recorded_at)
-FROM bridgeai_audit.data_access_events_default;
+FROM bridgeai_audit.data_access_events_default
+UNION ALL
+SELECT 'workflow_node_executions_partitioned_default', count(*), min(created_at), max(created_at)
+FROM bridgeai_workflow.workflow_node_executions_partitioned_default;
 ```
 
-发布门禁另查未来 62 天是否有完整边界。DEFAULT 有行时先区分“未预建”与合法迟到数据，禁止改写事件时间。DEFAULT 中有重叠行会阻止直接建分区，迟到月份按以下流程迁移：
+shadow expand 完成后，发布门禁用下列目录查询确认当前 UTC 月至未来 62 天覆盖的每个月均为真实叶子分区，且 `actual_bound` 等于同一行计算出的 UTC 月半开 `expected_bound`；异常结果必须为 0 行。migration manifest 另保存去掉末尾 `WHERE` 的完整 `catalog` 结果，不能只凭关系名宣称完整。
+
+```sql
+WITH parents(schema_name, partition_prefix, parent_rel) AS (
+    VALUES
+      ('bridgeai_workflow', 'workflow_events',
+       to_regclass('bridgeai_workflow.workflow_events')),
+      ('bridgeai_workflow', 'workflow_node_executions_partitioned',
+       to_regclass('bridgeai_workflow.workflow_node_executions_partitioned')),
+      ('bridgeai_audit', 'audit_events',
+       to_regclass('bridgeai_audit.audit_events')),
+      ('bridgeai_audit', 'data_access_events',
+       to_regclass('bridgeai_audit.data_access_events'))
+), expected AS (
+    SELECT p.*, month_start,
+           to_regclass(format(
+               '%I.%I_%s', p.schema_name, p.partition_prefix,
+               to_char(month_start, 'YYYY_MM')
+           )) AS expected_rel,
+           format(
+               'FOR VALUES FROM (%L) TO (%L)',
+               month_start AT TIME ZONE 'UTC',
+               (month_start + INTERVAL '1 month') AT TIME ZONE 'UTC'
+           ) AS expected_bound
+    FROM parents AS p
+    CROSS JOIN LATERAL generate_series(
+        date_trunc('month', clock_timestamp() AT TIME ZONE 'UTC'),
+        date_trunc('month',
+                   (clock_timestamp() + INTERVAL '62 days') AT TIME ZONE 'UTC'),
+        INTERVAL '1 month'
+    ) AS month_start
+), catalog AS (
+    SELECT e.*, pt.isleaf,
+           CASE WHEN e.expected_rel IS NULL THEN NULL
+                ELSE pg_get_expr(c.relpartbound, c.oid) END AS actual_bound
+    FROM expected AS e
+    LEFT JOIN LATERAL pg_partition_tree(e.parent_rel) AS pt
+      ON pt.relid = e.expected_rel
+    LEFT JOIN pg_class AS c ON c.oid = e.expected_rel
+)
+SELECT schema_name, partition_prefix, month_start, expected_rel,
+       expected_bound, actual_bound
+FROM catalog
+WHERE parent_rel IS NULL OR expected_rel IS NULL OR isleaf IS DISTINCT FROM true
+   OR actual_bound IS DISTINCT FROM expected_bound
+ORDER BY schema_name, partition_prefix, month_start;
+```
+
+DEFAULT 有行时先区分“未预建”与合法迟到数据，禁止改写事件时间。DEFAULT 中有重叠行会阻止直接建分区。迟到月份先在事务外保存来源摘要，然后在同一事务内搬移、校验并 ATTACH；任何摘要不一致必须在 COMMIT 前抛错。以下是 `workflow_events` 的完整模板：
 
 ```sql
 CREATE TABLE bridgeai_workflow.workflow_events_2026_07_late
@@ -7613,8 +7707,35 @@ ALTER TABLE bridgeai_workflow.workflow_events_2026_07_late
     CHECK (occurred_at >= TIMESTAMPTZ '2026-07-01 00:00:00+00'
        AND occurred_at <  TIMESTAMPTZ '2026-08-01 00:00:00+00');
 
+-- 与下面事务使用同一数据库连接；临时表记录锁表前的期望集合。
+CREATE TEMP TABLE workflow_events_late_expected (
+    row_count BIGINT NOT NULL,
+    min_id BIGINT,
+    max_id BIGINT,
+    min_key TIMESTAMPTZ,
+    max_key TIMESTAMPTZ,
+    row_sha256 TEXT NOT NULL
+) ON COMMIT PRESERVE ROWS;
+INSERT INTO workflow_events_late_expected
+SELECT count(*), min(id), max(id), min(occurred_at), max(occurred_at),
+       encode(digest(COALESCE(string_agg(row_doc, E'\n' ORDER BY id, occurred_at), ''),
+                     'sha256'), 'hex')
+FROM (
+    SELECT d.id, d.occurred_at, to_jsonb(d)::text AS row_doc
+    FROM bridgeai_workflow.workflow_events_default AS d
+    WHERE d.occurred_at >= TIMESTAMPTZ '2026-07-01 00:00:00+00'
+      AND d.occurred_at <  TIMESTAMPTZ '2026-08-01 00:00:00+00'
+) AS expected_rows;
+
 BEGIN;
 LOCK TABLE bridgeai_workflow.workflow_events_default IN ACCESS EXCLUSIVE MODE;
+DO $empty_staging$
+BEGIN
+    IF EXISTS (SELECT 1 FROM bridgeai_workflow.workflow_events_2026_07_late) THEN
+        RAISE EXCEPTION 'late staging must be empty before copy';
+    END IF;
+END
+$empty_staging$;
 ALTER TABLE bridgeai_workflow.workflow_events_default DISABLE TRIGGER USER;
 INSERT INTO bridgeai_workflow.workflow_events_2026_07_late
 SELECT * FROM bridgeai_workflow.workflow_events_default
@@ -7624,13 +7745,58 @@ DELETE FROM bridgeai_workflow.workflow_events_default
 WHERE occurred_at >= TIMESTAMPTZ '2026-07-01 00:00:00+00'
   AND occurred_at <  TIMESTAMPTZ '2026-08-01 00:00:00+00';
 ALTER TABLE bridgeai_workflow.workflow_events_default ENABLE TRIGGER USER;
+
+-- 必须在 ATTACH/COMMIT 前验证；RAISE 会回滚 DELETE、触发器状态和全部 DDL。
+DO $verify_late_copy$
+DECLARE
+    e_count BIGINT; e_min_id BIGINT; e_max_id BIGINT;
+    e_min_key TIMESTAMPTZ; e_max_key TIMESTAMPTZ; e_hash TEXT;
+    a_count BIGINT; a_min_id BIGINT; a_max_id BIGINT;
+    a_min_key TIMESTAMPTZ; a_max_key TIMESTAMPTZ; a_hash TEXT;
+    remaining BIGINT;
+BEGIN
+    SELECT row_count, min_id, max_id, min_key, max_key, row_sha256
+      INTO STRICT e_count, e_min_id, e_max_id, e_min_key, e_max_key, e_hash
+      FROM workflow_events_late_expected;
+    SELECT count(*), min(id), max(id), min(occurred_at), max(occurred_at),
+           encode(digest(COALESCE(string_agg(row_doc, E'\n' ORDER BY id, occurred_at), ''),
+                         'sha256'), 'hex')
+      INTO a_count, a_min_id, a_max_id, a_min_key, a_max_key, a_hash
+      FROM (
+          SELECT s.id, s.occurred_at, to_jsonb(s)::text AS row_doc
+          FROM bridgeai_workflow.workflow_events_2026_07_late AS s
+      ) AS actual_rows;
+    SELECT count(*) INTO remaining
+      FROM bridgeai_workflow.workflow_events_default
+     WHERE occurred_at >= TIMESTAMPTZ '2026-07-01 00:00:00+00'
+       AND occurred_at <  TIMESTAMPTZ '2026-08-01 00:00:00+00';
+    IF remaining <> 0 OR
+       ROW(a_count, a_min_id, a_max_id, a_min_key, a_max_key, a_hash)
+       IS DISTINCT FROM
+       ROW(e_count, e_min_id, e_max_id, e_min_key, e_max_key, e_hash) THEN
+        RAISE EXCEPTION 'late copy verification failed: expected %, actual %, remaining %',
+            e_count, a_count, remaining;
+    END IF;
+END
+$verify_late_copy$;
+
 ALTER TABLE bridgeai_workflow.workflow_events
     ATTACH PARTITION bridgeai_workflow.workflow_events_2026_07_late
     FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-08-01 00:00:00+00');
 COMMIT;
+
+-- 提交后独立复核路由与摘要；此处失败触发发布中止和前滚修复，不冒充可回滚。
+SELECT tableoid::regclass AS routed_partition, count(*) AS row_count,
+       min(id) AS min_id, max(id) AS max_id,
+       min(occurred_at) AS min_key, max(occurred_at) AS max_key
+FROM bridgeai_workflow.workflow_events
+WHERE occurred_at >= TIMESTAMPTZ '2026-07-01 00:00:00+00'
+  AND occurred_at <  TIMESTAMPTZ '2026-08-01 00:00:00+00'
+GROUP BY tableoid;
+DROP TABLE workflow_events_late_expected;
 ```
 
-该流程仅由迁移所有者执行，期间暂停目标父表写入或由上游缓冲。事务前后比较目标范围的 `count(*)`、`min/max(id)`、`min/max(occurred_at)` 和稳定聚合哈希；任一不一致即回滚。`DISABLE TRIGGER USER` 仅用于移动已经提交且追加不可变的 DEFAULT 行，不是业务删除通道。审计／访问事件使用同一流程，并将核对键换成 `server_recorded_at`。
+该流程仅由迁移所有者执行，期间暂停目标父表写入或由上游缓冲。`DISABLE TRIGGER USER` 仅用于移动已经提交且追加不可变的 DEFAULT 行，不是业务删除通道。审计／访问事件使用同一事务内摘要门禁并将路由键换成 `server_recorded_at`；UUID 事件 ID 不依赖 `min/max(id)`，改为 `count + min/max(server_recorded_at) + 全行稳定 SHA-256`。节点执行 DEFAULT 的迟到行以 `created_at` 为键，且 registry/shadow 双向 anti-join 必须同时为 0 后才可 ATTACH。
 
 ### 8.23.3 父子索引和在线限制
 
@@ -7692,9 +7858,190 @@ CREATE TABLE bridgeai_workflow.workflow_node_executions_partitioned (
           (id, organization_id, project_id, task_id, run_id, created_at)
         ON DELETE RESTRICT
 ) PARTITION BY RANGE (created_at);
+
+CREATE TABLE bridgeai_workflow.workflow_node_executions_partitioned_default
+    PARTITION OF bridgeai_workflow.workflow_node_executions_partitioned DEFAULT;
+CREATE TABLE bridgeai_workflow.workflow_node_executions_partitioned_2026_08
+    PARTITION OF bridgeai_workflow.workflow_node_executions_partitioned
+    FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00');
+
+CREATE INDEX ix_workflow_node_executions_partitioned_run_status
+    ON bridgeai_workflow.workflow_node_executions_partitioned
+       (organization_id, project_id, run_id, status, node_name, created_at);
 ```
 
-`LIKE` 不复制外键，原 PK/UNIQUE 也不能原样放入分区表；正式 Alembic 必须显式重建 task/run 外键、全部 CHECK、不可变控制、RLS/Policy/owner/grant 和父子索引。登记行与分区行在同一事务写入，重试由登记表三个全局唯一约束判断同语义或冲突。
+`LIKE` 不复制外键，原 PK/UNIQUE 也不能原样放入分区表；正式 Alembic 必须显式重建 task/run 外键、全部 CHECK 和不可变控制。DEFAULT 与月分区在 shadow 创建后、开始双写前建立；日常预建、DEFAULT 告警、迟到迁移和普通 DETACH 均把该父表作为第四个受管父表。switch 时父表改为正式名，子表可在独立低风险 revision 中同步改名，不能因名称切换重写行。
+
+registry、shadow 父表、DEFAULT 和月分区都是租户表。下列 DDL 在任何运行时授权前完成；直接 INSERT/UPDATE/DELETE 始终从应用、索引 Worker 和 PUBLIC 撤销，应用只通过同事务受控函数创建 node，普通查询仅访问父表。后续月分区复用相同 owner/RLS/Policy，默认不获得直接 grant。
+
+```sql
+ALTER TABLE bridgeai_workflow.workflow_node_execution_keys
+    OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_workflow.workflow_node_executions_partitioned
+    OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_workflow.workflow_node_executions_partitioned_default
+    OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_workflow.workflow_node_executions_partitioned_2026_08
+    OWNER TO bridgeai_migration_owner;
+
+ALTER TABLE bridgeai_workflow.workflow_node_execution_keys
+    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_workflow.workflow_node_execution_keys
+    FORCE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_workflow.workflow_node_executions_partitioned
+    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_workflow.workflow_node_executions_partitioned
+    FORCE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_workflow.workflow_node_executions_partitioned_default
+    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_workflow.workflow_node_executions_partitioned_default
+    FORCE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_workflow.workflow_node_executions_partitioned_2026_08
+    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_workflow.workflow_node_executions_partitioned_2026_08
+    FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY pl_workflow_node_execution_keys_scope
+ON bridgeai_workflow.workflow_node_execution_keys
+USING (
+    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+) WITH CHECK (
+    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+);
+CREATE POLICY pl_workflow_node_executions_partitioned_scope
+ON bridgeai_workflow.workflow_node_executions_partitioned
+USING (
+    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+) WITH CHECK (
+    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+);
+CREATE POLICY pl_workflow_node_executions_partitioned_default_scope
+ON bridgeai_workflow.workflow_node_executions_partitioned_default
+USING (
+    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+) WITH CHECK (
+    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+);
+CREATE POLICY pl_workflow_node_executions_partitioned_2026_08_scope
+ON bridgeai_workflow.workflow_node_executions_partitioned_2026_08
+USING (
+    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+) WITH CHECK (
+    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+);
+
+REVOKE ALL ON bridgeai_workflow.workflow_node_execution_keys,
+    bridgeai_workflow.workflow_node_executions_partitioned,
+    bridgeai_workflow.workflow_node_executions_partitioned_default,
+    bridgeai_workflow.workflow_node_executions_partitioned_2026_08
+    FROM PUBLIC;
+REVOKE INSERT, UPDATE, DELETE ON bridgeai_workflow.workflow_node_execution_keys,
+    bridgeai_workflow.workflow_node_executions_partitioned,
+    bridgeai_workflow.workflow_node_executions_partitioned_default,
+    bridgeai_workflow.workflow_node_executions_partitioned_2026_08
+    FROM bridgeai_app_rw, bridgeai_index_worker;
+GRANT SELECT ON bridgeai_workflow.workflow_node_execution_keys,
+    bridgeai_workflow.workflow_node_executions_partitioned
+    TO bridgeai_app_rw, bridgeai_readonly;
+```
+
+受控入口接受 shadow 的完整复合行，先登记全局键、锁定并比较已有语义，再写分区父表；任一步失败都回滚同一 PostgreSQL 事务。相同稳定 `id` 和相同 key 语义的重试可补齐此前由迁移所有者留下的 registry-only 行；不同 attempt/idempotency 或同 `id` 不同语义由唯一约束／显式比较拒绝。
+
+```sql
+CREATE OR REPLACE FUNCTION bridgeai_workflow.insert_node_execution_v2(
+    p_execution bridgeai_workflow.workflow_node_executions_partitioned
+) RETURNS TABLE (execution_id UUID, execution_created_at TIMESTAMPTZ)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_workflow
+AS $$
+DECLARE
+    existing_key bridgeai_workflow.workflow_node_execution_keys%ROWTYPE;
+BEGIN
+    IF p_execution.organization_id IS DISTINCT FROM
+       NULLIF(current_setting('app.organization_id', true), '')::uuid
+       OR p_execution.project_id IS DISTINCT FROM
+       NULLIF(current_setting('app.project_id', true), '')::uuid THEN
+        RAISE EXCEPTION 'node execution scope differs from trusted context';
+    END IF;
+
+    INSERT INTO bridgeai_workflow.workflow_node_execution_keys (
+        id, organization_id, project_id, task_id, run_id, node_name,
+        attempt, idempotency_key, created_at
+    ) VALUES (
+        p_execution.id, p_execution.organization_id, p_execution.project_id,
+        p_execution.task_id, p_execution.run_id, p_execution.node_name,
+        p_execution.attempt, p_execution.idempotency_key, p_execution.created_at
+    ) ON CONFLICT (id) DO NOTHING;
+
+    SELECT * INTO STRICT existing_key
+    FROM bridgeai_workflow.workflow_node_execution_keys
+    WHERE id = p_execution.id
+    FOR UPDATE;
+    IF ROW(existing_key.organization_id, existing_key.project_id,
+           existing_key.task_id, existing_key.run_id, existing_key.node_name,
+           existing_key.attempt, existing_key.idempotency_key, existing_key.created_at)
+       IS DISTINCT FROM
+       ROW(p_execution.organization_id, p_execution.project_id,
+           p_execution.task_id, p_execution.run_id, p_execution.node_name,
+           p_execution.attempt, p_execution.idempotency_key, p_execution.created_at) THEN
+        RAISE EXCEPTION 'node execution id reused with different key semantics';
+    END IF;
+
+    INSERT INTO bridgeai_workflow.workflow_node_executions_partitioned
+    SELECT (p_execution).*
+    ON CONFLICT (id, created_at) DO NOTHING;
+    IF NOT FOUND AND NOT EXISTS (
+        SELECT 1
+        FROM bridgeai_workflow.workflow_node_executions_partitioned AS n
+        WHERE (n.id, n.organization_id, n.project_id, n.task_id, n.run_id, n.created_at)
+            = (p_execution.id, p_execution.organization_id, p_execution.project_id,
+               p_execution.task_id, p_execution.run_id, p_execution.created_at)
+    ) THEN
+        RAISE EXCEPTION 'existing node execution differs from registry semantics';
+    END IF;
+    RETURN QUERY SELECT p_execution.id, p_execution.created_at;
+END
+$$;
+
+ALTER FUNCTION bridgeai_workflow.insert_node_execution_v2(
+    bridgeai_workflow.workflow_node_executions_partitioned
+) OWNER TO bridgeai_migration_owner;
+REVOKE ALL ON FUNCTION bridgeai_workflow.insert_node_execution_v2(
+    bridgeai_workflow.workflow_node_executions_partitioned
+) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION bridgeai_workflow.insert_node_execution_v2(
+    bridgeai_workflow.workflow_node_executions_partitioned
+) TO bridgeai_app_rw;
+```
+
+双写、verify 和 contract 都必须保存下列结果，两个 anti-join 与键不一致查询均为 0；失败注入还须证明在 shadow INSERT 被 CHECK/FK 拒绝后 registry 行也随事务回滚。
+
+```sql
+SELECT k.id, k.created_at
+FROM bridgeai_workflow.workflow_node_execution_keys AS k
+LEFT JOIN bridgeai_workflow.workflow_node_executions_partitioned AS n
+  ON (n.id, n.organization_id, n.project_id, n.task_id, n.run_id, n.created_at)
+   = (k.id, k.organization_id, k.project_id, k.task_id, k.run_id, k.created_at)
+WHERE n.id IS NULL;
+
+SELECT n.id, n.created_at
+FROM bridgeai_workflow.workflow_node_executions_partitioned AS n
+LEFT JOIN bridgeai_workflow.workflow_node_execution_keys AS k
+  ON (k.id, k.organization_id, k.project_id, k.task_id, k.run_id, k.created_at)
+   = (n.id, n.organization_id, n.project_id, n.task_id, n.run_id, n.created_at)
+WHERE k.id IS NULL
+   OR ROW(k.node_name, k.attempt, k.idempotency_key)
+      IS DISTINCT FROM ROW(n.node_name, n.attempt, n.idempotency_key);
+```
 
 `workflow_reviews` 在 expand 期新增可空 `node_execution_created_at`，从旧 node 行回填；验证后建立包含该时间的六列外键。`node_execution_id` 为空时新列也为空，非空时两者均非空。旧五列 FK 仅在六列 FK `VALIDATE` 成功、所有实例切换后删除。
 
@@ -7702,7 +8049,7 @@ CREATE TABLE bridgeai_workflow.workflow_node_executions_partitioned (
 
 生命周期使用既有表的真实状态，不强行为每表添加同一状态集：`active` 可读可引用；`archived` 退出热查询但仍保留引用和恢复；`revoked` 立即拒绝新读取／引用；`deleting` 表示已授权且传播中；`deleted` 表示传播已核对；Memory 的 `tombstoned` 只保留 ID、scope、版本／哈希、删除依据和时间，不保留正文。
 
-本章的三个父表都保留 DEFAULT 分区，PostgreSQL 17 因此会拒绝 `DETACH PARTITION ... CONCURRENTLY`。到龄分区须在写入暂停／上游缓冲的维护窗口中，使用短事务执行普通 `ALTER TABLE ... DETACH PARTITION`；不得为追求 concurrent detach 临时移除 DEFAULT 护栏。脱离后转只读归档，记录行数、范围、哈希、备份对象版本和恢复演练。物理 drop 前必须有精确 `retention_executions`，并同时满足：
+本章的四个父表都保留 DEFAULT 分区，PostgreSQL 17 因此会拒绝 `DETACH PARTITION ... CONCURRENTLY`。到龄分区须在写入暂停／上游缓冲的维护窗口中，使用短事务执行普通 `ALTER TABLE ... DETACH PARTITION`；node 分区在 DETACH 前还必须使 registry/shadow 双向 anti-join 为 0，并确认 `workflow_reviews` 六列 FK 无引用。不得为追求 concurrent detach 临时移除 DEFAULT 护栏。脱离后转只读归档，记录行数、范围、哈希、备份对象版本和恢复演练。物理 drop 前必须有精确 `retention_executions`，并同时满足：
 
 1. `legal_hold_checked = true` 且无 legal hold；
 2. `shared_reference_count = 0`，无强 FK、签发报告、Context、血缘或调查仍需数据；
@@ -7718,8 +8065,9 @@ CREATE TABLE bridgeai_workflow.workflow_node_executions_partitioned (
 
 ```text
 1 authorize：校验 actor、scope、retention、legal hold 和强引用
-2 deny-read：同一 PostgreSQL 事务将 active -> revoked/deleting，
-  创建 bridgeai_memory.deletion_jobs/bridgeai_audit.retention_executions、审计事件和 Outbox
+2 deny-read：同一 PostgreSQL 事务将 active -> revoked/deleting；Memory 创建
+  bridgeai_memory.deletion_jobs，Artifact/其他领域对象创建相应领域 job 或
+  bridgeai_audit.retention_executions；两者都写审计事件和 Outbox
 3 cache：按对象版本／命名空间使 Redis 对象、查询和 Context 缓存失效
 4 vector：只删除精确 collection/index_version/source UUID 的 point；
   bridgeai_memory_* 与 bridgeai_knowledge_* 永不交叉
@@ -7762,7 +8110,7 @@ ALTER TABLE bridgeai_workflow.workflow_tasks
     ADD COLUMN IF NOT EXISTS version BIGINT;
 ```
 
-回填 Worker 以 `(created_at,id)` 为稳定 cursor，每批独立短事务，只填 NULL。UUID 只打破同时间并列，不假设时间单调性。
+回填 Worker 以 `(created_at,id)` 为稳定 cursor，每批独立短事务，只填 NULL。UUID 只打破同时间并列，不假设时间单调性。每个组织／项目 shard 只允许一个持有 advisory lease 的顺序 Worker 和一个独立 cursor；该 Worker**不得**使用 `SKIP LOCKED`，遇到较早业务锁时等待或整批超时重试，不能越过被锁行后推进高水位。需要并行时只在互不重叠的 shard 间并行。
 
 ```sql
 WITH batch AS (
@@ -7773,9 +8121,9 @@ WITH batch AS (
       AND (
           t.organization_id IS NULL OR t.idempotency_key IS NULL
           OR t.requested_at IS NULL OR t.updated_by IS NULL OR t.version IS NULL
-      )
+    )
     ORDER BY t.created_at, t.id
-    FOR UPDATE OF t SKIP LOCKED
+    FOR UPDATE OF t
     LIMIT :batch_size
 )
 UPDATE bridgeai_workflow.workflow_tasks AS t
@@ -7789,7 +8137,31 @@ WHERE t.id = b.id
 RETURNING t.created_at, t.id;
 ```
 
-运行器仅在提交后保存最大 cursor；失败从上一已提交 cursor 重放。expand 后新应用双写新旧形状，旧应用仍可写旧列。回填以 `COALESCE(target, derived)` 和行锁／version 避免覆盖并发新值。若必须使用兼容触发器，它须单向、可测试、有明确移除版本，且不能调用外部存储。
+运行器仅在提交后保存最大 cursor；失败从上一已提交 cursor 重放。因为同一 shard 不跳锁，已提交 cursor 之前不存在因锁被越过的 NULL 行。expand 后新应用双写新旧形状，旧应用仍可写旧列。回填以 `COALESCE(target, derived)` 和行锁／version 避免覆盖并发新值。若必须使用兼容触发器，它须单向、可测试、有明确移除版本，且不能调用外部存储。
+
+高水位扫描完成不等于 backfill 完成。停掉旧写入口并等待在途事务结束后，必须重复运行下列**无 cursor** 扫尾批次直至连续两轮返回 0 行；随后 NULL 统计仍须为 0，才可进入约束收紧。该扫尾也覆盖人工修复、超时重试或历史异常造成的低位遗漏。
+
+```sql
+WITH residual AS (
+    SELECT t.id, p.organization_id
+    FROM bridgeai_workflow.workflow_tasks AS t
+    JOIN bridgeai_core.projects AS p ON p.id = t.project_id
+    WHERE t.organization_id IS NULL OR t.idempotency_key IS NULL
+       OR t.requested_at IS NULL OR t.updated_by IS NULL OR t.version IS NULL
+    ORDER BY t.created_at, t.id
+    FOR UPDATE OF t
+    LIMIT :batch_size
+)
+UPDATE bridgeai_workflow.workflow_tasks AS t
+SET organization_id = COALESCE(t.organization_id, r.organization_id),
+    idempotency_key = COALESCE(t.idempotency_key, 'legacy:task:' || t.id::text),
+    requested_at = COALESCE(t.requested_at, t.created_at),
+    updated_by = COALESCE(t.updated_by, t.created_by),
+    version = COALESCE(t.version, 1)
+FROM residual AS r
+WHERE t.id = r.id
+RETURNING t.id;
+```
 
 ### 8.24.3 约束、索引与事务边界
 
@@ -7839,7 +8211,7 @@ switch 先切读后切写。读切换可按组织／项目回退，shadow-read �
 | 1 | `workflow_tasks` | 从 project 回填 organization；`bridge_id → asset_id`、`input_batch_id → acquisition_dataset_id`；移除 thread 全局唯一；补幂等、请求时间、版本、审计列；未知状态阻断 |
 | 2 | `workflow_runs` | 从 task 回填 scope；历史 thread 仅此次复制，之后不自动同步；建 task/run/thread 组合被引用键 |
 | 3 | `workflow_events` | `created_at → occurred_at`，补 recorded/scope/producer key；核对 task/run 后按月完整复制到影子分区表；count/min/max/hash 一致才短事务改名；DEFAULT 为 0 |
-| 4 | `workflow_node_executions` | 先补 scope/audit/version 并核对 run；再建 8.23.4 registry 与 `created_at` 影子分区表，双写并证明 id/attempt/idempotency 全局唯一 |
+| 4 | `workflow_node_executions` | 先补 scope/audit/version 并核对 run；再建 8.23.4 registry、DEFAULT、月分区和 shadow 父表；通过受控函数双写，逐批把同一旧行在一个事务中写入 registry+shadow；双向 anti-join、键一致和 id/attempt/idempotency 全局唯一全部为 0 异常后才切换 |
 | 5 | `workflow_reviews` | 最后补 scope/run/node；expand 新增 `node_execution_created_at`，回填后建六列 `NOT VALID` FK 并 `VALIDATE CONSTRAINT`；保持终态决策和幂等语义 |
 
 每表异常清零、约束验证后才 `ENABLE/FORCE ROW LEVEL SECURITY`。owner 是不登录迁移角色，应用角色无 `BYPASSRLS`；Policy 先于 grant，切换后撤销旧表直访权限。分区子表和 registry 也在清单内。LangGraph Checkpointer 仍只由官方版本管理，不改名、不加业务 FK。
@@ -7861,6 +8233,16 @@ WHERE v.node_execution_id = n.id
   AND v.node_execution_created_at IS NULL;
 
 ALTER TABLE bridgeai_workflow.workflow_reviews
+    ADD CONSTRAINT ck_workflow_reviews_node_execution_time_pair_v2
+    CHECK (
+        (node_execution_id IS NULL AND node_execution_created_at IS NULL)
+        OR
+        (node_execution_id IS NOT NULL AND node_execution_created_at IS NOT NULL)
+    ) NOT VALID;
+ALTER TABLE bridgeai_workflow.workflow_reviews
+    VALIDATE CONSTRAINT ck_workflow_reviews_node_execution_time_pair_v2;
+
+ALTER TABLE bridgeai_workflow.workflow_reviews
     ADD CONSTRAINT fk_workflow_reviews_node_execution_v2
     FOREIGN KEY (
         node_execution_id, organization_id, project_id, task_id, run_id,
@@ -7870,7 +8252,14 @@ ALTER TABLE bridgeai_workflow.workflow_reviews
     ON DELETE RESTRICT NOT VALID;
 ALTER TABLE bridgeai_workflow.workflow_reviews
     VALIDATE CONSTRAINT fk_workflow_reviews_node_execution_v2;
+
+-- 仅在 pair CHECK、六列 FK 均已 VALIDATE，所有实例已切换且观察窗通过后，
+-- 于 contract revision 删除旧五列 FK；在此之前两条 FK 并存。
+ALTER TABLE bridgeai_workflow.workflow_reviews
+    DROP CONSTRAINT fk_workflow_reviews_node_execution_scope;
 ```
+
+六列 FK 使用 PostgreSQL 默认 `MATCH SIMPLE`，所以 pair CHECK 不是文档性断言，而是防止 `node_execution_id` 非空、时间键为空时跳过 FK 的必要数据库约束。负向验收必须分别拒绝“任意 node + NULL 时间键”和“真实 node + 错误非空时间键”；`VALIDATE CONSTRAINT` 后从 `pg_constraint` 同时确认 pair CHECK 与六列 FK 的 `convalidated=true`，再允许旧 FK contract。
 
 ### 8.24.6 Contract、快照、失败与重试门禁
 
@@ -7881,7 +8270,7 @@ contract 不与 switch 同日执行。删除列／表、重编码 ID／分区键
 - switch 后失败：兼容窗内 feature flag 切回旧读，双写不停；修复后再切。
 - contract 后失败：发布 forward-fix 重建兼容视图／列，或从验证快照恢复到新表；不盲目 downgrade 丢弃新写。
 
-最终 contract 硬门禁为：旧实例／Worker 为 0；双读硬失配为 0；所有 FK/CHECK 已验证；无失效索引；DEFAULT 为 0 且未来分区已预建；无未发布 Outbox 遗漏；legal hold、retention、删除 job 通过；RLS/Policy/grant 目录验收通过；代表性查询和恢复演练通过。任一失败都保留兼容形态，不进入破坏性收缩。
+最终 contract 硬门禁为：旧实例／Worker 为 0；双读硬失配为 0；所有高水位回填均完成无 cursor 扫尾且 NULL 为 0；registry/shadow 双向 anti-join 与键不一致为 0；pair CHECK 和六列 FK 均已验证；所有其他 FK/CHECK 已验证；无失效索引；四个 DEFAULT 均为 0 且未来 62 天分区已预建并核对边界；无未发布 Outbox 遗漏；legal hold、retention、删除 job 通过；RLS/Policy/grant 目录验收通过；Q1/Q5 原样查询计划和恢复演练通过。任一失败都保留兼容形态，不进入破坏性收缩。
 
 ## 8.25 备份、恢复与灾难演练
 
