@@ -394,7 +394,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -766,7 +766,7 @@ PostgreSQL 事务包含候选记录、来源关系、状态事件、审计记录
 | 事件类型和版本 | 拒绝未知版本或进入死信 |
 | 操作者权限 | 拒绝且不暴露目标记忆存在性 |
 | 作用域完整性 | rejected；project 记忆必须有 project_id |
-| 来源存在性和版本 | high/critical 阻断；低风险进入待补充来源 |
+| 来源存在性和版本 | high/critical 阻断；低风险转入 review_pending 并补齐来源 |
 | 来源访问权限 | rejected 并记录安全事件 |
 | 内容最小化和敏感信息 | 脱敏、隔离或拒绝 |
 | 重复和版本关系 | 复用、折叠或创建修订 |
@@ -2392,10 +2392,413 @@ restricted 内容默认只记录哈希和标识。审计记录自身也需要访
 
 ## 7.25 评测与测试体系
 
+Memory 评测必须把写入质量、检索质量、上下文压缩、安全隔离、生命周期和工程可用性分开。仅评价“回答是否自然”不能证明 Memory 系统可用。
+
+### 7.25.1 评测集
+
+第一阶段建立版本化评测集：
+
+| 分组 | 建议数量 | 核心覆盖 |
+|---|---:|---|
+| 任务连续性 | 200 | 阶段摘要、中断、交接、跨 thread |
+| 项目上下文 | 250 | 构件别名、术语、报告规则、多期巡检 |
+| 偏好解析 | 100 | 继承、覆盖、撤销和安全策略 |
+| 运行经验 | 100 | 模型、设备、环境和版本适配 |
+| 冲突与更正 | 150 | 人工修订、业务事实冲突、负向记忆 |
+| 权限与隐私 | 200 | 跨组织、跨项目、角色、敏感字段 |
+| 生命周期与删除 | 150 | 过期、撤销、归档、墓碑和删除传播 |
+| 注入与污染 | 150 | 直接、间接、多轮和持久化攻击 |
+
+样例至少包含：
+
+- 输入事件和认证上下文；
+- 权威来源及版本；
+- 预期记忆类型、作用域、风险和状态；
+- 允许与禁止召回集合；
+- 预期 Context Pack 和裁剪项；
+- 预期错误码、降级或人工复核；
+- 删除后各存储的预期状态。
+
+评测集不直接使用生产敏感原文。真实案例经脱敏和审批后进入回归集。
+
+### 7.25.2 写入指标
+
+| 指标 | 定义 | 首期门槛 |
+|---|---|---:|
+| 类型准确率 | 正确 memory_type / 全部候选 | ≥ 95% |
+| 作用域准确率 | 正确主作用域 / 全部候选 | ≥ 98% |
+| 高风险来源完整率 | high/critical active 中来源可解析比例 | 100% |
+| 无来源高风险发布数 | 无来源但进入 active 的数量 | 0 |
+| 重复发布率 | 本应幂等却创建重复 active | ≤ 0.5% |
+| 污染阻断率 | 固定攻击集中进入隔离或拒绝比例 | 100% |
+
+### 7.25.3 检索指标
+
+| 指标 | 首期门槛 |
+|---|---:|
+| 已确认目标记忆 Recall@10 | ≥ 90% |
+| 项目内 Precision@10 | ≥ 90% |
+| 越权召回数量 | 0 |
+| 已撤销、过期或删除记忆召回数量 | 0 |
+| 冲突标记召回率 | 100% |
+| 历史 as_of 版本正确率 | 100% |
+
+相关性评测只在授权候选集合内计算。越权结果即使语义相关也属于安全失败。
+
+### 7.25.4 摘要与 Context 指标
+
+| 指标 | 首期门槛 |
+|---|---:|
+| 关键事实保真率 | ≥ 98% |
+| 数值、单位和时间保真率 | 100% |
+| 否定关系保真率 | 100% |
+| 来源引用可解析率 | 100% |
+| 未经来源支持的新事实率 | 0 |
+| 安全规则和复核结论误裁剪数 | 0 |
+| Context Manifest 覆盖率 | 100% |
+
+关键事实保真使用人工标注和字段级自动比对联合评估。模型 Judge 只能作为辅助信号。
+
+### 7.25.5 生命周期指标
+
+| 指标 | 首期门槛 |
+|---|---:|
+| revoke 对新请求生效 | ≤ 2 s |
+| 删除后再次召回数 | 0 |
+| 删除传播完成率 | 100%，允许 blocked 有明确原因 |
+| 权限变化后旧缓存命中数 | 0 |
+| Outbox 索引最终一致率 | 100% |
+| 备份恢复后的删除复现数 | 0 |
+
+### 7.25.6 性能与稳定性
+
+- 20 个并发会话下，不含模型生成的检索与 Context 构建 P95 不高于 1.5 秒；
+- PostgreSQL 精确查询、语义召回、缓存命中和 Outbox 延迟达到 7.23.4；
+- 连续运行评测覆盖至少一个完整多期巡检样例；
+- 依赖故障时降级路径与 Context Manifest 记录一致；
+- 重试不产生重复候选、重复反馈和重复删除任务。
+
+### 7.25.7 测试层级
+
+**单元测试**
+
+- 作用域解析和继承；
+- 风险下限；
+- 状态迁移；
+- 幂等键；
+- 版本与冲突；
+- Token 预算和裁剪；
+- 缓存键；
+- 错误映射。
+
+**契约测试**
+
+- MemoryRecord、Proposal、Search、Feedback、Correction、Forget；
+- ContextPack 和 ContextManifest；
+- Tool Manifest 与第四章 ToolResult；
+- Workflow State 引用字段。
+
+**集成测试**
+
+- PostgreSQL + Outbox + Qdrant；
+- PostgreSQL + MinIO Artifact；
+- LangGraph Workflow + Checkpointer + Memory Service；
+- Memory + RAG + Business Service；
+- 人工复核、更正和报告签发；
+- 项目归档和删除传播。
+
+**安全负向测试**
+
+- 跨组织和跨项目读取；
+- 伪造角色、ACL 和 Filter；
+- 提示注入和持久化污染；
+- 越权 confirm、revoke、forget；
+- restricted 内容日志和导出；
+- 权限服务异常时默认拒绝。
+
+**故障注入**
+
+- PostgreSQL、Qdrant、MinIO 和 Redis 短时不可用；
+- Outbox 重复、乱序和积压；
+- 摘要超时、非法 Schema 和字段失真；
+- 删除 Worker 部分完成；
+- Checkpoint 与任务记忆不一致；
+- 备份恢复后 ACL 和墓碑重放。
+
+### 7.25.8 回归门
+
+以下变化必须执行全量或受影响分组回归：
+
+- Memory Schema 和状态语义；
+- 提取器、摘要器和 Prompt；
+- Embedding 模型、维度和索引；
+- 排序权重和 Context Policy；
+- ACL、RLS 和 Payload Filter；
+- 保留与删除策略；
+- LangGraph Store 或 Checkpointer 版本；
+- PostgreSQL、Qdrant、MinIO 关键升级。
+
+出现越权召回、删除后召回、无来源 high 发布、否定关系失真或关键审计缺失时，不允许发布。
+
+### 7.25.9 真实项目验收
+
+至少选择一个具有多期数据的桥梁巡检项目，完成：
+
+1. 新任务读取项目术语和报告规则；
+2. 中断后按 Checkpoint 恢复并用任务记忆交接；
+3. 人工纠正构件映射并在后续任务复用；
+4. RAG 依据与 Memory 上下文保持分离；
+5. 项目成员撤权后无法读取旧 Context 缓存；
+6. 归档后停止默认继承；
+7. 删除一条偏好并验证全部派生物；
+8. 使用 Context Manifest 复现签发前上下文。
+
 ## 7.26 第一阶段实施范围与架构决策
+
+### 7.26.1 必须交付
+
+第一阶段必须交付：
+
+1. 任务记忆、项目记忆、用户与组织偏好三类生产能力；
+2. 运行经验候选、确认和受控召回能力；
+3. MemoryRecord、Proposal、Search、Feedback、Correction、Forget 契约；
+4. Context Builder、ContextPack 和 ContextManifest；
+5. 候选提取、风险分级、来源绑定、确认、版本、冲突和隔离；
+6. PostgreSQL 权威存储、MinIO Artifact 和独立语义索引；
+7. Outbox、索引重建、缓存失效和删除传播；
+8. Agent、Workflow、RAG、业务数据和人工复核集成；
+9. 权限、审计、降级、故障恢复和固定评测集；
+10. 一个真实多期桥梁巡检项目的完整验收。
+
+### 7.26.2 首批记忆范围
+
+| 类型 | 首批内容 |
+|---|---|
+| 任务记忆 | 阶段摘要、关键结果引用、复核状态、未决事项和降级原因 |
+| 项目记忆 | 构件别名、项目术语、报告规则、人工修订和项目特殊约束 |
+| 偏好 | 语言、单位、模板、文件命名和通知 |
+| 运行经验 | 两至三个已评测模型/设备组合的适用性和失败模式 |
+
+第一阶段不把完整会话、完整 ToolResult、完整 RAG Evidence Pack 和原始影像作为 MemoryRecord 正文。
+
+### 7.26.3 Milestone 1：契约与权威存储
+
+- 发布 memory-record.v1 和相关 API Schema；
+- 建立 bridgeai_memory 概念实体的 PostgreSQL 迁移；
+- 实现状态机、来源关系、作用域、权限和审计；
+- 建立 MinIO Artifact 映射；
+- 实现独立 Memory 索引集合与 Payload Index；
+- 建立契约测试和权限负向测试。
+
+验收：可以由用户明确操作创建 low 偏好，由人工复核事件创建 high 项目候选，并查询具体版本。
+
+### 7.26.4 Milestone 2：写入治理
+
+- 接入事件白名单；
+- 实现 Candidate Extractor 和确定性最小化；
+- 实现幂等、去重、风险下限和来源校验；
+- 实现规则确认、人工确认、冲突和隔离；
+- 实现 Outbox、索引 Worker 和死信；
+- 建立污染和提示注入测试。
+
+验收：无来源 high 候选无法进入 active，重复事件不产生重复记忆。
+
+### 7.26.5 Milestone 3：检索与 Context Builder
+
+- 实现服务端授权过滤；
+- 实现精确、结构化和语义混合检索；
+- 实现排序、版本折叠、冲突和去重；
+- 实现 Token 预算、分层摘要和压缩校验；
+- 生成 ContextPack 和 ContextManifest；
+- 实现安全缓存键和失效。
+
+验收：固定评测集达到 Recall、保真和越权指标，历史 as_of 查询可复现。
+
+### 7.26.6 Milestone 4：系统集成与降级
+
+- 接入 LangGraph Workflow 节点；
+- 对接 Checkpointer、业务状态和人工复核；
+- 对接 RAG Evidence ID 和业务事实引用；
+- 实现更正、负向记忆、revoke 和 forget；
+- 实现服务、索引、摘要和 Artifact 降级；
+- 完成指标、告警、补偿和运行核对。
+
+验收：依赖故障不绕过权限，主巡检 Workflow 能完成、降级或进入人工复核。
+
+### 7.26.7 Milestone 5：真实项目评测与验收
+
+- 选取一个多期桥梁巡检项目；
+- 导入经确认项目术语、构件映射和报告规则；
+- 验证任务中断、交接和跨 thread；
+- 验证人工修订进入后续任务；
+- 验证撤权、归档和删除；
+- 形成评测报告、问题清单和 V1.0 发布记录。
+
+验收：满足 7.25 的阻断性指标，并由业务、工程、数据和安全负责人共同签署。
+
+### 7.26.8 首期不纳入
+
+- 无审批的跨项目记忆共享；
+- 完全自动的长期经验学习和在线模型更新；
+- 多 Agent 之间自由读写共享记忆；
+- 用 Memory 替代桥梁资产、病害、检测和报告业务表；
+- 用 Memory 替代 RAG 规范和知识证据；
+- 由 Memory 直接触发设备控制、正式评定、处治批准和报告签发；
+- 面向所有业务的通用个人画像；
+- 与首期巡检闭环无关的复杂知识图谱。
+
+### 7.26.9 交付物
+
+- 第七章设计文档；
+- Memory API 与 Pydantic Schema；
+- 第八章可继续细化的概念数据模型；
+- Memory Tool Manifest；
+- Context Policy 配置基线；
+- 安全和权限测试集；
+- 摘要、检索、删除和故障评测集；
+- 运维指标、告警和恢复手册；
+- 真实项目验收报告。
+
+### ADR-007-001：Memory 与 LangGraph Checkpoint 分离
+
+**背景：** Checkpoint 保存 thread 的执行快照，项目记忆需要跨 thread 使用并具有独立权限、版本和生命周期。
+
+**决定：** Checkpointer 只承担图状态恢复；长期任务摘要和项目上下文由独立 Memory Service 管理。
+
+**理由：** 避免把框架内部 State 当成业务知识库，也避免跨 thread 共享依赖复制完整 Checkpoint。
+
+**代价：** 系统需要维护 task_id、thread_id、run_id、memory_id 和 context_manifest_id 的关联。
+
+**约束：** 恢复时以 Checkpoint 和 Workflow 业务状态为权威，任务记忆只用于解释和上下文。
+
+### ADR-007-002：PostgreSQL 为权威存储，语义索引为派生物
+
+**背景：** 记忆需要事务、关系、权限、状态、版本、审计和删除证明，而向量索引擅长语义召回。
+
+**决定：** PostgreSQL 保存权威记忆；Qdrant 或等价索引保存可重建向量和最小 Payload；MinIO 保存大型 Artifact。
+
+**理由：** 分离治理和检索职责，允许索引升级、重建和回滚。
+
+**代价：** 需要 Outbox、索引 Worker 和一致性核对。
+
+**约束：** 语义候选返回后必须回查 PostgreSQL；索引不可成为唯一 ACL 和状态来源。
+
+### ADR-007-003：自动提取默认创建候选记忆
+
+**背景：** 模型提取和摘要可能出现幻觉、作用域错误和持久化污染。
+
+**决定：** 模型和自动归纳只能创建 candidate；发布 active 由规则或人工确认。
+
+**理由：** 把不确定的提取能力与长期影响分离，降低错误记忆跨任务传播。
+
+**代价：** 增加确认队列、候选管理和人工处理。
+
+**约束：** 模型不能提交最终状态、权限、确认级别和发布时间。
+
+### ADR-007-004：权限过滤先于语义召回
+
+**背景：** 先跨项目召回再在应用层隐藏，仍可能泄漏标题、分数、缓存和时序信息。
+
+**决定：** 在 PostgreSQL 和语义索引查询前构造组织、项目、用户、角色、敏感级别和状态过滤。
+
+**理由：** 使未授权内容不进入候选集合和模型上下文。
+
+**代价：** 索引 Payload、ACL 版本和缓存键更复杂，权限变化需要快速失效。
+
+**约束：** Filter 由服务端 Policy Engine 生成，候选返回后再次回查权威权限。
+
+### ADR-007-005：高风险项目事实必须绑定权威来源或人工确认
+
+**背景：** 构件映射、复核规则和历史修订会影响后续任务，错误传播可能造成工程风险。
+
+**决定：** high/critical 内容没有业务记录、人工复核、签发报告或已发布评测时不得 active。
+
+**理由：** 保证高影响上下文可追溯、可复核、可撤销。
+
+**代价：** 某些候选需要等待人工确认，降低即时自动化比例。
+
+**约束：** Memory 只保存必要摘要和来源引用，正式工程结论仍回到权威业务记录。
+
+### ADR-007-006：每次上下文组装生成 Context Manifest
+
+**背景：** 动态检索、排序和压缩会使同一任务在不同时间获得不同上下文。
+
+**决定：** 每次 Context Builder 输出 Pack 时同步持久化 Manifest，记录候选、使用、裁剪、压缩、版本和哈希。
+
+**理由：** 支持审计、历史复现、回归和错误定位。
+
+**代价：** 增加存储、索引和保留成本。
+
+**约束：** Manifest 不复制越权正文；历史读取引用具体 memory_id 和版本。
+
+### ADR-007-007：撤销和删除先停止召回，再清理派生物
+
+**背景：** PostgreSQL、语义索引、缓存和 MinIO 无法在一个事务中原子删除。
+
+**决定：** 先在 PostgreSQL 将目标置为 revoked/deletion_pending，使其立即不可召回；随后异步清理索引、缓存、Artifact 和派生摘要。
+
+**理由：** 即使清理部分失败，也不会继续向新请求暴露内容。
+
+**代价：** 需要 deletion_job、墓碑、重试、死信和一致性检查。
+
+**约束：** 任何部分失败都不得恢复 active；备份恢复必须重放删除状态。
 
 ## 7.27 本章结论
 
+BridgeAI-Agent 的 Memory 不是一个无限增长的聊天记录，也不是一个可以绕过业务数据库和 RAG 的“第二事实库”，而是一套面向桥梁与道路巡检的受治理上下文基础设施。
+
+其核心结构为：
+
+```text
+受控业务事件
+  +
+候选默认与来源绑定
+  +
+任务／项目／偏好／运行经验分层
+  +
+PostgreSQL 权威记录 + 独立语义索引 + MinIO Artifact
+  +
+权限先于召回
+  +
+Context Builder、Token 预算与 Context Manifest
+  +
+反馈、更正、冲突、撤销和显式遗忘
+  +
+Agent / Workflow / RAG / Business Data / Human Review
+```
+
+第一阶段应优先完成同一桥梁多期巡检、任务中断交接、人工修订复用、报告偏好继承和项目归档删除五个闭环。
+
+Memory 的成功标准不是“记得更多”，而是：
+
+- 记住的内容具有明确来源、作用域、版本、权限和有效期；
+- 不把 Checkpoint、业务事实和 RAG 证据混为一体；
+- 不让模型自动写入未经确认的高风险项目事实；
+- 在有限上下文中保留结构化事实、否定关系、单位、时间和人工修订；
+- 能解释每次上下文选择、裁剪和压缩；
+- 能在权限撤销、来源失效和删除后停止召回；
+- 能在 Memory 故障时安全降级，而不是伪造项目历史；
+- 能通过固定评测集和真实巡检项目持续回归。
+
+完成本章后，第八章将进一步定义数据与数据库设计，把 Memory、Workflow、RAG、桥梁资产、构件、病害、检测、报告、复核和审计实体落实为完整的 PostgreSQL Schema、约束、索引和迁移方案。
+
 ## 参考资料
 
+1. [LangGraph 官方文档：Persistence](https://docs.langchain.com/oss/python/langgraph/persistence)
+2. [LangGraph 官方文档：Add and Manage Memory](https://docs.langchain.com/oss/python/langgraph/add-memory)
+3. [LangChain 官方文档：Memory Overview](https://docs.langchain.com/oss/python/concepts/memory)
+4. [LangGraph Python Reference：PostgresStore](https://reference.langchain.com/python/langgraph.store.postgres/base/PostgresStore)
+5. [PostgreSQL 官方文档：Row Security Policies](https://www.postgresql.org/docs/current/ddl-rowsecurity.html)
+6. [Qdrant 官方文档：Payload](https://qdrant.tech/documentation/concepts/payload/)
+7. [Qdrant 官方文档：Filtering](https://qdrant.tech/documentation/search/filtering/)
+8. [MinIO AIStor 官方文档：Object Versioning](https://docs.min.io/aistor/administration/objects-and-versioning/versioning/)
+9. [OWASP Cheat Sheet Series：LLM Prompt Injection Prevention](https://cheatsheetseries.owasp.org/cheatsheets/LLM_Prompt_Injection_Prevention_Cheat_Sheet.html)
+10. [OWASP Cheat Sheet Series：AI Agent Security](https://cheatsheetseries.owasp.org/cheatsheets/AI_Agent_Security_Cheat_Sheet.html)
+
+以上软件与安全资料于 2026-07-29 核验。正式实施时仍应锁定依赖版本，并在升级前重新核验 API、迁移和安全行为。
+
 ## 修订记录
+
+| 版本 | 日期 | 修订说明 |
+|---|---|---|
+| V1.0 | 2026-07-29 | 正式发布，定义面向桥梁与道路巡检的任务记忆、项目上下文、用户与组织偏好、运行经验、候选治理、检索、压缩、权限、遗忘、评测和实施架构 |
