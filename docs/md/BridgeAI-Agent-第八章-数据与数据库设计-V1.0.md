@@ -1293,7 +1293,7 @@ CREATE INDEX ix_dataset_artifacts_artifact_version
 
 `damage_entities` 是跨检测批次保持不变的病害身份；`damage_observations` 是特定时间的一次观测，可在空间候选关联得到确认前暂不归入稳定实体。`damage_revisions` 是观测结论的全追加修订流：`(observation_id, revision_no)` 全局唯一，前驱必须是同一观测的紧邻修订，任何旧修订都不原地改状态。
 
-`damage_observations.current_revision_id/current_revision_no` 是唯一的默认当前指针，两列必须同时为空或同时非空。为解决观测与修订的闭环外键，先创建两张表，再以 `ALTER TABLE` 添加同观测、组织、项目的可延迟组合外键。新观测允许在首个修订落库前保持空指针，但 `pending_review` 和 `confirmed` 观测必须已指向同状态修订。指针切换更新观测的 `updated_at/updated_by/version`，并由 8.19 记录审计事件。
+`damage_observations.current_revision_id/current_revision_no` 是唯一的默认当前指针，两列必须同时为空或同时非空。为解决观测与修订的闭环外键，先创建两张表，再以 `ALTER TABLE` 添加同观测、组织、项目的可延迟组合外键。新观测允许在首个修订落库前保持空指针，但指针一旦非空便不得清空；`pending_review` 和 `confirmed` 观测必须已指向同状态修订，且不得回退到较早状态。指针切换更新观测的 `updated_at/updated_by/version`，并由 8.19 记录审计事件。
 
 ```sql
 CREATE TABLE bridgeai_inspection.damage_entities (
@@ -1825,6 +1825,90 @@ DECLARE
     previous_evolution_state TEXT;
     previous_observed_at TIMESTAMPTZ;
 BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.association_status = 'confirmed' THEN
+            RAISE EXCEPTION
+                'confirmed damage observation history cannot be deleted';
+        END IF;
+        RETURN OLD;
+    END IF;
+
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.current_revision_id IS NOT NULL
+           AND NEW.current_revision_id IS NULL THEN
+            RAISE EXCEPTION
+                'a non-null current revision pointer cannot be cleared';
+        END IF;
+
+        IF (OLD.status = 'pending_review'
+            AND NEW.status NOT IN ('pending_review', 'confirmed', 'voided'))
+           OR (OLD.status = 'confirmed'
+               AND NEW.status NOT IN ('confirmed', 'voided'))
+           OR (OLD.status = 'voided' AND NEW.status <> 'voided') THEN
+            RAISE EXCEPTION
+                'damage observation status cannot transition from % to %',
+                OLD.status, NEW.status;
+        END IF;
+
+        IF OLD.association_status = 'confirmed'
+           AND ROW(
+               NEW.organization_id, NEW.project_id, NEW.asset_id,
+               NEW.campaign_id, NEW.acquisition_dataset_id,
+               NEW.damage_entity_id, NEW.previous_observation_id,
+               NEW.spatial_location_id, NEW.observed_at, NEW.observation_method,
+               NEW.association_status, NEW.association_method,
+               NEW.association_rule_code, NEW.association_evidence,
+               NEW.association_confirmed_at, NEW.association_confirmed_by,
+               NEW.evolution_state
+           ) IS DISTINCT FROM ROW(
+               OLD.organization_id, OLD.project_id, OLD.asset_id,
+               OLD.campaign_id, OLD.acquisition_dataset_id,
+               OLD.damage_entity_id, OLD.previous_observation_id,
+               OLD.spatial_location_id, OLD.observed_at, OLD.observation_method,
+               OLD.association_status, OLD.association_method,
+               OLD.association_rule_code, OLD.association_evidence,
+               OLD.association_confirmed_at, OLD.association_confirmed_by,
+               OLD.evolution_state
+           ) THEN
+            RAISE EXCEPTION
+                'confirmed damage observation history is immutable';
+        END IF;
+    END IF;
+
+    IF NEW.association_status = 'confirmed' THEN
+        -- 同一病害实体是跨期关联的共同串行化点。
+        -- 锁后才读取首次确认和前驱，避免并发创建冲突历史。
+        PERFORM 1
+        FROM bridgeai_inspection.damage_entities AS de
+        WHERE de.id = NEW.damage_entity_id
+          AND de.organization_id = NEW.organization_id
+          AND de.project_id = NEW.project_id
+          AND de.asset_id = NEW.asset_id
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'damage entity does not exist in observation scope'
+                USING ERRCODE = 'foreign_key_violation';
+        END IF;
+
+        IF NEW.evolution_state = 'new'
+           AND EXISTS (
+               SELECT 1
+               FROM bridgeai_inspection.damage_observations AS first_observation
+               WHERE first_observation.organization_id = NEW.organization_id
+                 AND first_observation.project_id = NEW.project_id
+                 AND first_observation.damage_entity_id = NEW.damage_entity_id
+                 AND first_observation.association_status = 'confirmed'
+                 AND first_observation.evolution_state = 'new'
+                 AND first_observation.id <> NEW.id
+           ) THEN
+            RAISE EXCEPTION
+                'damage entity % already has a confirmed new observation',
+                NEW.damage_entity_id
+                USING ERRCODE = 'unique_violation';
+        END IF;
+    END IF;
+
     IF NEW.current_revision_id IS NOT NULL THEN
         SELECT dr.status, dr.predecessor_revision_id, dr.predecessor_revision_no
         INTO current_status, current_predecessor_id, current_predecessor_no
@@ -1910,9 +1994,14 @@ END;
 $$;
 
 CREATE TRIGGER trg_damage_observations_validate
-BEFORE INSERT OR UPDATE ON bridgeai_inspection.damage_observations
+BEFORE INSERT OR UPDATE OR DELETE ON bridgeai_inspection.damage_observations
 FOR EACH ROW
 EXECUTE FUNCTION bridgeai_inspection.validate_damage_observation();
+
+CREATE UNIQUE INDEX uq_damage_observations_one_confirmed_new
+    ON bridgeai_inspection.damage_observations
+       (organization_id, project_id, damage_entity_id)
+    WHERE association_status = 'confirmed' AND evolution_state = 'new';
 
 CREATE INDEX ix_damage_entities_component_status
     ON bridgeai_inspection.damage_entities
@@ -1933,6 +2022,8 @@ CREATE INDEX ix_damage_evidence_artifact_version
 
 `confirmed_by` 与全局 `created_by/updated_by` 一样保存稳定审计主体 UUID，不单独绑定 `users`，以免丢失服务主体或历史身份语义。模型修订必须强关联 `model_inference_runs`，数据库 `CHECK` 保证其只能以 `draft/pending_review` 入库；人工对模型结果的采纳是新建后继 `human + confirmed` 修订，不是把模型修订原地改为已确认。高风险和极高风险修订还必须保存非空确认意见。
 
+一旦观测的跨期关联进入 `association_status = confirmed`，它的组织、项目、资产、批次、数据集、空间位置、观测时间/方法、稳定病害、前驱、演变状态、确认方法/证据/主体全部冻结；修正必须新建观测或后续修订，不得原地重写已被后继演变引用的历史。
+
 `damage_measurements` 的每条量测都显式保存 metric/value/unit/method/uncertainty/source；模型来源还必须指向模型运行。`damage_evidence` 同时强关联 Artifact 和属于该 Artifact 的确定版本，不接受对象键、URL 或多态 ID 替代外键。修订、量测和证据均有数据库追加控制；错误只能在新修订中纠正。
 
 ## 8.14 多期病害关联与历史演变
@@ -1949,6 +2040,8 @@ CREATE INDEX ix_damage_evidence_artifact_version
 | `recurred` | 已判定修复后再次出现 | 前驱必须是同实体的 `repaired` 观测，并保留人工确认或受控规则证据 |
 
 `association_status = candidate` 时只能写 `candidate_damage_entity_id`，不得写最终 `damage_entity_id/evolution_state`。空间距离、模型相似度或单一规则命中都只能生成这种候选；空间近邻方法被 `CHECK` 排除在最终确认方法之外。候选转为 `confirmed` 时，只能保留人工确认（`association_confirmed_by`）或受控规则（`association_rule_code`）其一，并必须写入证据摘要。触发器额外验证前驱的实体、时间顺序和 `recurred <- repaired` 关系。
+
+建立任何 confirmed 跨期关联前先锁定共同 `damage_entities` 行，然后检查前驱和首次确认。每个稳定病害实体只能有一条 `association_status = confirmed AND evolution_state = new` 观测；部分唯一索引与锁后触发器共同阻止顺序和并发重复。
 
 空间候选查询必须先限定组织、项目和资产，再在项目适用投影坐标系内计算米制距离。查询结果只可写入 `candidate_damage_entity_id + association_status = candidate + association_method = spatial_proximity`，禁止直接更新稳定实体关联。
 
