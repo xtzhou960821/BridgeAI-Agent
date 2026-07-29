@@ -6347,6 +6347,29 @@ REVOKE ALL ON FUNCTION bridgeai_core.complete_idempotency_request(
 REVOKE ALL ON FUNCTION bridgeai_core.fail_idempotency_request(UUID, TEXT, BOOLEAN)
     FROM PUBLIC;
 
+CREATE OR REPLACE FUNCTION bridgeai_core.outbox_event_semantic_sha256(
+    p_organization_id UUID, p_project_id UUID, p_aggregate_type TEXT,
+    p_aggregate_id TEXT, p_aggregate_version TEXT, p_event_type TEXT,
+    p_event_schema_version TEXT, p_payload JSONB, p_max_attempts INTEGER
+) RETURNS TEXT
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+SET search_path = pg_catalog, bridgeai_core
+AS $$
+    SELECT encode(public.digest(convert_to(jsonb_build_object(
+        'organization_id', p_organization_id,
+        'project_id', p_project_id,
+        'aggregate_type', p_aggregate_type,
+        'aggregate_id', p_aggregate_id,
+        'aggregate_version', p_aggregate_version,
+        'event_type', p_event_type,
+        'event_schema_version', p_event_schema_version,
+        'payload', p_payload,
+        'max_attempts', p_max_attempts
+    )::text, 'UTF8'), 'sha256'), 'hex');
+$$;
+
 CREATE TABLE bridgeai_core.outbox_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     organization_id UUID NOT NULL,
@@ -6357,6 +6380,7 @@ CREATE TABLE bridgeai_core.outbox_events (
     event_type TEXT NOT NULL,
     event_schema_version TEXT NOT NULL,
     payload JSONB NOT NULL,
+    event_semantic_sha256 TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -6393,6 +6417,15 @@ CREATE TABLE bridgeai_core.outbox_events (
         AND btrim(event_schema_version) <> '' AND btrim(idempotency_key) <> ''
     ),
     CONSTRAINT ck_outbox_events_payload_object CHECK (jsonb_typeof(payload) = 'object'),
+    CONSTRAINT ck_outbox_events_semantic_sha256
+        CHECK (event_semantic_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_outbox_events_semantic_digest CHECK (
+        event_semantic_sha256 = bridgeai_core.outbox_event_semantic_sha256(
+            organization_id, project_id, aggregate_type, aggregate_id,
+            aggregate_version, event_type, event_schema_version, payload,
+            max_attempts
+        )
+    ),
     CONSTRAINT ck_outbox_events_status
         CHECK (status IN ('pending', 'processing', 'retry', 'published', 'dead_letter')),
     CONSTRAINT ck_outbox_events_attempts
@@ -6435,13 +6468,13 @@ BEGIN
     END IF;
     IF ROW(NEW.organization_id, NEW.project_id, NEW.aggregate_type, NEW.aggregate_id,
            NEW.aggregate_version, NEW.event_type, NEW.event_schema_version,
-           NEW.payload, NEW.idempotency_key, NEW.max_attempts,
+           NEW.payload, NEW.event_semantic_sha256, NEW.idempotency_key, NEW.max_attempts,
            NEW.replay_of_event_id, NEW.replay_requested_by,
            NEW.replay_requested_at, NEW.created_at)
        IS DISTINCT FROM
        ROW(OLD.organization_id, OLD.project_id, OLD.aggregate_type, OLD.aggregate_id,
            OLD.aggregate_version, OLD.event_type, OLD.event_schema_version,
-           OLD.payload, OLD.idempotency_key, OLD.max_attempts,
+           OLD.payload, OLD.event_semantic_sha256, OLD.idempotency_key, OLD.max_attempts,
            OLD.replay_of_event_id, OLD.replay_requested_by,
            OLD.replay_requested_at, OLD.created_at) THEN
         RAISE EXCEPTION 'outbox event identity and payload are immutable';
@@ -6478,24 +6511,56 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, bridgeai_core
 AS $$
-DECLARE v_id UUID;
+DECLARE
+    v_id UUID;
+    v_semantic_sha256 TEXT;
+    v_existing bridgeai_core.outbox_events%ROWTYPE;
 BEGIN
     IF p_organization_id::text <> current_setting('app.organization_id', true)
        OR p_project_id::text <> current_setting('app.project_id', true) THEN
         RAISE EXCEPTION 'outbox scope differs from trusted transaction context';
     END IF;
+    v_semantic_sha256 := bridgeai_core.outbox_event_semantic_sha256(
+        p_organization_id, p_project_id, p_aggregate_type, p_aggregate_id,
+        p_aggregate_version, p_event_type, p_event_schema_version, p_payload,
+        p_max_attempts
+    );
     INSERT INTO bridgeai_core.outbox_events (
         organization_id, project_id, aggregate_type, aggregate_id,
         aggregate_version, event_type, event_schema_version, payload,
-        idempotency_key, max_attempts
+        event_semantic_sha256, idempotency_key, max_attempts
     ) VALUES (
         p_organization_id, p_project_id, p_aggregate_type, p_aggregate_id,
         p_aggregate_version, p_event_type, p_event_schema_version, p_payload,
-        p_idempotency_key, p_max_attempts
+        v_semantic_sha256, p_idempotency_key, p_max_attempts
     ) ON CONFLICT (organization_id, project_id, idempotency_key)
-      DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+      DO NOTHING
     RETURNING id INTO v_id;
-    RETURN v_id;
+    IF FOUND THEN
+        RETURN v_id;
+    END IF;
+
+    -- 唯一键冲突在并发事务下会等待获胜者；随后锁定已存行再比较语义。
+    SELECT * INTO STRICT v_existing
+      FROM bridgeai_core.outbox_events
+     WHERE organization_id = p_organization_id AND project_id = p_project_id
+       AND idempotency_key = p_idempotency_key
+     FOR UPDATE;
+    IF v_existing.event_semantic_sha256 <> v_semantic_sha256
+       OR ROW(
+           v_existing.aggregate_type, v_existing.aggregate_id,
+           v_existing.aggregate_version, v_existing.event_type,
+           v_existing.event_schema_version, v_existing.payload,
+           v_existing.max_attempts
+       ) IS DISTINCT FROM ROW(
+           p_aggregate_type, p_aggregate_id, p_aggregate_version, p_event_type,
+           p_event_schema_version, p_payload, p_max_attempts
+       )
+       OR v_existing.replay_of_event_id IS NOT NULL THEN
+        RAISE EXCEPTION 'outbox idempotency key reused with different event semantics'
+            USING ERRCODE = '22000';
+    END IF;
+    RETURN v_existing.id;
 END;
 $$;
 
@@ -6639,12 +6704,14 @@ BEGIN
     END IF;
     INSERT INTO bridgeai_core.outbox_events (
         organization_id, project_id, aggregate_type, aggregate_id, aggregate_version,
-        event_type, event_schema_version, payload, idempotency_key, max_attempts,
+        event_type, event_schema_version, payload, event_semantic_sha256,
+        idempotency_key, max_attempts,
         replay_of_event_id, replay_requested_by, replay_requested_at
     ) VALUES (
         v_source.organization_id, v_source.project_id, v_source.aggregate_type,
         v_source.aggregate_id, v_source.aggregate_version, v_source.event_type,
-        v_source.event_schema_version, v_source.payload, p_new_idempotency_key,
+        v_source.event_schema_version, v_source.payload,
+        v_source.event_semantic_sha256, p_new_idempotency_key,
         v_source.max_attempts, v_source.id, v_actor, clock_timestamp()
     ) RETURNING id INTO v_new_id;
     RETURN v_new_id;
@@ -6770,9 +6837,60 @@ $$;
 REVOKE ALL ON FUNCTION bridgeai_core.request_artifact_version_deletion(
     UUID, UUID, TEXT, TEXT
 ) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION bridgeai_core.has_controlled_retention_outbox_access(
+    p_organization_id UUID, p_project_id UUID, p_aggregate_type TEXT,
+    p_aggregate_id TEXT, p_event_type TEXT, p_event_schema_version TEXT,
+    p_payload JSONB
+) RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY INVOKER
+SET search_path = pg_catalog, bridgeai_core, bridgeai_audit
+AS $$
+BEGIN
+    RETURN (
+    SELECT current_setting('app.actor_type', true) = 'user'
+       AND bridgeai_core.has_organization_access(p_organization_id)
+       AND p_project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+       AND p_aggregate_type = 'artifact_version'
+       AND p_event_type = 'artifact.deletion_requested'
+       AND p_event_schema_version = '1'
+       AND p_payload ->> 'artifact_version_id' = p_aggregate_id
+       AND EXISTS (
+           SELECT 1
+           FROM bridgeai_audit.retention_executions AS re
+           JOIN bridgeai_core.project_memberships AS pm
+             ON pm.organization_id = re.organization_id
+            AND pm.project_id = re.project_id
+            AND pm.principal_type = 'user'
+            AND pm.user_id = re.requested_by
+           WHERE re.id = CASE
+               WHEN p_payload ->> 'retention_execution_id' ~
+                    '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+               THEN (p_payload ->> 'retention_execution_id')::uuid
+               ELSE NULL
+           END
+             AND re.organization_id = p_organization_id
+             AND re.project_id = p_project_id
+             AND re.target_type = 'artifact_version'
+             AND re.target_id = p_aggregate_id
+             AND re.action = 'delete_object' AND re.status = 'running'
+             AND re.requested_by = NULLIF(current_setting('app.actor_id', true), '')::uuid
+             AND pm.role_code = 'retention_operator' AND pm.status = 'active'
+             AND pm.valid_from <= statement_timestamp()
+             AND (pm.valid_to IS NULL OR pm.valid_to > statement_timestamp())
+       )
+    );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION bridgeai_core.has_controlled_retention_outbox_access(
+    UUID, UUID, TEXT, TEXT, TEXT, TEXT, JSONB
+) FROM PUBLIC;
 ```
 
-`SKIP LOCKED` 使并发 Worker 不会领取同一行；`attempt_count` 在 Claim 时递增，达到上限必然死信。重放函数只接受死信源行，完整复制聚合身份、事件类型/版本和 payload，只产生新 ID、新幂等键与服务器记录的重放人/时间。Lease Reaper 只把过期 `processing` 转为 `retry/dead_letter`，不执行业务补偿。核对任务按 `aggregate_type/id/version + event_type` 比较 PostgreSQL 权威状态、Outbox 终态和外部派生版本。
+Outbox 幂等键同时冻结租户、聚合身份/版本、事件类型/模式版本、规范化 JSONB payload 和重试上限。同 key 同语义返回原 UUID；任一语义字段不同则明确冲突并回滚，包括两个并发事务竞争同 key 的情形。`SKIP LOCKED` 使并发 Worker 不会领取同一行；`attempt_count` 在 Claim 时递增，达到上限必然死信。重放函数只接受死信源行，完整复制聚合身份、事件类型/版本和 payload，只产生新 ID、新幂等键与服务器记录的重放人/时间。Lease Reaper 只把过期 `processing` 转为 `retry/dead_letter`，不执行业务补偿。核对任务按 `aggregate_type/id/version + event_type` 比较 PostgreSQL 权威状态、Outbox 终态和外部派生版本。
 
 ### 8.20.1 跨存储创建与激活
 
@@ -6871,6 +6989,9 @@ ALTER FUNCTION bridgeai_core.complete_idempotency_request(UUID, TEXT, TEXT, UUID
     OWNER TO bridgeai_migration_owner;
 ALTER FUNCTION bridgeai_core.fail_idempotency_request(UUID, TEXT, BOOLEAN)
     OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.outbox_event_semantic_sha256(
+    UUID, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, INTEGER
+) OWNER TO bridgeai_migration_owner;
 ALTER FUNCTION bridgeai_core.enqueue_outbox_event(
     UUID, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, TEXT, INTEGER
 ) OWNER TO bridgeai_migration_owner;
@@ -6886,6 +7007,9 @@ ALTER FUNCTION bridgeai_core.replay_dead_letter_event(UUID, TEXT)
     OWNER TO bridgeai_migration_owner;
 ALTER FUNCTION bridgeai_core.request_artifact_version_deletion(UUID, UUID, TEXT, TEXT)
     OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.has_controlled_retention_outbox_access(
+    UUID, UUID, TEXT, TEXT, TEXT, TEXT, JSONB
+) OWNER TO bridgeai_migration_owner;
 ALTER FUNCTION bridgeai_audit.event_details_are_safe(JSONB)
     OWNER TO bridgeai_migration_owner;
 
@@ -6898,6 +7022,9 @@ REVOKE ALL ON FUNCTION bridgeai_core.register_idempotency_request(
     UUID, UUID, TEXT, TEXT, TEXT, TIMESTAMPTZ
 ), bridgeai_core.complete_idempotency_request(UUID, TEXT, TEXT, UUID, UUID),
    bridgeai_core.fail_idempotency_request(UUID, TEXT, BOOLEAN),
+   bridgeai_core.outbox_event_semantic_sha256(
+       UUID, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, INTEGER
+   ),
    bridgeai_core.enqueue_outbox_event(
        UUID, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, TEXT, INTEGER
    ), bridgeai_core.claim_outbox_events(UUID, UUID, TEXT, INTEGER, INTERVAL),
@@ -7073,8 +7200,20 @@ CREATE POLICY idempotency_requests_project_isolation
 ALTER TABLE bridgeai_core.outbox_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bridgeai_core.outbox_events FORCE ROW LEVEL SECURITY;
 CREATE POLICY outbox_events_project_worker ON bridgeai_core.outbox_events
-    USING (bridgeai_core.has_project_access(organization_id, project_id, true))
-    WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true));
+    USING (
+        bridgeai_core.has_project_access(organization_id, project_id, true)
+        OR bridgeai_core.has_controlled_retention_outbox_access(
+            organization_id, project_id, aggregate_type, aggregate_id,
+            event_type, event_schema_version, payload
+        )
+    )
+    WITH CHECK (
+        bridgeai_core.has_project_access(organization_id, project_id, true)
+        OR bridgeai_core.has_controlled_retention_outbox_access(
+            organization_id, project_id, aggregate_type, aggregate_id,
+            event_type, event_schema_version, payload
+        )
+    );
 
 ALTER TABLE bridgeai_audit.audit_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bridgeai_audit.audit_events FORCE ROW LEVEL SECURITY;
@@ -7134,7 +7273,30 @@ CREATE POLICY retention_executions_scope ON bridgeai_audit.retention_executions
                 ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END)
     WITH CHECK (CASE WHEN project_id IS NULL
                      THEN bridgeai_core.has_organization_access(organization_id)
-                     ELSE bridgeai_core.has_project_access(organization_id, project_id, true) END);
+                     ELSE bridgeai_core.has_project_access(organization_id, project_id, true)
+                       OR (
+                           -- 仅为受控 Artifact 删除的 retention 状态推进开精确通道；
+                           -- retention_operator 不加入通用写角色白名单。
+                           bridgeai_core.has_organization_access(organization_id)
+                           AND project_id = NULLIF(
+                               current_setting('app.project_id', true), ''
+                           )::uuid
+                           AND current_setting('app.actor_type', true) = 'user'
+                           AND EXISTS (
+                               SELECT 1 FROM bridgeai_core.project_memberships AS pm
+                               WHERE pm.organization_id = retention_executions.organization_id
+                                 AND pm.project_id = retention_executions.project_id
+                                 AND pm.principal_type = 'user'
+                                 AND pm.user_id = NULLIF(
+                                     current_setting('app.actor_id', true), ''
+                                 )::uuid
+                                 AND pm.role_code = 'retention_operator'
+                                 AND pm.status = 'active'
+                                 AND pm.valid_from <= statement_timestamp()
+                                 AND (pm.valid_to IS NULL
+                                      OR pm.valid_to > statement_timestamp())
+                           )
+                       ) END);
 
 ALTER TABLE bridgeai_audit.lineage_edges ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bridgeai_audit.lineage_edges FORCE ROW LEVEL SECURITY;
@@ -7221,7 +7383,7 @@ GRANT EXECUTE ON FUNCTION bridgeai_audit.event_details_are_safe(JSONB)
     TO bridgeai_audit_writer;
 ```
 
-本节新增 13 个逻辑租户表（含两个分区父表），物理目录中为 15 个关系（另含两个 default partition）；全部在授权前 `ENABLE` + `FORCE ROW LEVEL SECURITY` 并有可执行 Policy。应以 `pg_class.relrowsecurity/relforcerowsecurity`、`pg_policy`、`pg_roles` 和 `information_schema.role_table_grants` 验收，不以 SQL 文本或逻辑/物理数量混报代替目录证据。
+本节新增 13 个逻辑租户表（含两个分区父表），物理目录中为 15 个关系（另含两个 default partition）；全部在授权前 `ENABLE` + `FORCE ROW LEVEL SECURITY` 并有可执行 Policy。`retention_operator` 只在 `retention_executions` 的受控状态推进 Policy 中获得精确通道，不进入通用 `p_write` 白名单，也不获得底表权限。应以 `pg_class.relrowsecurity/relforcerowsecurity`、`pg_policy`、`pg_roles` 和 `information_schema.role_table_grants` 验收，不以 SQL 文本或逻辑/物理数量混报代替目录证据。
 
 任何 `SECURITY DEFINER` 函数都必须由不登录所有者持有，固定只含 `pg_catalog` 和所需 Schema 的 `search_path`，所有对象使用 Schema 限定名，并在授予指定角色前先 `REVOKE ... FROM PUBLIC`。不得在函数中拼接请求提供的 SQL、表名或 `search_path`。
 
