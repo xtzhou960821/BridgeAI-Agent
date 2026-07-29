@@ -139,11 +139,839 @@ CREATE SCHEMA IF NOT EXISTS bridgeai_audit;
 
 ## 8.8 组织、用户、角色与项目模型
 
+身份域将人员用户和服务主体分表存储，避免将 API 客户端伪装为人员账号。`users.status = 'disabled'` 只禁止后续登录，不删除用户、成员资格或已有审计主体 UUID。组织成员资格是人员进入组织的权威记录；项目成员资格在此基础上授予项目访问，或直接授予同组织的服务主体。
+
+```sql
+CREATE TABLE bridgeai_identity.organizations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT uq_organizations_code UNIQUE (organization_code),
+    CONSTRAINT ck_organizations_code_nonblank CHECK (btrim(organization_code) <> ''),
+    CONSTRAINT ck_organizations_name_nonblank CHECK (btrim(name) <> ''),
+    CONSTRAINT ck_organizations_status CHECK (status IN ('active', 'suspended', 'closed')),
+    CONSTRAINT ck_organizations_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_organizations_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_identity.users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    user_code TEXT NOT NULL,
+    email TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    disabled_at TIMESTAMPTZ,
+    disabled_reason TEXT,
+    last_login_at TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_users_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT uq_users_id_organization UNIQUE (id, organization_id),
+    CONSTRAINT uq_users_organization_code UNIQUE (organization_id, user_code),
+    CONSTRAINT ck_users_code_nonblank CHECK (btrim(user_code) <> ''),
+    CONSTRAINT ck_users_email_normalized
+        CHECK (email = lower(btrim(email)) AND position('@' IN email) > 1),
+    CONSTRAINT ck_users_display_name_nonblank CHECK (btrim(display_name) <> ''),
+    CONSTRAINT ck_users_status CHECK (status IN ('invited', 'active', 'locked', 'disabled')),
+    CONSTRAINT ck_users_disabled_state CHECK (
+        (status = 'disabled' AND disabled_at IS NOT NULL)
+        OR (status <> 'disabled' AND disabled_at IS NULL AND disabled_reason IS NULL)
+    ),
+    CONSTRAINT ck_users_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_users_version_positive CHECK (version > 0)
+);
+
+CREATE UNIQUE INDEX uq_users_organization_email_ci
+    ON bridgeai_identity.users (organization_id, lower(email));
+
+CREATE TABLE bridgeai_identity.service_principals (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    principal_code TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    authentication_method TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    credential_expires_at TIMESTAMPTZ,
+    disabled_at TIMESTAMPTZ,
+    last_authenticated_at TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_service_principals_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT uq_service_principals_id_organization UNIQUE (id, organization_id),
+    CONSTRAINT uq_service_principals_organization_code
+        UNIQUE (organization_id, principal_code),
+    CONSTRAINT ck_service_principals_code_nonblank CHECK (btrim(principal_code) <> ''),
+    CONSTRAINT ck_service_principals_name_nonblank CHECK (btrim(display_name) <> ''),
+    CONSTRAINT ck_service_principals_auth_method
+        CHECK (authentication_method IN ('mtls', 'private_key_jwt', 'client_secret')),
+    CONSTRAINT ck_service_principals_status
+        CHECK (status IN ('active', 'suspended', 'disabled')),
+    CONSTRAINT ck_service_principals_disabled_state CHECK (
+        (status = 'disabled' AND disabled_at IS NOT NULL)
+        OR (status <> 'disabled' AND disabled_at IS NULL)
+    ),
+    CONSTRAINT ck_service_principals_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_service_principals_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_identity.organization_memberships (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+    role_code TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    valid_to TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_organization_memberships_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_organization_memberships_user_scope
+        FOREIGN KEY (user_id, organization_id)
+        REFERENCES bridgeai_identity.users (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT uq_organization_memberships_id_organization UNIQUE (id, organization_id),
+    CONSTRAINT uq_organization_memberships_organization_user
+        UNIQUE (organization_id, user_id),
+    CONSTRAINT ck_organization_memberships_role_nonblank CHECK (btrim(role_code) <> ''),
+    CONSTRAINT ck_organization_memberships_status
+        CHECK (status IN ('invited', 'active', 'suspended', 'revoked')),
+    CONSTRAINT ck_organization_memberships_valid_range
+        CHECK (valid_to IS NULL OR valid_to > valid_from),
+    CONSTRAINT ck_organization_memberships_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_core.projects (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'planning',
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    valid_to TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_projects_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT uq_projects_id_organization UNIQUE (id, organization_id),
+    CONSTRAINT uq_projects_organization_code UNIQUE (organization_id, project_code),
+    CONSTRAINT ck_projects_code_nonblank CHECK (btrim(project_code) <> ''),
+    CONSTRAINT ck_projects_name_nonblank CHECK (btrim(name) <> ''),
+    CONSTRAINT ck_projects_status
+        CHECK (status IN ('planning', 'active', 'suspended', 'completed', 'archived')),
+    CONSTRAINT ck_projects_valid_range CHECK (valid_to IS NULL OR valid_to > valid_from),
+    CONSTRAINT ck_projects_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_projects_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_core.project_memberships (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    principal_type TEXT NOT NULL,
+    user_id UUID,
+    service_principal_id UUID,
+    role_code TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    valid_to TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_project_memberships_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_project_memberships_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_project_memberships_user_organization_membership
+        FOREIGN KEY (organization_id, user_id)
+        REFERENCES bridgeai_identity.organization_memberships (organization_id, user_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_project_memberships_service_principal_scope
+        FOREIGN KEY (service_principal_id, organization_id)
+        REFERENCES bridgeai_identity.service_principals (id, organization_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_project_memberships_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT ck_project_memberships_principal_shape CHECK (
+        (principal_type = 'user' AND user_id IS NOT NULL AND service_principal_id IS NULL)
+        OR
+        (principal_type = 'service_principal' AND user_id IS NULL AND service_principal_id IS NOT NULL)
+    ),
+    CONSTRAINT ck_project_memberships_role_nonblank CHECK (btrim(role_code) <> ''),
+    CONSTRAINT ck_project_memberships_status
+        CHECK (status IN ('active', 'suspended', 'revoked')),
+    CONSTRAINT ck_project_memberships_valid_range
+        CHECK (valid_to IS NULL OR valid_to > valid_from),
+    CONSTRAINT ck_project_memberships_version_positive CHECK (version > 0)
+);
+
+CREATE UNIQUE INDEX uq_project_memberships_user
+    ON bridgeai_core.project_memberships (organization_id, project_id, user_id)
+    WHERE principal_type = 'user';
+
+CREATE UNIQUE INDEX uq_project_memberships_service_principal
+    ON bridgeai_core.project_memberships
+       (organization_id, project_id, service_principal_id)
+    WHERE principal_type = 'service_principal';
+```
+
+`created_by`/`updated_by` 保留稳定审计主体 UUID，不对 `users` 建单表外键：调用者可以是人员或服务主体，其不可变审计映射由 8.19 的审计域保存。禁止为了满足单表外键而把服务主体写入 `users`。
+
 ## 8.9 Artifact 与对象存储元数据模型
+
+`artifacts` 是业务上稳定的逻辑工件，`artifact_versions` 是该工件在对象存储中的不可变字节版本。后续数据集、病害证据和报告只能通过本领域的强类型关联表引用其中一层；本章不建立 `artifact_links` 或含 `entity_type/entity_id` 的多态关联。
+
+```sql
+CREATE TABLE bridgeai_core.artifacts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    artifact_code TEXT NOT NULL,
+    artifact_kind TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    sensitivity_level TEXT NOT NULL DEFAULT 'internal',
+    retention_policy_code TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_artifacts_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_artifacts_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT uq_artifacts_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_artifacts_project_code
+        UNIQUE (organization_id, project_id, artifact_code),
+    CONSTRAINT ck_artifacts_code_nonblank CHECK (btrim(artifact_code) <> ''),
+    CONSTRAINT ck_artifacts_kind_nonblank CHECK (btrim(artifact_kind) <> ''),
+    CONSTRAINT ck_artifacts_name_nonblank CHECK (btrim(display_name) <> ''),
+    CONSTRAINT ck_artifacts_status CHECK (status IN ('active', 'archived', 'revoked')),
+    CONSTRAINT ck_artifacts_sensitivity
+        CHECK (sensitivity_level IN ('public', 'internal', 'confidential', 'restricted')),
+    CONSTRAINT ck_artifacts_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_artifacts_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_core.artifact_versions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    artifact_id UUID NOT NULL,
+    revision_no BIGINT NOT NULL,
+    provider TEXT NOT NULL,
+    bucket TEXT NOT NULL,
+    object_key TEXT NOT NULL,
+    version_id TEXT NOT NULL,
+    sha256 CHAR(64),
+    size_bytes BIGINT,
+    media_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'staged',
+    sensitivity_level TEXT NOT NULL DEFAULT 'internal',
+    verified_at TIMESTAMPTZ,
+    activated_at TIMESTAMPTZ,
+    archived_at TIMESTAMPTZ,
+    revoked_at TIMESTAMPTZ,
+    revocation_reason TEXT,
+    retention_until TIMESTAMPTZ,
+    legal_hold BOOLEAN NOT NULL DEFAULT FALSE,
+    orphaned_at TIMESTAMPTZ,
+    reclaim_after TIMESTAMPTZ,
+    reclaim_attempts INTEGER NOT NULL DEFAULT 0,
+    reclaim_last_error TEXT,
+    deletion_requested_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_artifact_versions_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_artifact_versions_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_artifact_versions_artifact_scope
+        FOREIGN KEY (artifact_id, organization_id, project_id)
+        REFERENCES bridgeai_core.artifacts (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_artifact_versions_id_scope
+        UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_artifact_versions_id_scope_artifact
+        UNIQUE (id, organization_id, project_id, artifact_id),
+    CONSTRAINT uq_artifact_versions_revision
+        UNIQUE (artifact_id, revision_no),
+    CONSTRAINT uq_artifact_versions_object
+        UNIQUE (provider, bucket, object_key, version_id),
+    CONSTRAINT ck_artifact_versions_revision_positive CHECK (revision_no > 0),
+    CONSTRAINT ck_artifact_versions_provider CHECK (provider IN ('minio', 's3')),
+    CONSTRAINT ck_artifact_versions_bucket_nonblank CHECK (btrim(bucket) <> ''),
+    CONSTRAINT ck_artifact_versions_object_key_nonblank CHECK (btrim(object_key) <> ''),
+    CONSTRAINT ck_artifact_versions_version_id_nonblank CHECK (btrim(version_id) <> ''),
+    CONSTRAINT ck_artifact_versions_sha256 CHECK (
+        sha256 IS NULL OR sha256 ~ '^[0-9a-f]{64}$'
+    ),
+    CONSTRAINT ck_artifact_versions_size_nonnegative CHECK (size_bytes IS NULL OR size_bytes >= 0),
+    CONSTRAINT ck_artifact_versions_media_type_nonblank CHECK (btrim(media_type) <> ''),
+    CONSTRAINT ck_artifact_versions_status CHECK (
+        status IN ('staged', 'verified', 'active', 'archived', 'revoked', 'deleting', 'deleted')
+    ),
+    CONSTRAINT ck_artifact_versions_sensitivity CHECK (
+        sensitivity_level IN ('public', 'internal', 'confidential', 'restricted')
+    ),
+    CONSTRAINT ck_artifact_versions_verified_payload CHECK (
+        status = 'staged'
+        OR (status IN ('deleting', 'deleted') AND orphaned_at IS NOT NULL)
+        OR (sha256 IS NOT NULL AND size_bytes IS NOT NULL AND verified_at IS NOT NULL)
+    ),
+    CONSTRAINT ck_artifact_versions_activation_time CHECK (
+        status NOT IN ('active', 'archived', 'revoked', 'deleting', 'deleted')
+        OR activated_at IS NOT NULL
+        OR orphaned_at IS NOT NULL
+    ),
+    CONSTRAINT ck_artifact_versions_terminal_times CHECK (
+        (status <> 'archived' OR archived_at IS NOT NULL)
+        AND (status <> 'revoked' OR (revoked_at IS NOT NULL AND revocation_reason IS NOT NULL))
+        AND (status NOT IN ('deleting', 'deleted') OR deletion_requested_at IS NOT NULL)
+        AND (status <> 'deleted' OR deleted_at IS NOT NULL)
+    ),
+    CONSTRAINT ck_artifact_versions_orphan_reclaim CHECK (
+        (orphaned_at IS NULL AND reclaim_after IS NULL)
+        OR (orphaned_at IS NOT NULL AND reclaim_after IS NOT NULL AND reclaim_after >= orphaned_at)
+    ),
+    CONSTRAINT ck_artifact_versions_reclaim_attempts CHECK (reclaim_attempts >= 0),
+    CONSTRAINT ck_artifact_versions_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_artifact_versions_version_positive CHECK (version > 0)
+);
+
+CREATE UNIQUE INDEX uq_artifact_versions_one_active
+    ON bridgeai_core.artifact_versions (artifact_id)
+    WHERE status = 'active';
+
+CREATE INDEX ix_artifact_versions_scope_status
+    ON bridgeai_core.artifact_versions
+       (organization_id, project_id, artifact_id, status);
+
+CREATE INDEX ix_artifact_versions_orphan_reclaim
+    ON bridgeai_core.artifact_versions (reclaim_after)
+    WHERE orphaned_at IS NOT NULL AND status <> 'deleted';
+
+CREATE OR REPLACE FUNCTION bridgeai_core.enforce_artifact_version_transition()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.status <> 'staged' AND ROW(
+        NEW.organization_id, NEW.project_id, NEW.artifact_id, NEW.revision_no,
+        NEW.provider, NEW.bucket, NEW.object_key, NEW.version_id,
+        NEW.sha256, NEW.size_bytes, NEW.media_type
+    ) IS DISTINCT FROM ROW(
+        OLD.organization_id, OLD.project_id, OLD.artifact_id, OLD.revision_no,
+        OLD.provider, OLD.bucket, OLD.object_key, OLD.version_id,
+        OLD.sha256, OLD.size_bytes, OLD.media_type
+    ) THEN
+        RAISE EXCEPTION 'verified artifact object identity and digest are immutable';
+    END IF;
+
+    IF OLD.status = NEW.status THEN
+        RETURN NEW;
+    ELSIF NOT (
+        (OLD.status = 'staged' AND NEW.status = 'verified')
+        OR (OLD.status = 'verified' AND NEW.status = 'active')
+        OR (OLD.status = 'active' AND NEW.status IN ('archived', 'revoked'))
+        OR (OLD.status IN ('archived', 'revoked') AND NEW.status = 'deleting')
+        OR (OLD.status = 'deleting' AND NEW.status = 'deleted')
+        OR (
+            OLD.status IN ('staged', 'verified')
+            AND NEW.status = 'deleting'
+            AND NEW.orphaned_at IS NOT NULL
+            AND NEW.reclaim_after IS NOT NULL
+        )
+    ) THEN
+        RAISE EXCEPTION 'invalid artifact version transition: % -> %', OLD.status, NEW.status;
+    END IF;
+
+    IF NEW.status = 'deleting' THEN
+        IF NEW.legal_hold THEN
+            RAISE EXCEPTION 'artifact version % is under legal hold', NEW.id;
+        END IF;
+        IF NEW.retention_until IS NOT NULL AND NEW.retention_until > CURRENT_TIMESTAMP THEN
+            RAISE EXCEPTION 'artifact version % is still retained', NEW.id;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_artifact_versions_transition
+BEFORE UPDATE
+ON bridgeai_core.artifact_versions
+FOR EACH ROW
+EXECUTE FUNCTION bridgeai_core.enforce_artifact_version_transition();
+```
+
+正常生命周期是 `staged → verified → active → archived/revoked → deleting → deleted`。唯一例外是对已登记但未激活的孤立对象回收：对账任务必须先写入 `orphaned_at` 和不早于其的 `reclaim_after`，才能从 `staged`/`verified` 进入 `deleting`。对象存储中完全未登记的孤立字节由 bucket inventory 对账发现；强保留期和 legal hold 在进入删除状态时由数据库拒绝绕过。
 
 ## 8.10 桥梁、道路、路线与构件模型
 
+`assets.id` 和 `components.id` 是内部稳定 UUID；`asset_code`/`component_code` 是可读的当前正式编码，不承担主键职责。资产范围只允许 `bridge` 和 `road`。桥梁与道路专有属性使用一对一子类表，外键同时带上组织、项目和资产类型，不可将道路资产写入桥梁属性表。
+
+```sql
+CREATE TABLE bridgeai_asset.assets (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    asset_code TEXT NOT NULL,
+    official_code TEXT,
+    asset_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    commissioned_on DATE,
+    deactivated_at TIMESTAMPTZ,
+    deactivation_reason TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_assets_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_assets_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT uq_assets_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_assets_id_scope_type UNIQUE (id, organization_id, project_id, asset_type),
+    CONSTRAINT uq_assets_project_code UNIQUE (organization_id, project_id, asset_code),
+    CONSTRAINT uq_assets_project_official_code
+        UNIQUE (organization_id, project_id, official_code),
+    CONSTRAINT ck_assets_code_nonblank CHECK (btrim(asset_code) <> ''),
+    CONSTRAINT ck_assets_official_code_nonblank
+        CHECK (official_code IS NULL OR btrim(official_code) <> ''),
+    CONSTRAINT ck_assets_type CHECK (asset_type IN ('bridge', 'road')),
+    CONSTRAINT ck_assets_name_nonblank CHECK (btrim(name) <> ''),
+    CONSTRAINT ck_assets_status CHECK (status IN ('planning', 'active', 'inactive', 'retired')),
+    CONSTRAINT ck_assets_deactivation_state CHECK (
+        (status IN ('inactive', 'retired') AND deactivated_at IS NOT NULL)
+        OR (status IN ('planning', 'active') AND deactivated_at IS NULL AND deactivation_reason IS NULL)
+    ),
+    CONSTRAINT ck_assets_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_assets_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_asset.bridge_profiles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    asset_id UUID NOT NULL,
+    asset_type TEXT NOT NULL DEFAULT 'bridge',
+    bridge_type_code TEXT NOT NULL,
+    span_count INTEGER,
+    total_length_m NUMERIC(14, 3),
+    deck_width_m NUMERIC(12, 3),
+    design_load_code TEXT,
+    waterway_name TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_bridge_profiles_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_bridge_profiles_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_bridge_profiles_bridge_asset
+        FOREIGN KEY (asset_id, organization_id, project_id, asset_type)
+        REFERENCES bridgeai_asset.assets (id, organization_id, project_id, asset_type)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_bridge_profiles_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_bridge_profiles_asset_scope
+        UNIQUE (asset_id, organization_id, project_id),
+    CONSTRAINT ck_bridge_profiles_asset_type CHECK (asset_type = 'bridge'),
+    CONSTRAINT ck_bridge_profiles_type_nonblank CHECK (btrim(bridge_type_code) <> ''),
+    CONSTRAINT ck_bridge_profiles_span_count CHECK (span_count IS NULL OR span_count > 0),
+    CONSTRAINT ck_bridge_profiles_total_length CHECK (total_length_m IS NULL OR total_length_m > 0),
+    CONSTRAINT ck_bridge_profiles_deck_width CHECK (deck_width_m IS NULL OR deck_width_m > 0),
+    CONSTRAINT ck_bridge_profiles_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_bridge_profiles_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_asset.road_sections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    asset_id UUID NOT NULL,
+    asset_type TEXT NOT NULL DEFAULT 'road',
+    section_code TEXT NOT NULL,
+    route_code TEXT NOT NULL,
+    direction_code TEXT NOT NULL,
+    road_class_code TEXT,
+    start_chainage_m NUMERIC(14, 3) NOT NULL,
+    end_chainage_m NUMERIC(14, 3) NOT NULL,
+    lane_count INTEGER,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_road_sections_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_road_sections_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_road_sections_road_asset
+        FOREIGN KEY (asset_id, organization_id, project_id, asset_type)
+        REFERENCES bridgeai_asset.assets (id, organization_id, project_id, asset_type)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_road_sections_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_road_sections_asset_scope
+        UNIQUE (asset_id, organization_id, project_id),
+    CONSTRAINT uq_road_sections_project_code
+        UNIQUE (organization_id, project_id, section_code),
+    CONSTRAINT ck_road_sections_asset_type CHECK (asset_type = 'road'),
+    CONSTRAINT ck_road_sections_code_nonblank CHECK (btrim(section_code) <> ''),
+    CONSTRAINT ck_road_sections_route_nonblank CHECK (btrim(route_code) <> ''),
+    CONSTRAINT ck_road_sections_direction_nonblank CHECK (btrim(direction_code) <> ''),
+    CONSTRAINT ck_road_sections_chainage CHECK (
+        start_chainage_m >= 0 AND end_chainage_m > start_chainage_m
+    ),
+    CONSTRAINT ck_road_sections_lane_count CHECK (lane_count IS NULL OR lane_count > 0),
+    CONSTRAINT ck_road_sections_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_road_sections_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_asset.components (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    asset_id UUID NOT NULL,
+    parent_component_id UUID,
+    component_code TEXT NOT NULL,
+    component_type_code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    installed_on DATE,
+    deactivated_at TIMESTAMPTZ,
+    deactivation_reason TEXT,
+    attributes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_components_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_components_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_components_asset_scope
+        FOREIGN KEY (asset_id, organization_id, project_id)
+        REFERENCES bridgeai_asset.assets (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_components_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_components_id_scope_asset
+        UNIQUE (id, organization_id, project_id, asset_id),
+    CONSTRAINT uq_components_asset_code
+        UNIQUE (organization_id, project_id, asset_id, component_code),
+    CONSTRAINT fk_components_parent_same_asset
+        FOREIGN KEY (parent_component_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_asset.components (id, organization_id, project_id, asset_id)
+        DEFERRABLE INITIALLY IMMEDIATE,
+    CONSTRAINT ck_components_not_own_parent
+        CHECK (parent_component_id IS NULL OR parent_component_id <> id),
+    CONSTRAINT ck_components_code_nonblank CHECK (btrim(component_code) <> ''),
+    CONSTRAINT ck_components_type_nonblank CHECK (btrim(component_type_code) <> ''),
+    CONSTRAINT ck_components_name_nonblank CHECK (btrim(name) <> ''),
+    CONSTRAINT ck_components_status CHECK (status IN ('active', 'inactive', 'retired')),
+    CONSTRAINT ck_components_deactivation_state CHECK (
+        (status IN ('inactive', 'retired') AND deactivated_at IS NOT NULL)
+        OR (status = 'active' AND deactivated_at IS NULL AND deactivation_reason IS NULL)
+    ),
+    CONSTRAINT ck_components_attributes_object CHECK (jsonb_typeof(attributes) = 'object'),
+    CONSTRAINT ck_components_version_positive CHECK (version > 0)
+);
+
+CREATE OR REPLACE FUNCTION bridgeai_asset.reject_component_cycle()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    cycle_found BOOLEAN;
+BEGIN
+    IF NEW.parent_component_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    WITH RECURSIVE ancestors AS (
+        SELECT c.id, c.parent_component_id
+        FROM bridgeai_asset.components AS c
+        WHERE c.id = NEW.parent_component_id
+          AND c.organization_id = NEW.organization_id
+          AND c.project_id = NEW.project_id
+          AND c.asset_id = NEW.asset_id
+        UNION
+        SELECT c.id, c.parent_component_id
+        FROM bridgeai_asset.components AS c
+        JOIN ancestors AS a ON c.id = a.parent_component_id
+        WHERE c.organization_id = NEW.organization_id
+          AND c.project_id = NEW.project_id
+          AND c.asset_id = NEW.asset_id
+    )
+    SELECT EXISTS (SELECT 1 FROM ancestors WHERE id = NEW.id)
+    INTO cycle_found;
+
+    IF cycle_found THEN
+        RAISE EXCEPTION 'component hierarchy cycle detected for component %', NEW.id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER trg_components_reject_cycle
+AFTER INSERT OR UPDATE OF parent_component_id, organization_id, project_id, asset_id
+ON bridgeai_asset.components
+DEFERRABLE INITIALLY IMMEDIATE
+FOR EACH ROW
+EXECUTE FUNCTION bridgeai_asset.reject_component_cycle();
+
+CREATE TABLE bridgeai_asset.component_aliases (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    asset_id UUID NOT NULL,
+    component_id UUID NOT NULL,
+    alias_code TEXT NOT NULL,
+    alias_type TEXT NOT NULL,
+    source_system TEXT,
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    valid_to TIMESTAMPTZ,
+    mapping_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_component_aliases_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_component_aliases_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_component_aliases_component_same_asset
+        FOREIGN KEY (component_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_asset.components (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_component_aliases_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_component_aliases_asset_alias
+        UNIQUE (organization_id, project_id, asset_id, alias_code),
+    CONSTRAINT ck_component_aliases_code_nonblank CHECK (btrim(alias_code) <> ''),
+    CONSTRAINT ck_component_aliases_type CHECK (
+        alias_type IN ('project_alias', 'former_official_code', 'external_code')
+    ),
+    CONSTRAINT ck_component_aliases_valid_range CHECK (valid_to IS NULL OR valid_to > valid_from),
+    CONSTRAINT ck_component_aliases_renumber_reason CHECK (
+        alias_type <> 'former_official_code' OR mapping_reason IS NOT NULL
+    ),
+    CONSTRAINT ck_component_aliases_version_positive CHECK (version > 0)
+);
+
+CREATE INDEX ix_components_parent_scope
+    ON bridgeai_asset.components
+       (organization_id, project_id, asset_id, parent_component_id);
+
+CREATE INDEX ix_component_aliases_component_scope
+    ON bridgeai_asset.component_aliases
+       (organization_id, project_id, asset_id, component_id);
+```
+
+构件停用只更改 `components.status/deactivated_at/deactivation_reason`，不删除稳定 UUID。重编码在同一事务中更新 `components.component_code`，并把原编码以 `component_aliases.alias_type = 'former_official_code'` 映射回同一 `component_id`；项目俗称使用 `project_alias`，不得覆盖正式编码。自组合外键阻止跨组织、跨项目和跨资产挂接，可延迟约束触发器进一步拒绝环形构件树。
+
 ## 8.11 PostGIS 空间与工程定位设计
+
+空间库内的标准几何统一为 **CGCS2000 / EPSG:4490**。`geom_4490` 用于空间过滤和交换；`source_geom/source_srid` 保留导入源几何及坐标参考；非 4490 数据必须登记转换工具、版本、参数和位置精度。工程定位同时保留局部坐标、路线桩号、横向偏距、车道、构件表面和高程，不用 JSONB 替代这些核心查询列。
+
+```sql
+CREATE TABLE bridgeai_asset.spatial_locations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    asset_id UUID NOT NULL,
+    component_id UUID,
+    location_kind TEXT NOT NULL,
+    geom_4490 geometry(Geometry, 4490) NOT NULL,
+    source_geom geometry(Geometry),
+    source_srid INTEGER NOT NULL,
+    transform_tool TEXT,
+    transform_tool_version TEXT,
+    transform_parameters JSONB NOT NULL DEFAULT '{}'::jsonb,
+    position_accuracy_m NUMERIC(12, 4) NOT NULL,
+    local_reference_code TEXT,
+    local_x NUMERIC(14, 4),
+    local_y NUMERIC(14, 4),
+    local_z NUMERIC(14, 4),
+    chainage_m NUMERIC(14, 3),
+    lateral_offset_m NUMERIC(12, 3),
+    lane_code TEXT,
+    component_surface_code TEXT,
+    elevation_m NUMERIC(14, 4),
+    vertical_datum_code TEXT,
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    valid_to TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_spatial_locations_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_spatial_locations_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_spatial_locations_asset_scope
+        FOREIGN KEY (asset_id, organization_id, project_id)
+        REFERENCES bridgeai_asset.assets (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_spatial_locations_component_same_asset
+        FOREIGN KEY (component_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_asset.components (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_spatial_locations_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_spatial_locations_id_scope_asset
+        UNIQUE (id, organization_id, project_id, asset_id),
+    CONSTRAINT ck_spatial_locations_kind_nonblank CHECK (btrim(location_kind) <> ''),
+    CONSTRAINT ck_spatial_locations_geom_4490 CHECK (
+        ST_SRID(geom_4490) = 4490
+        AND NOT ST_IsEmpty(geom_4490)
+        AND ST_IsValid(geom_4490)
+        AND ST_CoordDim(geom_4490) = 2
+    ),
+    CONSTRAINT ck_spatial_locations_source_srid CHECK (source_srid > 0),
+    CONSTRAINT ck_spatial_locations_source_geom CHECK (
+        source_geom IS NULL
+        OR (
+            ST_SRID(source_geom) = source_srid
+            AND NOT ST_IsEmpty(source_geom)
+            AND ST_IsValid(source_geom)
+        )
+    ),
+    CONSTRAINT ck_spatial_locations_transform_trace CHECK (
+        source_srid = 4490
+        OR (
+            source_geom IS NOT NULL
+            AND transform_tool IS NOT NULL
+            AND btrim(transform_tool) <> ''
+            AND transform_tool_version IS NOT NULL
+            AND btrim(transform_tool_version) <> ''
+            AND transform_parameters <> '{}'::jsonb
+        )
+    ),
+    CONSTRAINT ck_spatial_locations_transform_parameters_object
+        CHECK (jsonb_typeof(transform_parameters) = 'object'),
+    CONSTRAINT ck_spatial_locations_accuracy CHECK (position_accuracy_m > 0),
+    CONSTRAINT ck_spatial_locations_local_xy CHECK (
+        (local_x IS NULL AND local_y IS NULL AND local_z IS NULL AND local_reference_code IS NULL)
+        OR
+        (local_x IS NOT NULL AND local_y IS NOT NULL
+         AND local_reference_code IS NOT NULL AND btrim(local_reference_code) <> '')
+    ),
+    CONSTRAINT ck_spatial_locations_chainage CHECK (chainage_m IS NULL OR chainage_m >= 0),
+    CONSTRAINT ck_spatial_locations_offset_requires_chainage CHECK (
+        lateral_offset_m IS NULL OR chainage_m IS NOT NULL
+    ),
+    CONSTRAINT ck_spatial_locations_lane_requires_chainage CHECK (
+        lane_code IS NULL OR (chainage_m IS NOT NULL AND btrim(lane_code) <> '')
+    ),
+    CONSTRAINT ck_spatial_locations_surface_requires_component CHECK (
+        component_surface_code IS NULL
+        OR (component_id IS NOT NULL AND btrim(component_surface_code) <> '')
+    ),
+    CONSTRAINT ck_spatial_locations_elevation_datum CHECK (
+        elevation_m IS NULL
+        OR (vertical_datum_code IS NOT NULL AND btrim(vertical_datum_code) <> '')
+    ),
+    CONSTRAINT ck_spatial_locations_valid_range CHECK (valid_to IS NULL OR valid_to > valid_from),
+    CONSTRAINT ck_spatial_locations_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_spatial_locations_version_positive CHECK (version > 0)
+);
+
+CREATE INDEX ix_spatial_locations_scope_asset
+    ON bridgeai_asset.spatial_locations (organization_id, project_id, asset_id);
+
+CREATE INDEX ix_spatial_locations_geom_4490
+    ON bridgeai_asset.spatial_locations USING GIST (geom_4490);
+
+CREATE INDEX ix_spatial_locations_route_position
+    ON bridgeai_asset.spatial_locations
+       (organization_id, project_id, asset_id, chainage_m)
+    WHERE chainage_m IS NOT NULL;
+```
+
+空间查询必须在空间谓词之前同时提供组织、项目和资产过滤。下例的普通复合 B-tree 索引与 GiST 索引可由 PostgreSQL 做 bitmap-and，既不放大跨租户扫描，也不需要把组织 UUID 混入几何类型。
+
+```sql
+WITH query_area AS (
+    SELECT ST_GeomFromText(:query_wkt, 4490) AS geom
+)
+SELECT sl.*
+FROM bridgeai_asset.spatial_locations AS sl
+CROSS JOIN query_area AS qa
+WHERE sl.organization_id = :organization_id
+  AND sl.project_id = :project_id
+  AND sl.asset_id = :asset_id
+  AND sl.geom_4490 && qa.geom
+  AND ST_Intersects(sl.geom_4490, qa.geom);
+```
+
+EPSG:4490 为地理坐标系，不得把其角度差直接解释为米。米制缓冲、距离和面积计算必须在查询或受控派生列中显式转到项目适用的投影坐标系，并保留所用 SRID 和转换参数。
 
 ## 8.12 检测批次、采集会话与数据集模型
 
