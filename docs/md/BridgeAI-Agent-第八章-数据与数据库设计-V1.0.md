@@ -995,9 +995,1046 @@ EPSG:4490 为地理坐标系，不得把其角度差直接解释为米。米制�
 
 ## 8.12 检测批次、采集会话与数据集模型
 
+`inspection_campaigns` 表示一次有计划边界的检测任务，`acquisition_sessions` 表示一段由明确操作者和设备执行的现场采集，`acquisition_datasets` 表示一个可独立导入、质检和隔离的批次。三者都复写 `asset_id` 并由组合外键限定在同一组织、项目和资产内；数据集的对象存储内容只能通过 `dataset_artifacts` 强关联到确定的 Artifact 及其不可变版本。
+
+```sql
+CREATE TABLE bridgeai_inspection.inspection_campaigns (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    asset_id UUID NOT NULL,
+    campaign_code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    inspection_type TEXT NOT NULL,
+    planned_start_at TIMESTAMPTZ NOT NULL,
+    planned_end_at TIMESTAMPTZ NOT NULL,
+    actual_start_at TIMESTAMPTZ,
+    actual_end_at TIMESTAMPTZ,
+    scope_location_id UUID,
+    planned_scope TEXT NOT NULL,
+    coverage_requirements JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'planned',
+    cancellation_reason TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_inspection_campaigns_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_inspection_campaigns_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_inspection_campaigns_asset_scope
+        FOREIGN KEY (asset_id, organization_id, project_id)
+        REFERENCES bridgeai_asset.assets (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_inspection_campaigns_location_same_asset
+        FOREIGN KEY (scope_location_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_asset.spatial_locations (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_inspection_campaigns_id_scope
+        UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_inspection_campaigns_id_scope_asset
+        UNIQUE (id, organization_id, project_id, asset_id),
+    CONSTRAINT uq_inspection_campaigns_project_code
+        UNIQUE (organization_id, project_id, campaign_code),
+    CONSTRAINT ck_inspection_campaigns_code_nonblank CHECK (btrim(campaign_code) <> ''),
+    CONSTRAINT ck_inspection_campaigns_name_nonblank CHECK (btrim(name) <> ''),
+    CONSTRAINT ck_inspection_campaigns_type_nonblank CHECK (btrim(inspection_type) <> ''),
+    CONSTRAINT ck_inspection_campaigns_planned_range
+        CHECK (planned_end_at > planned_start_at),
+    CONSTRAINT ck_inspection_campaigns_actual_range
+        CHECK (actual_end_at IS NULL OR (actual_start_at IS NOT NULL AND actual_end_at > actual_start_at)),
+    CONSTRAINT ck_inspection_campaigns_scope_nonblank CHECK (btrim(planned_scope) <> ''),
+    CONSTRAINT ck_inspection_campaigns_coverage_object
+        CHECK (jsonb_typeof(coverage_requirements) = 'object'),
+    CONSTRAINT ck_inspection_campaigns_status
+        CHECK (status IN ('planned', 'in_progress', 'completed', 'cancelled')),
+    CONSTRAINT ck_inspection_campaigns_status_times CHECK (
+        (status = 'planned' AND actual_start_at IS NULL AND actual_end_at IS NULL)
+        OR (status = 'in_progress' AND actual_start_at IS NOT NULL AND actual_end_at IS NULL)
+        OR (status = 'completed' AND actual_start_at IS NOT NULL AND actual_end_at IS NOT NULL)
+        OR status = 'cancelled'
+    ),
+    CONSTRAINT ck_inspection_campaigns_cancellation CHECK (
+        (status = 'cancelled' AND cancellation_reason IS NOT NULL
+         AND btrim(cancellation_reason) <> '')
+        OR (status <> 'cancelled' AND cancellation_reason IS NULL)
+    ),
+    CONSTRAINT ck_inspection_campaigns_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_inspection_campaigns_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_inspection.acquisition_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    asset_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+    session_code TEXT NOT NULL,
+    operator_subject_id UUID NOT NULL,
+    equipment_code TEXT NOT NULL,
+    equipment_model TEXT,
+    equipment_serial_number TEXT,
+    acquisition_started_at TIMESTAMPTZ,
+    acquisition_ended_at TIMESTAMPTZ,
+    coverage_location_id UUID,
+    coverage_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    quality_status TEXT NOT NULL DEFAULT 'pending',
+    quality_notes TEXT,
+    status TEXT NOT NULL DEFAULT 'scheduled',
+    abort_reason TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_acquisition_sessions_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_acquisition_sessions_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_acquisition_sessions_campaign_same_asset
+        FOREIGN KEY (campaign_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_inspection.inspection_campaigns
+                   (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_acquisition_sessions_location_same_asset
+        FOREIGN KEY (coverage_location_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_asset.spatial_locations (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_acquisition_sessions_id_scope
+        UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_acquisition_sessions_id_scope_campaign_asset
+        UNIQUE (id, organization_id, project_id, campaign_id, asset_id),
+    CONSTRAINT uq_acquisition_sessions_campaign_code
+        UNIQUE (organization_id, project_id, campaign_id, session_code),
+    CONSTRAINT ck_acquisition_sessions_code_nonblank CHECK (btrim(session_code) <> ''),
+    CONSTRAINT ck_acquisition_sessions_equipment_code CHECK (btrim(equipment_code) <> ''),
+    CONSTRAINT ck_acquisition_sessions_equipment_model
+        CHECK (equipment_model IS NULL OR btrim(equipment_model) <> ''),
+    CONSTRAINT ck_acquisition_sessions_equipment_serial
+        CHECK (equipment_serial_number IS NULL OR btrim(equipment_serial_number) <> ''),
+    CONSTRAINT ck_acquisition_sessions_time_range CHECK (
+        acquisition_ended_at IS NULL
+        OR (acquisition_started_at IS NOT NULL AND acquisition_ended_at > acquisition_started_at)
+    ),
+    CONSTRAINT ck_acquisition_sessions_coverage_object
+        CHECK (jsonb_typeof(coverage_summary) = 'object'),
+    CONSTRAINT ck_acquisition_sessions_quality
+        CHECK (quality_status IN ('pending', 'passed', 'warning', 'failed')),
+    CONSTRAINT ck_acquisition_sessions_status
+        CHECK (status IN ('scheduled', 'in_progress', 'completed', 'aborted')),
+    CONSTRAINT ck_acquisition_sessions_status_times CHECK (
+        (status = 'scheduled' AND acquisition_started_at IS NULL AND acquisition_ended_at IS NULL)
+        OR (status = 'in_progress' AND acquisition_started_at IS NOT NULL
+            AND acquisition_ended_at IS NULL)
+        OR (status IN ('completed', 'aborted') AND acquisition_started_at IS NOT NULL
+            AND acquisition_ended_at IS NOT NULL)
+    ),
+    CONSTRAINT ck_acquisition_sessions_abort_reason CHECK (
+        (status = 'aborted' AND abort_reason IS NOT NULL AND btrim(abort_reason) <> '')
+        OR (status <> 'aborted' AND abort_reason IS NULL)
+    ),
+    CONSTRAINT ck_acquisition_sessions_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_acquisition_sessions_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_inspection.acquisition_datasets (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    asset_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+    session_id UUID NOT NULL,
+    dataset_code TEXT NOT NULL,
+    import_batch_code TEXT NOT NULL,
+    dataset_type TEXT NOT NULL,
+    captured_from_at TIMESTAMPTZ,
+    captured_to_at TIMESTAMPTZ,
+    imported_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    record_count BIGINT,
+    size_bytes BIGINT,
+    coverage_location_id UUID,
+    quality_status TEXT NOT NULL DEFAULT 'pending',
+    quality_score NUMERIC(7, 6),
+    quality_report JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'importing',
+    rejection_reason TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_acquisition_datasets_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_acquisition_datasets_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_acquisition_datasets_session_scope
+        FOREIGN KEY (session_id, organization_id, project_id, campaign_id, asset_id)
+        REFERENCES bridgeai_inspection.acquisition_sessions
+                   (id, organization_id, project_id, campaign_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_acquisition_datasets_location_same_asset
+        FOREIGN KEY (coverage_location_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_asset.spatial_locations (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_acquisition_datasets_id_scope
+        UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_acquisition_datasets_id_scope_campaign_asset
+        UNIQUE (id, organization_id, project_id, campaign_id, asset_id),
+    CONSTRAINT uq_acquisition_datasets_project_code
+        UNIQUE (organization_id, project_id, dataset_code),
+    CONSTRAINT uq_acquisition_datasets_import_batch
+        UNIQUE (organization_id, project_id, import_batch_code),
+    CONSTRAINT ck_acquisition_datasets_code_nonblank CHECK (btrim(dataset_code) <> ''),
+    CONSTRAINT ck_acquisition_datasets_batch_nonblank CHECK (btrim(import_batch_code) <> ''),
+    CONSTRAINT ck_acquisition_datasets_type CHECK (
+        dataset_type IN ('image', 'video', 'point_cloud', 'sensor', 'annotation', 'mixed')
+    ),
+    CONSTRAINT ck_acquisition_datasets_capture_range CHECK (
+        (captured_from_at IS NULL AND captured_to_at IS NULL)
+        OR (captured_from_at IS NOT NULL AND captured_to_at IS NOT NULL
+            AND captured_to_at >= captured_from_at)
+    ),
+    CONSTRAINT ck_acquisition_datasets_record_count
+        CHECK (record_count IS NULL OR record_count >= 0),
+    CONSTRAINT ck_acquisition_datasets_size CHECK (size_bytes IS NULL OR size_bytes >= 0),
+    CONSTRAINT ck_acquisition_datasets_quality
+        CHECK (quality_status IN ('pending', 'passed', 'warning', 'failed')),
+    CONSTRAINT ck_acquisition_datasets_quality_score
+        CHECK (quality_score IS NULL OR (quality_score >= 0 AND quality_score <= 1)),
+    CONSTRAINT ck_acquisition_datasets_quality_report
+        CHECK (jsonb_typeof(quality_report) = 'object'),
+    CONSTRAINT ck_acquisition_datasets_status
+        CHECK (status IN ('importing', 'ready', 'quarantined', 'rejected', 'archived')),
+    CONSTRAINT ck_acquisition_datasets_ready_quality CHECK (
+        status <> 'ready' OR quality_status IN ('passed', 'warning')
+    ),
+    CONSTRAINT ck_acquisition_datasets_rejection CHECK (
+        (status = 'rejected' AND rejection_reason IS NOT NULL AND btrim(rejection_reason) <> '')
+        OR (status <> 'rejected' AND rejection_reason IS NULL)
+    ),
+    CONSTRAINT ck_acquisition_datasets_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_acquisition_datasets_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_inspection.dataset_artifacts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    dataset_id UUID NOT NULL,
+    artifact_id UUID NOT NULL,
+    artifact_version_id UUID NOT NULL,
+    relation_type TEXT NOT NULL,
+    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_dataset_artifacts_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_dataset_artifacts_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_dataset_artifacts_dataset_scope
+        FOREIGN KEY (dataset_id, organization_id, project_id)
+        REFERENCES bridgeai_inspection.acquisition_datasets (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_dataset_artifacts_artifact_scope
+        FOREIGN KEY (artifact_id, organization_id, project_id)
+        REFERENCES bridgeai_core.artifacts (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_dataset_artifacts_version_of_artifact
+        FOREIGN KEY (artifact_version_id, organization_id, project_id, artifact_id)
+        REFERENCES bridgeai_core.artifact_versions
+                   (id, organization_id, project_id, artifact_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_dataset_artifacts_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_dataset_artifacts_relation
+        UNIQUE (dataset_id, artifact_version_id, relation_type),
+    CONSTRAINT ck_dataset_artifacts_relation CHECK (
+        relation_type IN ('raw', 'calibration', 'preview', 'annotation', 'quality_report', 'derived')
+    ),
+    CONSTRAINT ck_dataset_artifacts_description
+        CHECK (description IS NULL OR btrim(description) <> ''),
+    CONSTRAINT ck_dataset_artifacts_version_positive CHECK (version > 0)
+);
+
+CREATE INDEX ix_inspection_campaigns_asset_status
+    ON bridgeai_inspection.inspection_campaigns
+       (organization_id, project_id, asset_id, status, planned_start_at);
+
+CREATE INDEX ix_acquisition_sessions_campaign_time
+    ON bridgeai_inspection.acquisition_sessions
+       (organization_id, project_id, campaign_id, acquisition_started_at);
+
+CREATE INDEX ix_acquisition_datasets_session_status
+    ON bridgeai_inspection.acquisition_datasets
+       (organization_id, project_id, session_id, status, imported_at);
+
+CREATE INDEX ix_dataset_artifacts_artifact_version
+    ON bridgeai_inspection.dataset_artifacts
+       (organization_id, project_id, artifact_id, artifact_version_id);
+```
+
 ## 8.13 病害实体、观测、修订与量测模型
 
+`damage_entities` 是跨检测批次保持不变的病害身份；`damage_observations` 是特定时间的一次观测，可在空间候选关联得到确认前暂不归入稳定实体。`damage_revisions` 是观测结论的全追加修订流：`(observation_id, revision_no)` 全局唯一，前驱必须是同一观测的紧邻修订，任何旧修订都不原地改状态。
+
+`damage_observations.current_revision_id/current_revision_no` 是唯一的默认当前指针，两列必须同时为空或同时非空。为解决观测与修订的闭环外键，先创建两张表，再以 `ALTER TABLE` 添加同观测、组织、项目的可延迟组合外键。新观测允许在首个修订落库前保持空指针，但 `pending_review` 和 `confirmed` 观测必须已指向同状态修订。指针切换更新观测的 `updated_at/updated_by/version`，并由 8.19 记录审计事件。
+
+```sql
+CREATE TABLE bridgeai_inspection.damage_entities (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    asset_id UUID NOT NULL,
+    component_id UUID,
+    canonical_location_id UUID,
+    damage_code TEXT NOT NULL,
+    damage_type_code TEXT NOT NULL,
+    first_observed_at TIMESTAMPTZ NOT NULL,
+    lifecycle_status TEXT NOT NULL DEFAULT 'active',
+    closed_at TIMESTAMPTZ,
+    closure_reason TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_damage_entities_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_entities_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_entities_asset_scope
+        FOREIGN KEY (asset_id, organization_id, project_id)
+        REFERENCES bridgeai_asset.assets (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_entities_component_same_asset
+        FOREIGN KEY (component_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_asset.components (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_entities_location_same_asset
+        FOREIGN KEY (canonical_location_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_asset.spatial_locations (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_damage_entities_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_damage_entities_id_scope_asset
+        UNIQUE (id, organization_id, project_id, asset_id),
+    CONSTRAINT uq_damage_entities_project_code
+        UNIQUE (organization_id, project_id, damage_code),
+    CONSTRAINT ck_damage_entities_code_nonblank CHECK (btrim(damage_code) <> ''),
+    CONSTRAINT ck_damage_entities_type_nonblank CHECK (btrim(damage_type_code) <> ''),
+    CONSTRAINT ck_damage_entities_status
+        CHECK (lifecycle_status IN ('active', 'repaired', 'closed', 'merged')),
+    CONSTRAINT ck_damage_entities_closed_state CHECK (
+        (lifecycle_status IN ('closed', 'merged') AND closed_at IS NOT NULL
+         AND closure_reason IS NOT NULL AND btrim(closure_reason) <> '')
+        OR (lifecycle_status IN ('active', 'repaired')
+            AND closed_at IS NULL AND closure_reason IS NULL)
+    ),
+    CONSTRAINT ck_damage_entities_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_damage_entities_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_inspection.model_inference_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    input_dataset_id UUID NOT NULL,
+    run_code TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    model_provider TEXT NOT NULL,
+    invoked_by UUID NOT NULL,
+    parameters JSONB NOT NULL DEFAULT '{}'::jsonb,
+    runtime_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'queued',
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    output_count BIGINT,
+    failure_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_model_inference_runs_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_model_inference_runs_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_model_inference_runs_input_dataset
+        FOREIGN KEY (input_dataset_id, organization_id, project_id)
+        REFERENCES bridgeai_inspection.acquisition_datasets (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_model_inference_runs_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_model_inference_runs_project_code
+        UNIQUE (organization_id, project_id, run_code),
+    CONSTRAINT ck_model_inference_runs_code_nonblank CHECK (btrim(run_code) <> ''),
+    CONSTRAINT ck_model_inference_runs_task_nonblank CHECK (btrim(task_type) <> ''),
+    CONSTRAINT ck_model_inference_runs_model_name CHECK (btrim(model_name) <> ''),
+    CONSTRAINT ck_model_inference_runs_model_version CHECK (btrim(model_version) <> ''),
+    CONSTRAINT ck_model_inference_runs_provider CHECK (btrim(model_provider) <> ''),
+    CONSTRAINT ck_model_inference_runs_parameters_object CHECK (jsonb_typeof(parameters) = 'object'),
+    CONSTRAINT ck_model_inference_runs_runtime_object
+        CHECK (jsonb_typeof(runtime_metadata) = 'object'),
+    CONSTRAINT ck_model_inference_runs_status
+        CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+    CONSTRAINT ck_model_inference_runs_times CHECK (
+        (status = 'queued' AND started_at IS NULL AND finished_at IS NULL)
+        OR (status = 'running' AND started_at IS NOT NULL AND finished_at IS NULL)
+        OR (status IN ('succeeded', 'failed', 'cancelled')
+            AND started_at IS NOT NULL AND finished_at IS NOT NULL
+            AND finished_at >= started_at)
+    ),
+    CONSTRAINT ck_model_inference_runs_output_count
+        CHECK (output_count IS NULL OR output_count >= 0),
+    CONSTRAINT ck_model_inference_runs_failure CHECK (
+        (status = 'failed' AND failure_reason IS NOT NULL AND btrim(failure_reason) <> '')
+        OR (status <> 'failed' AND failure_reason IS NULL)
+    ),
+    CONSTRAINT ck_model_inference_runs_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_inspection.damage_observations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    asset_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+    acquisition_dataset_id UUID,
+    damage_entity_id UUID,
+    candidate_damage_entity_id UUID,
+    previous_observation_id UUID,
+    spatial_location_id UUID NOT NULL,
+    observation_code TEXT NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL,
+    observation_method TEXT NOT NULL,
+    association_status TEXT NOT NULL DEFAULT 'unlinked',
+    association_method TEXT,
+    association_rule_code TEXT,
+    association_evidence TEXT,
+    association_confirmed_at TIMESTAMPTZ,
+    association_confirmed_by UUID,
+    evolution_state TEXT,
+    status TEXT NOT NULL DEFAULT 'draft',
+    current_revision_id UUID,
+    current_revision_no INTEGER,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_damage_observations_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_observations_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_observations_campaign_same_asset
+        FOREIGN KEY (campaign_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_inspection.inspection_campaigns
+                   (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_observations_dataset_same_campaign_asset
+        FOREIGN KEY (acquisition_dataset_id, organization_id, project_id, campaign_id, asset_id)
+        REFERENCES bridgeai_inspection.acquisition_datasets
+                   (id, organization_id, project_id, campaign_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_observations_entity_same_asset
+        FOREIGN KEY (damage_entity_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_inspection.damage_entities
+                   (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_observations_candidate_entity_same_asset
+        FOREIGN KEY (candidate_damage_entity_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_inspection.damage_entities
+                   (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_observations_previous_scope
+        FOREIGN KEY (previous_observation_id, organization_id, project_id)
+        REFERENCES bridgeai_inspection.damage_observations (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_observations_location_same_asset
+        FOREIGN KEY (spatial_location_id, organization_id, project_id, asset_id)
+        REFERENCES bridgeai_asset.spatial_locations (id, organization_id, project_id, asset_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_damage_observations_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_damage_observations_project_code
+        UNIQUE (organization_id, project_id, observation_code),
+    CONSTRAINT ck_damage_observations_code_nonblank CHECK (btrim(observation_code) <> ''),
+    CONSTRAINT ck_damage_observations_method_nonblank CHECK (btrim(observation_method) <> ''),
+    CONSTRAINT ck_damage_observations_not_own_predecessor
+        CHECK (previous_observation_id IS NULL OR previous_observation_id <> id),
+    CONSTRAINT ck_damage_observations_association_status
+        CHECK (association_status IN ('unlinked', 'candidate', 'confirmed')),
+    CONSTRAINT ck_damage_observations_evolution_state CHECK (
+        evolution_state IS NULL
+        OR evolution_state IN ('new', 'persistent', 'expanded', 'reduced', 'repaired', 'recurred')
+    ),
+    CONSTRAINT ck_damage_observations_association_shape CHECK (
+        (
+            association_status = 'unlinked'
+            AND damage_entity_id IS NULL
+            AND candidate_damage_entity_id IS NULL
+            AND previous_observation_id IS NULL
+            AND association_method IS NULL
+            AND association_rule_code IS NULL
+            AND association_evidence IS NULL
+            AND association_confirmed_at IS NULL
+            AND association_confirmed_by IS NULL
+            AND evolution_state IS NULL
+        )
+        OR
+        (
+            association_status = 'candidate'
+            AND damage_entity_id IS NULL
+            AND candidate_damage_entity_id IS NOT NULL
+            AND association_method IN ('spatial_proximity', 'model', 'rule')
+            AND association_evidence IS NOT NULL AND btrim(association_evidence) <> ''
+            AND association_confirmed_at IS NULL
+            AND association_confirmed_by IS NULL
+            AND evolution_state IS NULL
+            AND (association_method <> 'rule'
+                 OR (association_rule_code IS NOT NULL AND btrim(association_rule_code) <> ''))
+        )
+        OR
+        (
+            association_status = 'confirmed'
+            AND damage_entity_id IS NOT NULL
+            AND candidate_damage_entity_id IS NULL
+            AND association_method IN ('initial', 'manual', 'rule')
+            AND association_evidence IS NOT NULL AND btrim(association_evidence) <> ''
+            AND association_confirmed_at IS NOT NULL
+            AND evolution_state IS NOT NULL
+            AND (
+                (association_method IN ('initial', 'manual')
+                 AND association_confirmed_by IS NOT NULL
+                 AND association_rule_code IS NULL)
+                OR
+                (association_method = 'rule'
+                 AND association_confirmed_by IS NULL
+                 AND association_rule_code IS NOT NULL
+                 AND btrim(association_rule_code) <> '')
+            )
+            AND (
+                (evolution_state = 'new' AND previous_observation_id IS NULL
+                 AND association_method = 'initial')
+                OR
+                (evolution_state IN
+                    ('persistent', 'expanded', 'reduced', 'repaired', 'recurred')
+                 AND previous_observation_id IS NOT NULL
+                 AND association_method IN ('manual', 'rule'))
+            )
+        )
+    ),
+    CONSTRAINT ck_damage_observations_status
+        CHECK (status IN ('draft', 'pending_review', 'confirmed', 'voided')),
+    CONSTRAINT ck_damage_observations_current_pair CHECK (
+        (current_revision_id IS NULL AND current_revision_no IS NULL)
+        OR (current_revision_id IS NOT NULL AND current_revision_no IS NOT NULL)
+    ),
+    CONSTRAINT ck_damage_observations_current_required CHECK (
+        status IN ('draft', 'voided') OR current_revision_id IS NOT NULL
+    ),
+    CONSTRAINT ck_damage_observations_current_revision_positive
+        CHECK (current_revision_no IS NULL OR current_revision_no > 0),
+    CONSTRAINT ck_damage_observations_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_damage_observations_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_inspection.damage_revisions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    observation_id UUID NOT NULL,
+    revision_no INTEGER NOT NULL,
+    predecessor_revision_id UUID,
+    predecessor_revision_no INTEGER,
+    status TEXT NOT NULL DEFAULT 'draft',
+    origin_type TEXT NOT NULL,
+    damage_type_code TEXT NOT NULL,
+    severity_code TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    conclusion TEXT NOT NULL,
+    confidence NUMERIC(7, 6) NOT NULL,
+    model_inference_run_id UUID,
+    confirmation_note TEXT,
+    confirmed_at TIMESTAMPTZ,
+    confirmed_by UUID,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_damage_revisions_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_revisions_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_revisions_observation_scope
+        FOREIGN KEY (observation_id, organization_id, project_id)
+        REFERENCES bridgeai_inspection.damage_observations (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_revisions_model_run_scope
+        FOREIGN KEY (model_inference_run_id, organization_id, project_id)
+        REFERENCES bridgeai_inspection.model_inference_runs (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_damage_revisions_observation_revision
+        UNIQUE (observation_id, revision_no),
+    CONSTRAINT uq_damage_revisions_id_scope_observation_revision
+        UNIQUE (id, organization_id, project_id, observation_id, revision_no),
+    CONSTRAINT fk_damage_revisions_predecessor_same_observation
+        FOREIGN KEY (
+            predecessor_revision_id, organization_id, project_id,
+            observation_id, predecessor_revision_no
+        )
+        REFERENCES bridgeai_inspection.damage_revisions
+                   (id, organization_id, project_id, observation_id, revision_no)
+        DEFERRABLE INITIALLY IMMEDIATE,
+    CONSTRAINT ck_damage_revisions_revision_positive CHECK (revision_no > 0),
+    CONSTRAINT ck_damage_revisions_predecessor_shape CHECK (
+        (revision_no = 1
+         AND predecessor_revision_id IS NULL AND predecessor_revision_no IS NULL)
+        OR
+        (revision_no > 1
+         AND predecessor_revision_id IS NOT NULL
+         AND predecessor_revision_no = revision_no - 1
+         AND predecessor_revision_id <> id)
+    ),
+    CONSTRAINT ck_damage_revisions_status
+        CHECK (status IN ('draft', 'pending_review', 'confirmed', 'rejected')),
+    CONSTRAINT ck_damage_revisions_origin
+        CHECK (origin_type IN ('human', 'model', 'import')),
+    CONSTRAINT ck_damage_revisions_origin_run_status CHECK (
+        (origin_type = 'model'
+         AND model_inference_run_id IS NOT NULL
+         AND status IN ('draft', 'pending_review'))
+        OR
+        (origin_type IN ('human', 'import') AND model_inference_run_id IS NULL
+         AND (origin_type <> 'import' OR status IN ('draft', 'pending_review')))
+    ),
+    CONSTRAINT ck_damage_revisions_type_nonblank CHECK (btrim(damage_type_code) <> ''),
+    CONSTRAINT ck_damage_revisions_severity_nonblank CHECK (btrim(severity_code) <> ''),
+    CONSTRAINT ck_damage_revisions_risk
+        CHECK (risk_level IN ('low', 'medium', 'high', 'critical')),
+    CONSTRAINT ck_damage_revisions_conclusion_nonblank CHECK (btrim(conclusion) <> ''),
+    CONSTRAINT ck_damage_revisions_confidence CHECK (confidence >= 0 AND confidence <= 1),
+    CONSTRAINT ck_damage_revisions_confirmation CHECK (
+        (status = 'confirmed'
+         AND origin_type = 'human'
+         AND confirmed_at IS NOT NULL
+         AND confirmed_by IS NOT NULL)
+        OR
+        (status <> 'confirmed' AND confirmed_at IS NULL AND confirmed_by IS NULL
+         AND confirmation_note IS NULL)
+    ),
+    CONSTRAINT ck_damage_revisions_high_risk_confirmation CHECK (
+        status <> 'confirmed'
+        OR risk_level IN ('low', 'medium')
+        OR (confirmation_note IS NOT NULL AND btrim(confirmation_note) <> '')
+    ),
+    CONSTRAINT ck_damage_revisions_metadata_object CHECK (jsonb_typeof(metadata) = 'object')
+);
+
+ALTER TABLE bridgeai_inspection.damage_observations
+    ADD CONSTRAINT fk_damage_observations_current_revision
+    FOREIGN KEY (
+        current_revision_id, organization_id, project_id, id, current_revision_no
+    )
+    REFERENCES bridgeai_inspection.damage_revisions
+               (id, organization_id, project_id, observation_id, revision_no)
+    ON DELETE RESTRICT
+    DEFERRABLE INITIALLY DEFERRED;
+
+CREATE TABLE bridgeai_inspection.damage_measurements (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    observation_id UUID NOT NULL,
+    revision_id UUID NOT NULL,
+    revision_no INTEGER NOT NULL,
+    metric_code TEXT NOT NULL,
+    metric_value NUMERIC NOT NULL,
+    unit_code TEXT NOT NULL,
+    method_code TEXT NOT NULL,
+    uncertainty_value NUMERIC NOT NULL,
+    uncertainty_unit_code TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_reference TEXT NOT NULL,
+    source_dataset_id UUID,
+    model_inference_run_id UUID,
+    measured_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_damage_measurements_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_measurements_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_measurements_revision_scope
+        FOREIGN KEY (revision_id, organization_id, project_id, observation_id, revision_no)
+        REFERENCES bridgeai_inspection.damage_revisions
+                   (id, organization_id, project_id, observation_id, revision_no)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_measurements_source_dataset
+        FOREIGN KEY (source_dataset_id, organization_id, project_id)
+        REFERENCES bridgeai_inspection.acquisition_datasets (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_measurements_model_run
+        FOREIGN KEY (model_inference_run_id, organization_id, project_id)
+        REFERENCES bridgeai_inspection.model_inference_runs (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_damage_measurements_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_damage_measurements_revision_metric_method
+        UNIQUE (revision_id, metric_code, method_code),
+    CONSTRAINT ck_damage_measurements_revision_positive CHECK (revision_no > 0),
+    CONSTRAINT ck_damage_measurements_metric_nonblank CHECK (btrim(metric_code) <> ''),
+    CONSTRAINT ck_damage_measurements_unit_nonblank CHECK (btrim(unit_code) <> ''),
+    CONSTRAINT ck_damage_measurements_method_nonblank CHECK (btrim(method_code) <> ''),
+    CONSTRAINT ck_damage_measurements_uncertainty CHECK (uncertainty_value >= 0),
+    CONSTRAINT ck_damage_measurements_uncertainty_unit
+        CHECK (btrim(uncertainty_unit_code) <> ''),
+    CONSTRAINT ck_damage_measurements_source_type
+        CHECK (source_type IN ('manual', 'instrument', 'model', 'derived')),
+    CONSTRAINT ck_damage_measurements_source_reference
+        CHECK (btrim(source_reference) <> ''),
+    CONSTRAINT ck_damage_measurements_source_shape CHECK (
+        (source_type = 'model' AND model_inference_run_id IS NOT NULL)
+        OR (source_type <> 'model' AND model_inference_run_id IS NULL)
+    )
+);
+
+CREATE TABLE bridgeai_inspection.damage_evidence (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    observation_id UUID NOT NULL,
+    revision_id UUID NOT NULL,
+    revision_no INTEGER NOT NULL,
+    artifact_id UUID NOT NULL,
+    artifact_version_id UUID NOT NULL,
+    evidence_role TEXT NOT NULL,
+    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+    evidence_locator JSONB NOT NULL DEFAULT '{}'::jsonb,
+    evidence_summary TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_damage_evidence_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_evidence_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_evidence_revision_scope
+        FOREIGN KEY (revision_id, organization_id, project_id, observation_id, revision_no)
+        REFERENCES bridgeai_inspection.damage_revisions
+                   (id, organization_id, project_id, observation_id, revision_no)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_evidence_artifact_scope
+        FOREIGN KEY (artifact_id, organization_id, project_id)
+        REFERENCES bridgeai_core.artifacts (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_damage_evidence_version_of_artifact
+        FOREIGN KEY (artifact_version_id, organization_id, project_id, artifact_id)
+        REFERENCES bridgeai_core.artifact_versions
+                   (id, organization_id, project_id, artifact_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_damage_evidence_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_damage_evidence_revision_artifact_role
+        UNIQUE (revision_id, artifact_version_id, evidence_role),
+    CONSTRAINT ck_damage_evidence_revision_positive CHECK (revision_no > 0),
+    CONSTRAINT ck_damage_evidence_role CHECK (
+        evidence_role IN (
+            'source_media', 'annotation', 'sensor_record',
+            'model_output', 'quality_report', 'review_record'
+        )
+    ),
+    CONSTRAINT ck_damage_evidence_locator_object
+        CHECK (jsonb_typeof(evidence_locator) = 'object'),
+    CONSTRAINT ck_damage_evidence_summary_nonblank CHECK (btrim(evidence_summary) <> '')
+);
+
+CREATE OR REPLACE FUNCTION bridgeai_inspection.reject_damage_revision_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION
+        'damage revision %/% is append-only; create a successor revision instead',
+        OLD.observation_id, OLD.revision_no
+        USING ERRCODE = 'object_not_in_prerequisite_state';
+END;
+$$;
+
+CREATE TRIGGER trg_damage_revisions_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_inspection.damage_revisions
+FOR EACH ROW
+EXECUTE FUNCTION bridgeai_inspection.reject_damage_revision_mutation();
+
+CREATE OR REPLACE FUNCTION bridgeai_inspection.reject_damage_revision_child_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION
+        '% rows are append-only; create evidence or measurements on a successor revision',
+        TG_TABLE_NAME
+        USING ERRCODE = 'object_not_in_prerequisite_state';
+END;
+$$;
+
+CREATE TRIGGER trg_damage_measurements_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_inspection.damage_measurements
+FOR EACH ROW
+EXECUTE FUNCTION bridgeai_inspection.reject_damage_revision_child_mutation();
+
+CREATE TRIGGER trg_damage_evidence_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_inspection.damage_evidence
+FOR EACH ROW
+EXECUTE FUNCTION bridgeai_inspection.reject_damage_revision_child_mutation();
+
+CREATE OR REPLACE FUNCTION bridgeai_inspection.validate_damage_observation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    current_status TEXT;
+    current_predecessor_id UUID;
+    current_predecessor_no INTEGER;
+    previous_entity_id UUID;
+    previous_evolution_state TEXT;
+    previous_observed_at TIMESTAMPTZ;
+BEGIN
+    IF NEW.current_revision_id IS NOT NULL THEN
+        SELECT dr.status, dr.predecessor_revision_id, dr.predecessor_revision_no
+        INTO current_status, current_predecessor_id, current_predecessor_no
+        FROM bridgeai_inspection.damage_revisions AS dr
+        WHERE dr.id = NEW.current_revision_id
+          AND dr.organization_id = NEW.organization_id
+          AND dr.project_id = NEW.project_id
+          AND dr.observation_id = NEW.id
+          AND dr.revision_no = NEW.current_revision_no;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'current revision does not exist in observation scope'
+                USING ERRCODE = 'foreign_key_violation';
+        END IF;
+
+        IF NEW.status = 'draft' AND current_status <> 'draft' THEN
+            RAISE EXCEPTION 'draft observation must point to a draft revision';
+        ELSIF NEW.status = 'pending_review' AND current_status <> 'pending_review' THEN
+            RAISE EXCEPTION 'pending_review observation must point to a pending_review revision';
+        ELSIF NEW.status = 'confirmed' AND current_status <> 'confirmed' THEN
+            RAISE EXCEPTION 'confirmed observation must point to a confirmed revision';
+        END IF;
+
+        IF TG_OP = 'UPDATE'
+           AND ROW(NEW.current_revision_id, NEW.current_revision_no)
+               IS DISTINCT FROM ROW(OLD.current_revision_id, OLD.current_revision_no) THEN
+            IF OLD.current_revision_id IS NULL AND NEW.current_revision_no <> 1 THEN
+                RAISE EXCEPTION 'first current revision must be revision 1';
+            ELSIF OLD.current_revision_id IS NOT NULL
+                  AND (
+                      current_predecessor_id IS DISTINCT FROM OLD.current_revision_id
+                      OR current_predecessor_no IS DISTINCT FROM OLD.current_revision_no
+                  ) THEN
+                RAISE EXCEPTION
+                    'current revision must advance to the direct successor of the old current revision';
+            END IF;
+        END IF;
+    END IF;
+
+    IF NEW.association_status = 'confirmed'
+       AND NEW.previous_observation_id IS NOT NULL THEN
+        SELECT previous.damage_entity_id, previous.evolution_state, previous.observed_at
+        INTO previous_entity_id, previous_evolution_state, previous_observed_at
+        FROM bridgeai_inspection.damage_observations AS previous
+        WHERE previous.id = NEW.previous_observation_id
+          AND previous.organization_id = NEW.organization_id
+          AND previous.project_id = NEW.project_id;
+
+        IF NOT FOUND OR previous_entity_id IS DISTINCT FROM NEW.damage_entity_id THEN
+            RAISE EXCEPTION 'confirmed evolution predecessor must belong to the same damage entity';
+        END IF;
+
+        IF previous_observed_at >= NEW.observed_at THEN
+            RAISE EXCEPTION 'evolution predecessor must be observed earlier';
+        END IF;
+
+        IF NEW.evolution_state = 'recurred'
+           AND previous_evolution_state <> 'repaired' THEN
+            RAISE EXCEPTION 'recurred evolution must follow a repaired observation';
+        END IF;
+    END IF;
+
+    IF TG_OP = 'UPDATE'
+       AND ROW(
+           NEW.current_revision_id, NEW.current_revision_no, NEW.status,
+           NEW.association_status, NEW.damage_entity_id,
+           NEW.candidate_damage_entity_id, NEW.previous_observation_id,
+           NEW.evolution_state
+       ) IS DISTINCT FROM ROW(
+           OLD.current_revision_id, OLD.current_revision_no, OLD.status,
+           OLD.association_status, OLD.damage_entity_id,
+           OLD.candidate_damage_entity_id, OLD.previous_observation_id,
+           OLD.evolution_state
+       ) THEN
+        IF NEW.version <> OLD.version + 1 OR NEW.updated_at <= OLD.updated_at THEN
+            RAISE EXCEPTION
+                'current/association transition must increment version and advance updated_at';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_damage_observations_validate
+BEFORE INSERT OR UPDATE ON bridgeai_inspection.damage_observations
+FOR EACH ROW
+EXECUTE FUNCTION bridgeai_inspection.validate_damage_observation();
+
+CREATE INDEX ix_damage_entities_component_status
+    ON bridgeai_inspection.damage_entities
+       (organization_id, project_id, asset_id, component_id, lifecycle_status);
+
+CREATE INDEX ix_model_inference_runs_dataset_status
+    ON bridgeai_inspection.model_inference_runs
+       (organization_id, project_id, input_dataset_id, status, created_at);
+
+CREATE INDEX ix_damage_revisions_observation_status
+    ON bridgeai_inspection.damage_revisions
+       (organization_id, project_id, observation_id, status, revision_no DESC);
+
+CREATE INDEX ix_damage_evidence_artifact_version
+    ON bridgeai_inspection.damage_evidence
+       (organization_id, project_id, artifact_id, artifact_version_id);
+```
+
+`confirmed_by` 与全局 `created_by/updated_by` 一样保存稳定审计主体 UUID，不单独绑定 `users`，以免丢失服务主体或历史身份语义。模型修订必须强关联 `model_inference_runs`，数据库 `CHECK` 保证其只能以 `draft/pending_review` 入库；人工对模型结果的采纳是新建后继 `human + confirmed` 修订，不是把模型修订原地改为已确认。高风险和极高风险修订还必须保存非空确认意见。
+
+`damage_measurements` 的每条量测都显式保存 metric/value/unit/method/uncertainty/source；模型来源还必须指向模型运行。`damage_evidence` 同时强关联 Artifact 和属于该 Artifact 的确定版本，不接受对象键、URL 或多态 ID 替代外键。修订、量测和证据均有数据库追加控制；错误只能在新修订中纠正。
+
 ## 8.14 多期病害关联与历史演变
+
+跨期演变状态只有以下六种，且它们是“本次观测相对前驱观测”的判定，不是直接覆盖稳定病害实体。
+
+| `evolution_state` | 语义 | 强制来源 |
+|---|---|---|
+| `new` | 首次确认的病害 | 无前驱，`association_method = initial`，保存人工确认主体和证据摘要 |
+| `persistent` | 与前期同一病害且主要量测无显著变化 | 同实体早于本次的前驱，人工确认或受控规则编码，以及证据摘要 |
+| `expanded` | 尺寸、面积、体积或严重度扩大 | 同实体前驱，当前/前期量测或人工评定，以及阈值规则或确认主体 |
+| `reduced` | 量测范围缩小但仍可观测 | 同 `expanded`，必须保留可复算的当前/前期量测或人工证据 |
+| `repaired` | 经处置后本期已不再呈现或已达修复标准 | 同实体前驱、处置/复查证据和人工确认或受控规则 |
+| `recurred` | 已判定修复后再次出现 | 前驱必须是同实体的 `repaired` 观测，并保留人工确认或受控规则证据 |
+
+`association_status = candidate` 时只能写 `candidate_damage_entity_id`，不得写最终 `damage_entity_id/evolution_state`。空间距离、模型相似度或单一规则命中都只能生成这种候选；空间近邻方法被 `CHECK` 排除在最终确认方法之外。候选转为 `confirmed` 时，只能保留人工确认（`association_confirmed_by`）或受控规则（`association_rule_code`）其一，并必须写入证据摘要。触发器额外验证前驱的实体、时间顺序和 `recurred <- repaired` 关系。
+
+空间候选查询必须先限定组织、项目和资产，再在项目适用投影坐标系内计算米制距离。查询结果只可写入 `candidate_damage_entity_id + association_status = candidate + association_method = spatial_proximity`，禁止直接更新稳定实体关联。
+
+当前确认修订及量测趋势按下列范式查询。所有关联都带完整项目作用域，可通过可空参数按资产、构件或稳定病害实体继续收窄。
+
+```sql
+WITH current_confirmed AS (
+    SELECT
+        de.id AS damage_entity_id,
+        de.asset_id,
+        de.component_id,
+        o.id AS observation_id,
+        o.observed_at,
+        o.evolution_state,
+        dr.id AS revision_id,
+        dr.revision_no,
+        dr.damage_type_code,
+        dr.severity_code,
+        dr.risk_level,
+        dr.confidence
+    FROM bridgeai_inspection.damage_entities AS de
+    JOIN bridgeai_inspection.damage_observations AS o
+      ON o.damage_entity_id = de.id
+     AND o.organization_id = de.organization_id
+     AND o.project_id = de.project_id
+     AND o.asset_id = de.asset_id
+    JOIN bridgeai_inspection.damage_revisions AS dr
+      ON dr.id = o.current_revision_id
+     AND dr.organization_id = o.organization_id
+     AND dr.project_id = o.project_id
+     AND dr.observation_id = o.id
+     AND dr.revision_no = o.current_revision_no
+    WHERE de.organization_id = :organization_id
+      AND de.project_id = :project_id
+      AND de.asset_id = :asset_id
+      AND (:component_id IS NULL OR de.component_id = :component_id)
+      AND (:damage_entity_id IS NULL OR de.id = :damage_entity_id)
+      AND o.association_status = 'confirmed'
+      AND o.status = 'confirmed'
+      AND dr.status = 'confirmed'
+), measurement_series AS (
+    SELECT
+        cc.*,
+        dm.metric_code,
+        dm.metric_value,
+        dm.unit_code,
+        dm.method_code,
+        dm.uncertainty_value,
+        dm.uncertainty_unit_code,
+        dm.source_type,
+        LAG(dm.metric_value) OVER (
+            PARTITION BY cc.damage_entity_id, dm.metric_code, dm.unit_code, dm.method_code
+            ORDER BY cc.observed_at, cc.observation_id
+        ) AS previous_metric_value
+    FROM current_confirmed AS cc
+    LEFT JOIN bridgeai_inspection.damage_measurements AS dm
+      ON dm.revision_id = cc.revision_id
+     AND dm.observation_id = cc.observation_id
+     AND dm.revision_no = cc.revision_no
+     AND dm.organization_id = :organization_id
+     AND dm.project_id = :project_id
+)
+SELECT
+    measurement_series.*,
+    metric_value - previous_metric_value AS metric_delta
+FROM measurement_series
+ORDER BY damage_entity_id, observed_at, metric_code, method_code;
+```
+
+该查询只读观测的显式当前指针，因此被后继修订替代的旧版仍可通过主键引用和追溯，但不会意外进入默认趋势。
+
+```sql
+CREATE INDEX ix_damage_observations_entity_time
+    ON bridgeai_inspection.damage_observations
+       (organization_id, project_id, asset_id, damage_entity_id, observed_at)
+    WHERE association_status = 'confirmed';
+
+CREATE INDEX ix_damage_observations_candidates
+    ON bridgeai_inspection.damage_observations
+       (organization_id, project_id, asset_id, candidate_damage_entity_id, observed_at)
+    WHERE association_status = 'candidate';
+
+CREATE INDEX ix_damage_measurements_trend
+    ON bridgeai_inspection.damage_measurements
+       (organization_id, project_id, observation_id, metric_code, unit_code, method_code);
+```
 
 ## 8.15 Workflow 数据模型兼容收敛
 
