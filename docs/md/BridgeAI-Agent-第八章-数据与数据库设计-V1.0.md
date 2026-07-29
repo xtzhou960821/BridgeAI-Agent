@@ -8321,7 +8321,6 @@ pg_basebackup \
   --pgdata="$BRIDGEAI_BASEBACKUP_DIR" \
   --format=plain \
   --wal-method=stream \
-  --checkpoint=fast \
   --manifest-checksums=SHA256 \
   --progress
 
@@ -8349,6 +8348,10 @@ pg_restore \
   "$BRIDGEAI_LOGICAL_DUMP"
 ```
 
+`pg_basebackup` 默认使用 spread checkpoint；除非容量测试证明 WAL/IO 峰值可承受、变更已
+审批且处于维护窗口，不得以 `--checkpoint=fast` 覆盖默认值。fast checkpoint 不是 RPO/RTO
+达标证据，也不得为缩短备份表面耗时牺牲在线工作负载。
+
 逻辑恢复目标必须是新建空库；`pg_dumpall --globals-only --no-role-passwords` 只保存角色
 属性和成员关系，不保存 verifier，恢复时由密钥管理流程重新配置凭据。对象 owner、角色
 成员关系、RLS 和函数授权随后按迁移 manifest 恢复并以目录查询验收，而不是因为使用了
@@ -8368,9 +8371,13 @@ manifest、已验证约束、有效索引、分区边界、行数和不可变列
 
 ### 8.25.3 Artifact Manifest 与跨存储一致恢复点
 
-Artifact Manifest 不是对象 key 列表，而是数据库恢复边界处的不可变引用集合。备份
-控制器在 `REPEATABLE READ, READ ONLY` 快照内记录 `pg_current_wal_lsn()`、事务时间和
-Alembic heads，并导出所有尚未 `deleted` 的版本。示例字段合同如下：
+Artifact Manifest 不是对象 key 列表，而是受控写屏障关闭后的不可变引用集合。不得用
+`pg_current_wal_lsn()` 冒充 MVCC 快照或跨存储边界。备份控制器先关闭所有权威写入口、
+等待在途写事务排空，并记录 `write_barrier_closed_at` 与唯一
+`recovery_point_name`；随后由受控备份角色调用 `pg_create_restore_point`，将返回的
+`restore_point_lsn` 与该名称写入恢复点记录。只有在该写屏障仍关闭时，才在
+`REPEATABLE READ, READ ONLY` 事务导出 Manifest；查询按冻结时间／版本边界过滤，不接收
+屏障后的 Artifact 版本。示例字段合同如下：
 
 ```sql
 SELECT
@@ -8402,20 +8409,34 @@ JOIN bridgeai_core.artifact_versions AS av
   ON (av.artifact_id, av.organization_id, av.project_id)
    = (a.id, a.organization_id, a.project_id)
 WHERE av.status <> 'deleted'
+  AND av.created_at <= :write_barrier_closed_at
+  AND av.updated_at <= :write_barrier_closed_at
 ORDER BY a.organization_id, a.project_id, a.id, av.revision_no;
 ```
 
-Manifest 使用确定性 CSV 或 JSON Lines 编码，记录行数、总字节数、文件 SHA-256、生成器
-版本、数据库 LSN、快照时间和签名人；文件本身写入版本化、加密、不可覆盖的备份位置。
-对象复制任务逐项读取精确 `object_version_id`，流式计算哈希而不把大对象整体装入内存。
-`sha256`/`size_bytes` 为空的 staged 行只可作为待收敛异常登记，不能计入已保护对象；
-active/archived/revoked/deleting 对象缺版本、缺哈希或 legal hold/retention 元数据不一致
-均阻断备份完成。
+在同一写屏障中先创建命名恢复点，再打开只读快照：
 
-PostgreSQL 快照与对象清单必须形成命名恢复点：先冻结或版本化业务写入边界，记录 LSN，
-导出 Manifest，再等待 Manifest 所列对象版本全部进入备份故障域，最后写完成标记。完成
-标记包含 PostgreSQL backup ID、WAL 连续上界和 Manifest SHA-256。没有该完成标记的
-组合只能作为候选恢复材料，不能宣称达到 RPO。
+```sql
+-- 此调用只在隔离演练或批准的备份控制器中执行；名称在控制平面全局唯一。
+SELECT pg_create_restore_point(:recovery_point_name) AS restore_point_lsn;
+
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+-- 导出以上带 :write_barrier_closed_at 的 Manifest 查询，并记录 snapshot_started_at。
+COMMIT;
+```
+
+Manifest 使用确定性 CSV 或 JSON Lines 编码，记录行数、总字节数、文件 SHA-256、生成器
+版本、`recovery_point_name`、`restore_point_lsn`、`write_barrier_closed_at`、快照时间和签名人；
+文件本身写入版本化、加密、不可覆盖的备份位置。对象复制任务逐项读取精确
+`object_version_id`，流式计算哈希而不把大对象整体装入内存。`sha256`/`size_bytes` 为空的
+staged 行只可作为待收敛异常登记，不能计入已保护对象；active/archived/revoked/deleting
+对象缺版本、缺哈希或 legal hold/retention 元数据不一致均阻断备份完成。
+
+PostgreSQL 与对象清单必须形成命名恢复点：写屏障关闭并排空事务 → 创建
+`recovery_point_name/restore_point_lsn` → 导出冻结边界 Manifest → 等待 Manifest 所列对象版本
+全部进入备份故障域 → 写入完成标记。完成标记至少包含 PostgreSQL backup ID、WAL 连续上界、
+`recovery_point_name`、`restore_point_lsn`、Manifest SHA-256、对象版本全量校验状态和
+`completed_at`。没有该完成标记的组合只能作为候选恢复材料，不能宣称达到 RPO。
 
 ### 8.25.4 隔离恢复顺序与逐步门禁
 
@@ -8492,7 +8513,7 @@ P95。
 数据库查询时延中隐藏。每个场景至少有足以稳定分位数的样本，预热、正式测量和故障
 注入结果分开保存。零错误且 P95 达标才通过；超时请求仍计入分位和错误率。
 
-代表性计划使用真实绑定值和应用角色采集：
+代表性 Q1 只读计划使用真实绑定值和应用角色采集：
 
 ```sql
 BEGIN READ ONLY;
@@ -8501,15 +8522,29 @@ SELECT set_config('app.organization_id', :organization_id, true);
 SELECT set_config('app.project_id', :project_id, true);
 
 EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON)
--- 此处粘贴 8.22.2 Q1 或 Q5 的原样 SQL，并绑定同一验收参数；不得改写为简化查询。
-SELECT 1;
+-- 此处粘贴 8.22.2 Q1 的原样 SQL，并绑定同一验收参数；不得改写为简化查询。
 ROLLBACK;
 ```
 
-上例的 `SELECT 1` 只是说明 `EXPLAIN` 语法位置，不是可接受计划。证据必须替换为 Q1/Q5
-真实查询，保存实际／估算行数、loop、shared/local/temp block、sort spill、WAL、planning/
-execution time、分区剪枝和索引条件。生产环境只在审批的低风险窗口使用 `ANALYZE`；
-不得为“好看”的计划关闭 RLS、强制 planner GUC、移除真实 JOIN 或只选最有利参数。
+Q5 含 `FOR UPDATE SKIP LOCKED`，`EXPLAIN ANALYZE` 会执行并锁定候选行，不能放入
+`BEGIN READ ONLY`，也不能在生产 Worker 流量中临时运行。仅在隔离、非生产数据库以受控
+测试角色运行下列可回滚事务；锁只保留到 `ROLLBACK`：
+
+```sql
+BEGIN READ WRITE;
+SET LOCAL ROLE bridgeai_migration_owner;
+SELECT set_config('app.organization_id', :organization_id, true);
+SELECT set_config('app.project_id', :project_id, true);
+
+EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON)
+-- 此处粘贴 8.22.2 Q5 的原样 SQL，并绑定同一验收参数；不得改写为简化查询。
+ROLLBACK;
+```
+
+上例不是 `SELECT 1` 的替代品。证据必须保存 Q1/Q5 真实查询的实际／估算行数、loop、
+shared/local/temp block、sort spill、WAL、planning/execution time、分区剪枝和索引条件。
+生产环境只在审批的低风险窗口使用 `ANALYZE`；不得为“好看”的计划关闭 RLS、强制 planner
+GUC、移除真实 JOIN 或只选最有利参数。
 
 ### 8.26.2 容量模型、预测与扩缩容门槛
 
@@ -8572,6 +8607,7 @@ FROM pg_stat_archiver;
 | 缓存／IO | `pg_stat_database` 的 blks_hit/read、temp_bytes；OS 磁盘时延 | cache hit ratio 异常下降或 temp_bytes 速率较基线翻倍 15 分钟 P2；磁盘延迟越 SLO P1 | 对照工作负载和 plan，检查 spill、顺扫、统计信息与磁盘 |
 | 表健康 | `pg_stat_user_tables` 的 dead/live、last_autovacuum/analyze；`pg_stat_progress_vacuum` | `dead/live > 10%` 且 dead > 100000 持续 30 分钟 P2；关键表 24 小时未 analyze 且变化大为 P2 | 查长事务和 autovacuum 配置，先验证再手动 VACUUM/ANALYZE |
 | 复制／归档／备份 | `pg_stat_replication` LSN 差、`pg_stat_archiver`、备份作业和季度恢复证据 | 归档 5/10 分钟阈值见 8.26.2；最近成功物理备份超过计划窗口 P1；季度恢复逾期 P1 | 先保护 WAL 连续性和介质容量；不能以 archive_timeout 关闭告警 |
+| 端到端恢复点年龄 | 备份控制平面仅在 PostgreSQL backup、`recovery_point_name/restore_point_lsn`、Manifest digest 和全部对象版本校验均完成后写入完成标记；`latest_completed_recovery_point_age_seconds = now() - max(completed_at)`；维度仅 `environment,backup_policy` | >10 分钟 P2；>15 分钟 P1，缺完成标记或任一组成状态非 verified 立即 P1 | 灾备/DB/对象存储 owner 停止把候选材料标为可恢复，检查写屏障、WAL 连续性、Manifest 与对象复制，修复后重新生成完整恢复点；不得以单独 PostgreSQL 备份或对象同步清零告警 |
 | 分区／约束／索引 | 目录巡检、DEFAULT 行数、未来边界、`convalidated`、`indisvalid/indisready` | DEFAULT > 0、约束意外未验证、失效索引均 P1 | 停相关发布／归档，按 8.23/8.24 前滚修复 |
 | Outbox／删除 | `outbox_events`、`deletion_jobs`、`retention_executions` 的状态年龄和 semantic digest | oldest 30 秒 P2／5 分钟 P1；dead-letter 或删除状态倒退 P1 | 保持 revoked/deny-read，检查 lease、worker 和外部依赖，受控重放 |
 | Artifact | Manifest 对账、对象 HEAD/GET、哈希抽样 | 强引用版本缺失、SHA-256 不一致、legal hold/retention 漂移均 P0/P1 | 阻断对象及上层证据读取，保全版本和审计，不以 latest 替代 |
@@ -8637,7 +8673,7 @@ Checkpoint 版本；Qdrant collection/payload/别名；ACL、Embedding、检索�
 | 物理备份与 PITR | 基准备份验证并回放到选定事务；角色/RLS/约束/Checkpoint 完整 | 删除一段演练 WAL、错误时间线、目标点之后 canary、归档中断 | backup/WAL manifest、replay LSN、目标事务、失败日志、实测 RPO/RTO | 全链 ≤15 分钟/≤4 小时，否则 FAILED |
 | 逻辑恢复 | custom dump 恢复到新空 PostgreSQL 17 库并做目录/数据对账 | 非空目标、缺角色／扩展、错误 revision、约束/RLS/grant 漂移阻断 | dump digest、restore list/exit、catalog diff、行数/hash | 仅作补充证据，不冒充 PITR |
 | Artifact/MinIO | Manifest 中每个强引用 object_version_id 可读且 hash/size 一致 | latest 与 version 不同、缺版本、篡改字节、legal hold/retention 漂移、对象服务中断 | Manifest digest、inventory、HEAD/GET 和 SHA-256 汇总 | 差异为 0；否则相关上层拒读 |
-| PostGIS | 目标 SRID、空间约束、Q1/Q5、GiST 和空间结果在真实扩展运行 | 错 SRID、越界坐标、空 geometry、错误 bbox 被拒绝；计划退化阻断 | PostGIS 版本、SRID、结果集、`EXPLAIN (ANALYZE, BUFFERS)` | 没有 PostGIS 实例不得标 PASS |
+| PostGIS | 目标 SRID、空间约束、Q2/Q6、GiST 和空间结果在真实扩展运行 | 错 SRID、越界坐标、空 geometry、错误 bbox 被拒绝；计划退化阻断 | PostGIS 版本、SRID、结果集、`EXPLAIN (ANALYZE, BUFFERS)` | 没有 PostGIS 实例不得标 PASS |
 | Qdrant/RAG/Memory | 从 active/published 权威集重建隔离集合并通过双向差集和 ACL | 集合全丢失、部分写、旧别名、跨集合／跨项目 payload、revoked point 被拒绝 | collection config/index version、Point 差集、别名、降级日志 | 差集和越权为 0 后才切别名 |
 | Workflow/Checkpoint | 原 thread 从最后稳定节点恢复，复核结果、报告和 context manifest 对账 | Checkpoint 后进程终止、Interrupt 重入、Artifact 缺失、权限／来源变化进入复核 | task/run/thread/checkpoint 时间线、幂等副作用、人工决策 | 不静默跳节点、不重复副作用 |
 | 性能与容量 | 8.26.1 三类 P95、第五至七章代表链和容量快照达标 | 冷缓存、20 并发、池饱和、锁、磁盘／WAL 压力、索引重建竞争和超时 | 完整实验合同、原始 histogram、EXPLAIN JSON、资源曲线、错误率 | 条件不完整或只测热缓存不得通过 |
