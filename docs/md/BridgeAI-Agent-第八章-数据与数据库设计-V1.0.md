@@ -7389,9 +7389,499 @@ GRANT EXECUTE ON FUNCTION bridgeai_audit.event_details_are_safe(JSONB)
 
 ## 8.22 索引、查询与空间检索优化
 
+### 8.22.1 索引选择矩阵
+
+索引以已登记的查询形状为起点，不以“字段重要”为理由遍历建索引。主键和 `UNIQUE` 约束已有隐式 B-tree，不重复建等价索引；PostgreSQL 不自动为外键引用列建索引，只有父行删除／更新或子表联接的真实路径需要时才补齐。复合索引先放组织、项目等值边界，再放业务等值、范围和排序列。
+
+| 查询路径 | 谓词／排序 | 决策 | 写放大控制 |
+|---|---|---|---|
+| 项目任务列表 | `organization_id, project_id, status` 等值，`updated_at DESC` | 复用 `ix_workflow_tasks_scope_status` | 已覆盖边界、状态和时间；只有真实计划证明回表是主要成本时才增加有限 `INCLUDE` |
+| 多期病害 | 项目／资产／稳定病害，按 `observed_at` | 复用 `ix_damage_observations_entity_time`、`ix_damage_measurements_trend` | 部分索引只收 confirmed 关联；current revision 由既有组合唯一索引点查 |
+| 当前报告版本 | 项目、`report_code`，再按 current pointer 联接 | 复用 `uq_reports_project_code`、`uq_report_revisions_id_scope_report_revision` | 两步均是唯一点查，不再建等价 current 索引 |
+| 待复核 | 项目、`pending/claimed`、priority/due time | 复用 `ix_workflow_reviews_pending` | 只有热集合入索引；领取仍由受控写入、锁和 lease 完成 |
+| Outbox Claim | `pending/retry`、到期时间，按 available/created/id | 复用 `ix_outbox_events_claim` | 与 8.20 `FOR UPDATE SKIP LOCKED` 顺序一致 |
+| 空间范围 | 组织／项目／资产 + `&&` + `ST_Intersects` | 复用 scope B-tree 与 `ix_spatial_locations_geom_4490` GiST | 标准列为 `geom_4490 geometry(Geometry,4490)`；不以 EPSG:4490 角度计算米制距离 |
+| 名称模糊查找 | 项目内 `lower(assets.name) % lower(:query)` | 新增 `pg_trgm` GIN | 只覆盖有明确入口的资产名；构件别名先用精确 `alias_code`，不为全部 text 建 Trigram |
+| 顺序追加事件 | 月分区内时间范围 | 大分区才启用 BRIN | 只用于与物理写入顺序高相关的 `occurred_at/server_recorded_at`；相关性下降或分区很小时不建 |
+| JSONB 条件 | 版本化且高频的单一标量路径 | V1 allowlist 为空，拒绝通用 GIN | `status/event_type/aggregate_id` 已结构化；只有查询登记、JSON Schema、选择率和写成本均通过后才引入有限表达式索引 |
+
+空间索引的唯一基线仍是 8.11 已定义的 `ON bridgeai_asset.spatial_locations USING GIST (geom_4490)`，本节不重复创建。正式环境必须在含 PostGIS 的 PostgreSQL 16+ 上对它和 Q6 执行验收；未安装 PostGIS 的环境只能报告静态校验结果。
+
+外键父端的唯一索引不解决子端反向检索。报告按 Workflow run 回溯和复核按 node execution 回溯增加下列非等价子端索引：
+
+```sql
+-- 扩展由迁移所有者安装；生产 CONCURRENTLY DDL 按 8.24 拆为非事务迁移。
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_assets_name_trgm
+    ON bridgeai_asset.assets USING GIN (lower(name) gin_trgm_ops);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_workflow_reviews_node_execution_fk
+    ON bridgeai_workflow.workflow_reviews
+       (node_execution_id, organization_id, project_id, task_id, run_id)
+    WHERE node_execution_id IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_report_revisions_workflow_run_fk
+    ON bridgeai_report.report_revisions
+       (workflow_run_id, organization_id, project_id, workflow_task_id);
+```
+
+fresh install 可在业务写入前直接于分区父表建 BRIN；PostgreSQL 会为已有及后续新建分区维护匹配子索引。在线父表不能使用 `CREATE INDEX CONCURRENTLY`：须先逐个子表并发建索引，再将子索引 `ATTACH PARTITION` 到父索引。
+
+```sql
+CREATE INDEX IF NOT EXISTS ix_workflow_events_occurred_brin
+    ON bridgeai_workflow.workflow_events
+    USING BRIN (occurred_at) WITH (pages_per_range = 32, autosummarize = on);
+CREATE INDEX IF NOT EXISTS ix_audit_events_recorded_brin
+    ON bridgeai_audit.audit_events
+    USING BRIN (server_recorded_at) WITH (pages_per_range = 32, autosummarize = on);
+CREATE INDEX IF NOT EXISTS ix_data_access_events_recorded_brin
+    ON bridgeai_audit.data_access_events
+    USING BRIN (server_recorded_at) WITH (pages_per_range = 32, autosummarize = on);
+```
+
+### 8.22.2 真实查询合同
+
+应用必须显式传入组织／项目边界，不能依赖 RLS 为遗漏谓词“补滤”。
+
+```sql
+-- Q1：项目任务列表，使用稳定 seek cursor 而非深 OFFSET。
+SELECT id, thread_id, task_type, status, current_node, progress,
+       requested_at, updated_at, version
+FROM bridgeai_workflow.workflow_tasks
+WHERE organization_id = :organization_id
+  AND project_id = :project_id
+  AND status = :status
+  AND (updated_at, id) < (:cursor_updated_at, :cursor_id)
+ORDER BY updated_at DESC, id DESC
+LIMIT :page_size;
+
+-- Q2：多期病害的当前 confirmed 修订。
+SELECT o.id AS observation_id, o.observed_at, o.evolution_state,
+       r.id AS revision_id, r.revision_no, r.damage_type_code,
+       r.severity_code, r.risk_level, r.confidence
+FROM bridgeai_inspection.damage_observations AS o
+JOIN bridgeai_inspection.damage_revisions AS r
+  ON (r.id, r.organization_id, r.project_id, r.observation_id, r.revision_no)
+   = (o.current_revision_id, o.organization_id, o.project_id, o.id,
+      o.current_revision_no)
+WHERE o.organization_id = :organization_id
+  AND o.project_id = :project_id
+  AND o.asset_id = :asset_id
+  AND o.damage_entity_id = :damage_entity_id
+  AND o.association_status = 'confirmed'
+  AND o.status = 'confirmed'
+  AND r.status = 'confirmed'
+ORDER BY o.observed_at, o.id;
+
+-- Q3：通过真实 current pointer 取当前报告修订。
+SELECT p.id, p.report_code, p.status, r.id AS revision_id, r.revision_no,
+       r.content_sha256, r.snapshot_manifest_sha256
+FROM bridgeai_report.reports AS p
+JOIN bridgeai_report.report_revisions AS r
+  ON (r.id, r.organization_id, r.project_id, r.report_id, r.revision_no)
+   = (p.current_revision_id, p.organization_id, p.project_id, p.id,
+      p.current_revision_no)
+WHERE p.organization_id = :organization_id
+  AND p.project_id = :project_id
+  AND p.report_code = :report_code;
+
+-- Q4：待复核列表；状态改变另由带 lease 的受控写入完成。
+SELECT id, task_id, run_id, node_execution_id, review_type,
+       priority, title, due_at, created_at
+FROM bridgeai_workflow.workflow_reviews
+WHERE organization_id = :organization_id
+  AND project_id = :project_id
+  AND status IN ('pending', 'claimed')
+ORDER BY CASE priority
+             WHEN 'critical' THEN 4 WHEN 'high' THEN 3
+             WHEN 'normal' THEN 2 WHEN 'low' THEN 1
+         END DESC,
+         due_at NULLS LAST, id
+LIMIT :page_size;
+
+-- Q5：Outbox 候选；实际 Worker 调用 8.20 claim_outbox_events()。
+SELECT id
+FROM bridgeai_core.outbox_events
+WHERE organization_id = :organization_id
+  AND project_id = :project_id
+  AND status IN ('pending', 'retry')
+  AND available_at <= clock_timestamp()
+  AND attempt_count < max_attempts
+ORDER BY available_at, created_at, id
+FOR UPDATE SKIP LOCKED
+LIMIT :claim_limit;
+
+-- Q6：EPSG:4490 范围查询，先包围盒再精确拓扑。
+WITH query_area AS (SELECT ST_GeomFromText(:query_wkt, 4490) AS geom)
+SELECT sl.id, sl.asset_id, sl.component_id, sl.location_kind, sl.geom_4490
+FROM bridgeai_asset.spatial_locations AS sl
+CROSS JOIN query_area AS qa
+WHERE sl.organization_id = :organization_id
+  AND sl.project_id = :project_id
+  AND sl.asset_id = :asset_id
+  AND sl.geom_4490 && qa.geom
+  AND ST_Intersects(sl.geom_4490, qa.geom);
+```
+
+Trigram 同样不得跨项目搜索：
+
+```sql
+SELECT id, asset_code, name, similarity(lower(name), lower(:query)) AS score
+FROM bridgeai_asset.assets
+WHERE organization_id = :organization_id
+  AND project_id = :project_id
+  AND lower(name) % lower(:query)
+ORDER BY score DESC, id
+LIMIT 20;
+```
+
+### 8.22.3 `EXPLAIN` 验收与索引生命周期
+
+索引创建成功不等于查询达标。Q1—Q6 每条关键查询都必须留存 query ID/SQL hash、应用与 Schema 版本、参数类型和脱敏参数；总行数、租户行数、状态分布、月分区大小和倾斜；PostgreSQL 小版本、实例规格、规划参数、并发数，以及冷、热缓存各一轮。
+
+验收保存 `EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, VERBOSE)` 全文，包括实际／估算行、loops、shared hit/read/dirtied、temp I/O 和 WAL。p50/p95/p99、吞吐、超时率和最大扫描量由容量测试按目标硬件批准；本章不伪造脱离环境的毫秒门限。
+
+```sql
+ANALYZE bridgeai_workflow.workflow_tasks;
+EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, VERBOSE)
+SELECT id, status, updated_at
+FROM bridgeai_workflow.workflow_tasks
+WHERE organization_id = :organization_id
+  AND project_id = :project_id
+  AND status = :status
+ORDER BY updated_at DESC
+LIMIT 50;
+```
+
+验收须解释分区剪枝、计划节点和读块，不强制所有查询都是 Index Scan：小表或低选择率参数使用 Seq Scan 可以正确。当实际／估算行持续相差一个数量级时，先检查倾斜、`ANALYZE` 和扩展统计。覆盖索引的 `INCLUDE` 只放稳定、小型、高频返回列；JSONB、正文和高频更新列默认不放入。
+
+每个新索引上线前后比较表／索引字节数、TPS、WAL、checkpoint 和 `pg_stat_user_indexes.idx_scan`。连续两个完整观察周期无读取且无约束用途的索引，经 query owner 确认后才下线。分区事件表同时观察 `n_dead_tup`、autovacuum/autoanalyze、BRIN 时间相关性和默认分区积压；高频 UPDATE 表与追加事件分区分别调参，不能用一组全局值覆盖所有表。
+
 ## 8.23 分区、归档、保留与删除传播
 
+### 8.23.1 月分区边界
+
+首期只分区高增长时间序列。`assets`、`projects`、`damage_entities`、`damage_observations`、`reports` 及其修订表不分区；强外键、current pointer 和不可变历史优先于时间裁剪。
+
+| 表 | RANGE 键 | 当前形态与动作 |
+|---|---|---|
+| `workflow_events` | `occurred_at` | 8.15 已是父表和 `workflow_events_default`；只增量建月分区，不重建父表 |
+| `audit_events` | `server_recorded_at` | 8.19 已是父表和 `audit_events_default`；不使用客户端 `occurred_at` 路由 |
+| `data_access_events` | `server_recorded_at` | 同上 |
+| `workflow_node_executions` | `created_at` | 当前非分区；必须走 8.23.4/8.24 的兼容影子迁移，不能一句 `ALTER TABLE` 原地修改 |
+
+边界统一按 UTC 半开区间 `[from,to)`，分区名月份也按 UTC。新环境／维护窗口的 2026-08 示例：
+
+```sql
+CREATE TABLE bridgeai_workflow.workflow_events_2026_08
+    PARTITION OF bridgeai_workflow.workflow_events
+    FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00');
+CREATE TABLE bridgeai_audit.audit_events_2026_08
+    PARTITION OF bridgeai_audit.audit_events
+    FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00');
+CREATE TABLE bridgeai_audit.data_access_events_2026_08
+    PARTITION OF bridgeai_audit.data_access_events
+    FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00');
+```
+
+运维任务每天检查并至少预建“当月 + 下两月”。经父表访问使用父表 RLS；父表权限不会变成对子表的直接访问权限，因此默认不向应用角色 grant 子表。若特权运维必须直读子表，须对子表单独 `ENABLE/FORCE ROW LEVEL SECURITY`、建等价 Policy 并只 grant 该运维角色。新分区 owner、RLS、Policy、grant、行级触发器和索引继承均以系统目录验收。
+
+### 8.23.2 默认分区、迟到数据与 ATTACH
+
+DEFAULT 分区是防止路由故障丢数的短时护栏，不是归档区。下列查询每 5 分钟执行；任一计数非 0 立即告警：
+
+```sql
+SELECT 'workflow_events_default' AS partition_name,
+       count(*) AS row_count, min(occurred_at) AS min_key, max(occurred_at) AS max_key
+FROM bridgeai_workflow.workflow_events_default
+UNION ALL
+SELECT 'audit_events_default', count(*), min(server_recorded_at), max(server_recorded_at)
+FROM bridgeai_audit.audit_events_default
+UNION ALL
+SELECT 'data_access_events_default', count(*), min(server_recorded_at), max(server_recorded_at)
+FROM bridgeai_audit.data_access_events_default;
+```
+
+发布门禁另查未来 62 天是否有完整边界。DEFAULT 有行时先区分“未预建”与合法迟到数据，禁止改写事件时间。DEFAULT 中有重叠行会阻止直接建分区，迟到月份按以下流程迁移：
+
+```sql
+CREATE TABLE bridgeai_workflow.workflow_events_2026_07_late
+    (LIKE bridgeai_workflow.workflow_events
+     INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES
+     INCLUDING STORAGE INCLUDING COMMENTS);
+ALTER TABLE bridgeai_workflow.workflow_events_2026_07_late
+    ADD CONSTRAINT ck_workflow_events_2026_07_late
+    CHECK (occurred_at >= TIMESTAMPTZ '2026-07-01 00:00:00+00'
+       AND occurred_at <  TIMESTAMPTZ '2026-08-01 00:00:00+00');
+
+BEGIN;
+LOCK TABLE bridgeai_workflow.workflow_events_default IN ACCESS EXCLUSIVE MODE;
+ALTER TABLE bridgeai_workflow.workflow_events_default DISABLE TRIGGER USER;
+INSERT INTO bridgeai_workflow.workflow_events_2026_07_late
+SELECT * FROM bridgeai_workflow.workflow_events_default
+WHERE occurred_at >= TIMESTAMPTZ '2026-07-01 00:00:00+00'
+  AND occurred_at <  TIMESTAMPTZ '2026-08-01 00:00:00+00';
+DELETE FROM bridgeai_workflow.workflow_events_default
+WHERE occurred_at >= TIMESTAMPTZ '2026-07-01 00:00:00+00'
+  AND occurred_at <  TIMESTAMPTZ '2026-08-01 00:00:00+00';
+ALTER TABLE bridgeai_workflow.workflow_events_default ENABLE TRIGGER USER;
+ALTER TABLE bridgeai_workflow.workflow_events
+    ATTACH PARTITION bridgeai_workflow.workflow_events_2026_07_late
+    FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-08-01 00:00:00+00');
+COMMIT;
+```
+
+该流程仅由迁移所有者执行，期间暂停目标父表写入或由上游缓冲。事务前后比较目标范围的 `count(*)`、`min/max(id)`、`min/max(occurred_at)` 和稳定聚合哈希；任一不一致即回滚。`DISABLE TRIGGER USER` 仅用于移动已经提交且追加不可变的 DEFAULT 行，不是业务删除通道。审计／访问事件使用同一流程，并将核对键换成 `server_recorded_at`。
+
+### 8.23.3 父子索引和在线限制
+
+分区父索引不存数据，真实存储在子索引。`CREATE TABLE ... PARTITION OF` 会为现有父索引建立匹配子索引。大存量独立表先加已验证的边界 CHECK，再于事务外逐子表 `CREATE INDEX CONCURRENTLY`，最后在短事务中 ATTACH 表和索引。PostgreSQL 17 不支持对分区父表 `CREATE INDEX CONCURRENTLY`。
+
+```sql
+SELECT parent.relname AS parent_index, child.relname AS child_index,
+       i.indisvalid, i.indisready
+FROM pg_inherits AS inh
+JOIN pg_class AS parent ON parent.oid = inh.inhparent
+JOIN pg_class AS child ON child.oid = inh.inhrelid
+JOIN pg_index AS i ON i.indexrelid = child.oid
+WHERE parent.relkind = 'I'
+  AND parent.relnamespace IN (
+      'bridgeai_workflow'::regnamespace, 'bridgeai_audit'::regnamespace
+  )
+ORDER BY parent.relname, child.relname;
+```
+
+任何 `indisvalid=false` 或 `indisready=false` 均阻断发布。失败的 concurrent index 先诊断，再 `DROP INDEX CONCURRENTLY` 后重试；同名 `IF NOT EXISTS` 不能证明其有效。
+
+### 8.23.4 `workflow_node_executions` 兼容分区
+
+该表当前以 `id` 为主键，且 run/node/attempt、idempotency 跨全表唯一；`workflow_reviews` 还以五列组合外键引用它。PostgreSQL 要求分区表的 PK/UNIQUE 包含分区键，简单加入 `created_at` 会把全局唯一错误地弱化为同时间唯一。
+
+兼容方案使用不分区键登记表保持全局唯一，月分区表保存大体量执行内容：
+
+```sql
+CREATE TABLE bridgeai_workflow.workflow_node_execution_keys (
+    id UUID PRIMARY KEY,
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    task_id UUID NOT NULL,
+    run_id UUID NOT NULL,
+    node_name TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT uq_workflow_node_execution_keys_scope
+        UNIQUE (id, organization_id, project_id, task_id, run_id, created_at),
+    CONSTRAINT uq_workflow_node_execution_keys_attempt
+        UNIQUE (organization_id, project_id, run_id, node_name, attempt),
+    CONSTRAINT uq_workflow_node_execution_keys_idempotency
+        UNIQUE (organization_id, project_id, idempotency_key),
+    CONSTRAINT fk_workflow_node_execution_keys_run FOREIGN KEY (
+        run_id, organization_id, project_id, task_id
+    ) REFERENCES bridgeai_workflow.workflow_runs
+      (id, organization_id, project_id, task_id) ON DELETE RESTRICT
+);
+
+-- 正式迁移显式列出 8.15 的全部列、CHECK 和 task/run FK，并在末尾声明：
+CREATE TABLE bridgeai_workflow.workflow_node_executions_partitioned (
+    LIKE bridgeai_workflow.workflow_node_executions
+    INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING STORAGE INCLUDING COMMENTS,
+    PRIMARY KEY (id, created_at),
+    UNIQUE (id, organization_id, project_id, task_id, run_id, created_at),
+    FOREIGN KEY (id, organization_id, project_id, task_id, run_id, created_at)
+        REFERENCES bridgeai_workflow.workflow_node_execution_keys
+          (id, organization_id, project_id, task_id, run_id, created_at)
+        ON DELETE RESTRICT
+) PARTITION BY RANGE (created_at);
+```
+
+`LIKE` 不复制外键，原 PK/UNIQUE 也不能原样放入分区表；正式 Alembic 必须显式重建 task/run 外键、全部 CHECK、不可变控制、RLS/Policy/owner/grant 和父子索引。登记行与分区行在同一事务写入，重试由登记表三个全局唯一约束判断同语义或冲突。
+
+`workflow_reviews` 在 expand 期新增可空 `node_execution_created_at`，从旧 node 行回填；验证后建立包含该时间的六列外键。`node_execution_id` 为空时新列也为空，非空时两者均非空。旧五列 FK 仅在六列 FK `VALIDATE` 成功、所有实例切换后删除。
+
+### 8.23.5 归档与保留门禁
+
+生命周期使用既有表的真实状态，不强行为每表添加同一状态集：`active` 可读可引用；`archived` 退出热查询但仍保留引用和恢复；`revoked` 立即拒绝新读取／引用；`deleting` 表示已授权且传播中；`deleted` 表示传播已核对；Memory 的 `tombstoned` 只保留 ID、scope、版本／哈希、删除依据和时间，不保留正文。
+
+本章的三个父表都保留 DEFAULT 分区，PostgreSQL 17 因此会拒绝 `DETACH PARTITION ... CONCURRENTLY`。到龄分区须在写入暂停／上游缓冲的维护窗口中，使用短事务执行普通 `ALTER TABLE ... DETACH PARTITION`；不得为追求 concurrent detach 临时移除 DEFAULT 护栏。脱离后转只读归档，记录行数、范围、哈希、备份对象版本和恢复演练。物理 drop 前必须有精确 `retention_executions`，并同时满足：
+
+1. `legal_hold_checked = true` 且无 legal hold；
+2. `shared_reference_count = 0`，无强 FK、签发报告、Context、血缘或调查仍需数据；
+3. 无 `pending/running/blocked/failed` 的保留或删除传播任务；
+4. 归档备份已验证可恢复，法定审计保留期已满；
+5. 两人审批、变更窗口和 break-glass 记录齐全。
+
+审计事件不因业务对象删除而级联删除，按自身法定策略归档。门禁不满足时保持 detached/read-only 或继续在线，禁止自动 drop。
+
+### 8.23.6 删除传播与失败重试
+
+删除不是跨 PostgreSQL、Qdrant、Redis、MinIO 的分布式事务。顺序固定为：
+
+```text
+1 authorize：校验 actor、scope、retention、legal hold 和强引用
+2 deny-read：同一 PostgreSQL 事务将 active -> revoked/deleting，
+  创建 bridgeai_memory.deletion_jobs/bridgeai_audit.retention_executions、审计事件和 Outbox
+3 cache：按对象版本／命名空间使 Redis 对象、查询和 Context 缓存失效
+4 vector：只删除精确 collection/index_version/source UUID 的 point；
+  bridgeai_memory_* 与 bridgeai_knowledge_* 永不交叉
+5 object：仅当无共享引用、无 legal hold 且 retention_until 已到，
+  删除 MinIO 精确 bucket/object_key/version_id 并回读确认
+6 derived：撤销可重建的未签发产物；已签发报告、citation、lineage 和
+  context_manifest_items 保留版本／哈希并显示“来源已删除”，不静默换源
+7 tombstone：受控脱敏正文并保留最小墓碑；逐项成功后先 complete job，
+  再将权威记录置 deleted
+```
+
+任何外部步骤失败时，PostgreSQL tombstone／拒读状态、删除依据、已完成步骤和 `last_error` 保留；Outbox 进入 retry/dead-letter。人工重放使用新幂等键且保持原语义。禁止为重试先删权威证据、审计或 Outbox，也禁止在数据库事务中同步调用外部存储。
+
 ## 8.24 数据迁移、兼容与发布流程
+
+### 8.24.1 Expand-contract 主流程
+
+所有 Alembic 发布固定采用 **expand → backfill → verify → switch → contract**，默认前滚而不是把新写入硬降级回旧形状。每阶段是独立 revision，记录兼容代码范围、前后置条件、锁预算和中止方案。
+
+| 阶段 | 动作 | 退出门禁 |
+|---|---|---|
+| expand | 新增 nullable 列／新表、宽松 CHECK、兼容写入、`NOT VALID` 约束 | 老应用仍可读写；新对象 owner/RLS/Policy/grant 已验收；无长表锁 |
+| backfill | 稳定游标分批回填、双写、异常隔离 | 可幂等重放；孤儿／越界／未知状态为 0；复制延迟、WAL、autovacuum 可控 |
+| verify | `VALIDATE CONSTRAINT`、双读、行数／哈希／范围和查询计划核对 | 硬失配为 0；并发新写已纳入；失效索引为 0 |
+| switch | 版本化 repository/feature flag 先切读、后切权威写 | 全实例运行兼容版；旧读仍可恢复；观察窗无硬失配 |
+| contract | `NOT NULL`、最终 CHECK、删除旧列／触发器／表、收回 grant | 旧实例／Worker 为 0；完整业务周期与恢复演练通过 |
+
+全程保持：租户键不跨域；confirmed 修订、已签发报告、审计事件和墓碑不原地改写；`task_id/run_id/thread_id` 不混同；已存幂等键语义不变；未终态 Outbox、legal hold、未到期 retention 和强引用不丢失。
+
+### 8.24.2 Expand、稳定游标 Backfill 与并发写
+
+新列先 nullable，不在一次高锁风险变更中同时新增、全表回填和 `SET NOT NULL`。以第五章旧 `workflow_tasks` 为例：
+
+```sql
+ALTER TABLE bridgeai_workflow.workflow_tasks
+    ADD COLUMN IF NOT EXISTS organization_id UUID,
+    ADD COLUMN IF NOT EXISTS idempotency_key TEXT,
+    ADD COLUMN IF NOT EXISTS requested_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS updated_by UUID,
+    ADD COLUMN IF NOT EXISTS version BIGINT;
+```
+
+回填 Worker 以 `(created_at,id)` 为稳定 cursor，每批独立短事务，只填 NULL。UUID 只打破同时间并列，不假设时间单调性。
+
+```sql
+WITH batch AS (
+    SELECT t.id, p.organization_id
+    FROM bridgeai_workflow.workflow_tasks AS t
+    JOIN bridgeai_core.projects AS p ON p.id = t.project_id
+    WHERE (t.created_at, t.id) > (:cursor_created_at, :cursor_id)
+      AND (
+          t.organization_id IS NULL OR t.idempotency_key IS NULL
+          OR t.requested_at IS NULL OR t.updated_by IS NULL OR t.version IS NULL
+      )
+    ORDER BY t.created_at, t.id
+    FOR UPDATE OF t SKIP LOCKED
+    LIMIT :batch_size
+)
+UPDATE bridgeai_workflow.workflow_tasks AS t
+SET organization_id = COALESCE(t.organization_id, b.organization_id),
+    idempotency_key = COALESCE(t.idempotency_key, 'legacy:task:' || t.id::text),
+    requested_at = COALESCE(t.requested_at, t.created_at),
+    updated_by = COALESCE(t.updated_by, t.created_by),
+    version = COALESCE(t.version, 1)
+FROM batch AS b
+WHERE t.id = b.id
+RETURNING t.created_at, t.id;
+```
+
+运行器仅在提交后保存最大 cursor；失败从上一已提交 cursor 重放。expand 后新应用双写新旧形状，旧应用仍可写旧列。回填以 `COALESCE(target, derived)` 和行锁／version 避免覆盖并发新值。若必须使用兼容触发器，它须单向、可测试、有明确移除版本，且不能调用外部存储。
+
+### 8.24.3 约束、索引与事务边界
+
+大表 FK/CHECK 先 `NOT VALID`：从创建起保护新写，历史数据回填和孤儿检查后再验证。
+
+```sql
+ALTER TABLE bridgeai_workflow.workflow_runs
+    ADD CONSTRAINT fk_workflow_runs_task_scope_v2
+    FOREIGN KEY (task_id, organization_id, project_id)
+    REFERENCES bridgeai_workflow.workflow_tasks (id, organization_id, project_id)
+    ON DELETE RESTRICT NOT VALID;
+
+ALTER TABLE bridgeai_workflow.workflow_runs
+    VALIDATE CONSTRAINT fk_workflow_runs_task_scope_v2;
+```
+
+验证失败时保留 `NOT VALID` 约束，隔离并修正历史异常后重试，不删除保护新写的约束。非空收紧先建并验证 `CHECK (column IS NOT NULL) NOT VALID`，再 `SET NOT NULL`，最后删过渡 CHECK。
+
+`CREATE INDEX CONCURRENTLY`／`DROP INDEX CONCURRENTLY` 使用 Alembic autocommit block 或独立非事务 revision，与表变更、回填和验证分开：
+
+```sql
+-- 独立连接执行，前后不得有 BEGIN/COMMIT。
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_assets_name_trgm
+    ON bridgeai_asset.assets USING GIN (lower(name) gin_trgm_ops);
+```
+
+执行后检查 `pg_index.indisvalid/indisready`。超时或取消可能留下失效索引；同名 `IF NOT EXISTS` 不证明有效，重试前须 `DROP INDEX CONCURRENTLY` 失效对象。分区父索引遵守 8.23.3 的逐子表并发创建和 ATTACH 边界。
+
+### 8.24.4 Verify、Switch 与观察窗
+
+verify 同时覆盖：
+
+1. 目录：列、PK/UNIQUE/FK/CHECK、触发器、索引有效性、owner、RLS `ENABLE+FORCE`、Policy 和 grant 与 manifest 一致；
+2. 数据：新旧路径比较 `count(*)`、`min/max(key)`、每租户／项目／月行数及不可变列聚合哈希；NULL、孤儿、越界为 0；
+3. 并发：双写期持续执行创建／claim／复核，验证幂等冲突、锁等待、`SKIP LOCKED` 和重试；
+4. 派生：所有非终态 Outbox 仍可 claim，Qdrant point/collection/index version、MinIO object version、Redis namespace 可与 PostgreSQL 聚合版本对账；
+5. 性能：保存 8.22.3 的代表性 `EXPLAIN (ANALYZE, BUFFERS)`，确认分区剪枝及可接受的 WAL／写入影响。
+
+switch 先切读后切写。读切换可按组织／项目回退，shadow-read 差异只存 hash 和定位键。读稳定后新写路径成为权威，旧路径在观察窗只作兼容核对。观察窗至少覆盖一个月分区边界和完整 Workflow 执行—复核—报告签发周期；风险记录可以要求更长，迁移人员不得临时缩短。
+
+### 8.24.5 第五章 Workflow 逐表升级
+
+已部署环境不得以空表替换旧表。严格顺序如下，每步先通过 8.15.2 的逐表验证：
+
+| 顺序 | 表 | 升级与门禁 |
+|---|---|---|
+| 1 | `workflow_tasks` | 从 project 回填 organization；`bridge_id → asset_id`、`input_batch_id → acquisition_dataset_id`；移除 thread 全局唯一；补幂等、请求时间、版本、审计列；未知状态阻断 |
+| 2 | `workflow_runs` | 从 task 回填 scope；历史 thread 仅此次复制，之后不自动同步；建 task/run/thread 组合被引用键 |
+| 3 | `workflow_events` | `created_at → occurred_at`，补 recorded/scope/producer key；核对 task/run 后按月完整复制到影子分区表；count/min/max/hash 一致才短事务改名；DEFAULT 为 0 |
+| 4 | `workflow_node_executions` | 先补 scope/audit/version 并核对 run；再建 8.23.4 registry 与 `created_at` 影子分区表，双写并证明 id/attempt/idempotency 全局唯一 |
+| 5 | `workflow_reviews` | 最后补 scope/run/node；expand 新增 `node_execution_created_at`，回填后建六列 `NOT VALID` FK 并 `VALIDATE CONSTRAINT`；保持终态决策和幂等语义 |
+
+每表异常清零、约束验证后才 `ENABLE/FORCE ROW LEVEL SECURITY`。owner 是不登录迁移角色，应用角色无 `BYPASSRLS`；Policy 先于 grant，切换后撤销旧表直访权限。分区子表和 registry 也在清单内。LangGraph Checkpointer 仍只由官方版本管理，不改名、不加业务 FK。
+
+节点执行分区的关键增量为：
+
+```sql
+ALTER TABLE bridgeai_workflow.workflow_reviews
+    ADD COLUMN IF NOT EXISTS node_execution_created_at TIMESTAMPTZ;
+
+UPDATE bridgeai_workflow.workflow_reviews AS v
+SET node_execution_created_at = n.created_at
+FROM bridgeai_workflow.workflow_node_executions AS n
+WHERE v.node_execution_id = n.id
+  AND v.organization_id = n.organization_id
+  AND v.project_id = n.project_id
+  AND v.task_id = n.task_id
+  AND v.run_id = n.run_id
+  AND v.node_execution_created_at IS NULL;
+
+ALTER TABLE bridgeai_workflow.workflow_reviews
+    ADD CONSTRAINT fk_workflow_reviews_node_execution_v2
+    FOREIGN KEY (
+        node_execution_id, organization_id, project_id, task_id, run_id,
+        node_execution_created_at
+    ) REFERENCES bridgeai_workflow.workflow_node_executions_partitioned
+      (id, organization_id, project_id, task_id, run_id, created_at)
+    ON DELETE RESTRICT NOT VALID;
+ALTER TABLE bridgeai_workflow.workflow_reviews
+    VALIDATE CONSTRAINT fk_workflow_reviews_node_execution_v2;
+```
+
+### 8.24.6 Contract、快照、失败与重试门禁
+
+contract 不与 switch 同日执行。删除列／表、重编码 ID／分区键或改变哈希语义前，必须创建且真实恢复验证快照，记录 LSN、Schema revision、行数／哈希、MinIO version ID 与 Qdrant collection/index version。
+
+- expand/backfill 失败：停 Worker，保留新列／影子表和 cursor，修复映射后幂等继续。
+- verify 失败：不切流，保留保护新写的约束，隔离历史异常后重验。
+- switch 后失败：兼容窗内 feature flag 切回旧读，双写不停；修复后再切。
+- contract 后失败：发布 forward-fix 重建兼容视图／列，或从验证快照恢复到新表；不盲目 downgrade 丢弃新写。
+
+最终 contract 硬门禁为：旧实例／Worker 为 0；双读硬失配为 0；所有 FK/CHECK 已验证；无失效索引；DEFAULT 为 0 且未来分区已预建；无未发布 Outbox 遗漏；legal hold、retention、删除 job 通过；RLS/Policy/grant 目录验收通过；代表性查询和恢复演练通过。任一失败都保留兼容形态，不进入破坏性收缩。
 
 ## 8.25 备份、恢复与灾难演练
 
