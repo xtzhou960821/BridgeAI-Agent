@@ -2131,9 +2131,2014 @@ CREATE INDEX ix_damage_measurements_trend
 
 ## 8.15 Workflow 数据模型兼容收敛
 
+第五章已经定义并可能已经部署 `workflow_tasks`、`workflow_runs`、`workflow_events`、`workflow_node_executions` 和 `workflow_reviews`。本节给出它们在第八章的**唯一最终物理形态**：新环境按下列 DDL 建表；既有环境必须按 8.15.2 的兼容迁移原位升级或采用有数据核对的影子分区切换，禁止通过删除旧表、建立空表来“完成迁移”。
+
+`task_id` 是业务任务，`run_id` 是一次执行，`thread_id` 是 LangGraph 恢复线程，三者没有值相等约束。任务上的 `thread_id` 只表示初始/默认线程；每次实际运行仍在 `workflow_runs.thread_id` 登记，因此同一任务可以有多个 run 和多个 thread。LangGraph Checkpointer 的 `checkpoints`、`checkpoint_writes`、`checkpoint_blobs` 等表继续由所采用的框架版本和官方迁移管理；BridgeAI 迁移不得复制、改名、加业务外键或把其中 State 当作领域事实。
+
+### 8.15.1 最终物理表
+
+```sql
+CREATE TABLE bridgeai_workflow.workflow_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    thread_id TEXT NOT NULL,
+    asset_id UUID,
+    acquisition_dataset_id UUID,
+    task_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    current_node TEXT,
+    progress NUMERIC(5, 2) NOT NULL DEFAULT 0,
+    state_version BIGINT NOT NULL DEFAULT 1,
+    selected_model_version TEXT,
+    idempotency_key TEXT NOT NULL,
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    error_code TEXT,
+    error_message TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_workflow_tasks_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_tasks_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_tasks_asset_scope
+        FOREIGN KEY (asset_id, organization_id, project_id)
+        REFERENCES bridgeai_asset.assets (id, organization_id, project_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_tasks_dataset_scope
+        FOREIGN KEY (acquisition_dataset_id, organization_id, project_id)
+        REFERENCES bridgeai_inspection.acquisition_datasets (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_workflow_tasks_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_workflow_tasks_idempotency
+        UNIQUE (organization_id, project_id, idempotency_key),
+    CONSTRAINT ck_workflow_tasks_thread_nonblank CHECK (btrim(thread_id) <> ''),
+    CONSTRAINT ck_workflow_tasks_type_nonblank CHECK (btrim(task_type) <> ''),
+    CONSTRAINT ck_workflow_tasks_status CHECK (
+        status IN ('pending', 'queued', 'running', 'waiting_review',
+                   'succeeded', 'failed', 'cancelled')
+    ),
+    CONSTRAINT ck_workflow_tasks_progress CHECK (progress BETWEEN 0 AND 100),
+    CONSTRAINT ck_workflow_tasks_state_version CHECK (state_version > 0),
+    CONSTRAINT ck_workflow_tasks_idempotency_nonblank CHECK (btrim(idempotency_key) <> ''),
+    CONSTRAINT ck_workflow_tasks_time_order CHECK (
+        (started_at IS NULL OR started_at >= requested_at)
+        AND (completed_at IS NULL OR (started_at IS NOT NULL AND completed_at >= started_at))
+    ),
+    CONSTRAINT ck_workflow_tasks_terminal_time CHECK (
+        (status IN ('succeeded', 'failed', 'cancelled') AND completed_at IS NOT NULL)
+        OR (status NOT IN ('succeeded', 'failed', 'cancelled') AND completed_at IS NULL)
+    ),
+    CONSTRAINT ck_workflow_tasks_error CHECK (
+        status <> 'failed' OR (error_code IS NOT NULL AND btrim(error_code) <> '')
+    ),
+    CONSTRAINT ck_workflow_tasks_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_workflow_tasks_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_workflow.workflow_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    task_id UUID NOT NULL,
+    thread_id TEXT NOT NULL,
+    run_number INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    start_node TEXT,
+    end_node TEXT,
+    trigger_type TEXT NOT NULL,
+    triggered_by UUID,
+    idempotency_key TEXT NOT NULL,
+    config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    duration_ms BIGINT,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_workflow_runs_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_runs_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_runs_task_scope
+        FOREIGN KEY (task_id, organization_id, project_id)
+        REFERENCES bridgeai_workflow.workflow_tasks (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_workflow_runs_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_workflow_runs_id_scope_task
+        UNIQUE (id, organization_id, project_id, task_id),
+    CONSTRAINT uq_workflow_runs_id_scope_task_thread
+        UNIQUE (id, organization_id, project_id, task_id, thread_id),
+    CONSTRAINT uq_workflow_runs_number
+        UNIQUE (organization_id, project_id, task_id, run_number),
+    CONSTRAINT uq_workflow_runs_idempotency
+        UNIQUE (organization_id, project_id, task_id, idempotency_key),
+    CONSTRAINT ck_workflow_runs_thread_nonblank CHECK (btrim(thread_id) <> ''),
+    CONSTRAINT ck_workflow_runs_number_positive CHECK (run_number > 0),
+    CONSTRAINT ck_workflow_runs_status CHECK (
+        status IN ('queued', 'running', 'waiting_review', 'succeeded',
+                   'failed', 'cancelled')
+    ),
+    CONSTRAINT ck_workflow_runs_trigger_nonblank CHECK (btrim(trigger_type) <> ''),
+    CONSTRAINT ck_workflow_runs_idempotency_nonblank CHECK (btrim(idempotency_key) <> ''),
+    CONSTRAINT ck_workflow_runs_config_object CHECK (jsonb_typeof(config) = 'object'),
+    CONSTRAINT ck_workflow_runs_time_order CHECK (
+        finished_at IS NULL OR (started_at IS NOT NULL AND finished_at >= started_at)
+    ),
+    CONSTRAINT ck_workflow_runs_terminal_time CHECK (
+        (status IN ('succeeded', 'failed', 'cancelled') AND finished_at IS NOT NULL)
+        OR (status NOT IN ('succeeded', 'failed', 'cancelled') AND finished_at IS NULL)
+    ),
+    CONSTRAINT ck_workflow_runs_duration CHECK (
+        duration_ms IS NULL OR (duration_ms >= 0 AND finished_at IS NOT NULL)
+    ),
+    CONSTRAINT ck_workflow_runs_error CHECK (
+        status <> 'failed' OR (error_code IS NOT NULL AND btrim(error_code) <> '')
+    ),
+    CONSTRAINT ck_workflow_runs_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_workflow.workflow_events (
+    id BIGINT GENERATED BY DEFAULT AS IDENTITY,
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    task_id UUID NOT NULL,
+    run_id UUID,
+    trace_id TEXT NOT NULL,
+    producer_event_key TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    node_name TEXT,
+    event_level TEXT NOT NULL DEFAULT 'info',
+    actor_subject_id UUID,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id, occurred_at),
+    CONSTRAINT fk_workflow_events_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_events_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_events_task_scope
+        FOREIGN KEY (task_id, organization_id, project_id)
+        REFERENCES bridgeai_workflow.workflow_tasks (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_events_run_same_task
+        FOREIGN KEY (run_id, organization_id, project_id, task_id)
+        REFERENCES bridgeai_workflow.workflow_runs (id, organization_id, project_id, task_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_workflow_events_producer_key
+        UNIQUE (organization_id, project_id, producer_event_key, occurred_at),
+    CONSTRAINT ck_workflow_events_trace_nonblank CHECK (btrim(trace_id) <> ''),
+    CONSTRAINT ck_workflow_events_key_nonblank CHECK (btrim(producer_event_key) <> ''),
+    CONSTRAINT ck_workflow_events_type_nonblank CHECK (btrim(event_type) <> ''),
+    CONSTRAINT ck_workflow_events_level
+        CHECK (event_level IN ('debug', 'info', 'warning', 'error', 'critical')),
+    CONSTRAINT ck_workflow_events_payload_object CHECK (jsonb_typeof(payload) = 'object'),
+    CONSTRAINT ck_workflow_events_recording_order CHECK (recorded_at >= occurred_at)
+) PARTITION BY RANGE (occurred_at);
+
+CREATE TABLE bridgeai_workflow.workflow_events_default
+    PARTITION OF bridgeai_workflow.workflow_events DEFAULT;
+
+CREATE TABLE bridgeai_workflow.workflow_node_executions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    task_id UUID NOT NULL,
+    run_id UUID NOT NULL,
+    node_name TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'pending',
+    input_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    output_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    idempotency_key TEXT NOT NULL,
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    duration_ms BIGINT,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_workflow_node_executions_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_node_executions_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_node_executions_task_scope
+        FOREIGN KEY (task_id, organization_id, project_id)
+        REFERENCES bridgeai_workflow.workflow_tasks (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_node_executions_run_same_task
+        FOREIGN KEY (run_id, organization_id, project_id, task_id)
+        REFERENCES bridgeai_workflow.workflow_runs (id, organization_id, project_id, task_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_workflow_node_executions_id_scope
+        UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_workflow_node_executions_id_scope_task_run
+        UNIQUE (id, organization_id, project_id, task_id, run_id),
+    CONSTRAINT uq_workflow_node_executions_attempt
+        UNIQUE (organization_id, project_id, run_id, node_name, attempt),
+    CONSTRAINT uq_workflow_node_executions_idempotency
+        UNIQUE (organization_id, project_id, idempotency_key),
+    CONSTRAINT ck_workflow_node_executions_node_nonblank CHECK (btrim(node_name) <> ''),
+    CONSTRAINT ck_workflow_node_executions_attempt_positive CHECK (attempt > 0),
+    CONSTRAINT ck_workflow_node_executions_status CHECK (
+        status IN ('pending', 'running', 'waiting_review', 'succeeded',
+                   'failed', 'skipped', 'cancelled')
+    ),
+    CONSTRAINT ck_workflow_node_executions_input_object
+        CHECK (jsonb_typeof(input_summary) = 'object'),
+    CONSTRAINT ck_workflow_node_executions_output_object
+        CHECK (jsonb_typeof(output_summary) = 'object'),
+    CONSTRAINT ck_workflow_node_executions_idempotency_nonblank
+        CHECK (btrim(idempotency_key) <> ''),
+    CONSTRAINT ck_workflow_node_executions_time_order CHECK (
+        finished_at IS NULL OR (started_at IS NOT NULL AND finished_at >= started_at)
+    ),
+    CONSTRAINT ck_workflow_node_executions_terminal_time CHECK (
+        (status IN ('succeeded', 'failed', 'skipped', 'cancelled') AND finished_at IS NOT NULL)
+        OR (status NOT IN ('succeeded', 'failed', 'skipped', 'cancelled') AND finished_at IS NULL)
+    ),
+    CONSTRAINT ck_workflow_node_executions_duration CHECK (
+        duration_ms IS NULL OR (duration_ms >= 0 AND finished_at IS NOT NULL)
+    ),
+    CONSTRAINT ck_workflow_node_executions_error CHECK (
+        status <> 'failed' OR (error_code IS NOT NULL AND btrim(error_code) <> '')
+    ),
+    CONSTRAINT ck_workflow_node_executions_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_workflow.workflow_reviews (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    task_id UUID NOT NULL,
+    run_id UUID,
+    node_execution_id UUID,
+    review_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    priority TEXT NOT NULL DEFAULT 'normal',
+    title TEXT NOT NULL,
+    description TEXT,
+    input_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    suggested_result JSONB,
+    final_result JSONB,
+    reviewer_subject_id UUID,
+    decision_idempotency_key TEXT,
+    reviewed_at TIMESTAMPTZ,
+    due_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_workflow_reviews_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_reviews_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_reviews_task_scope
+        FOREIGN KEY (task_id, organization_id, project_id)
+        REFERENCES bridgeai_workflow.workflow_tasks (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_reviews_run_same_task
+        FOREIGN KEY (run_id, organization_id, project_id, task_id)
+        REFERENCES bridgeai_workflow.workflow_runs (id, organization_id, project_id, task_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_workflow_reviews_node_execution_scope
+        FOREIGN KEY (
+            node_execution_id, organization_id, project_id, task_id, run_id
+        ) REFERENCES bridgeai_workflow.workflow_node_executions
+          (id, organization_id, project_id, task_id, run_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_workflow_reviews_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_workflow_reviews_id_organization UNIQUE (id, organization_id),
+    CONSTRAINT uq_workflow_reviews_decision_idempotency
+        UNIQUE (organization_id, project_id, decision_idempotency_key),
+    CONSTRAINT ck_workflow_reviews_type_nonblank CHECK (btrim(review_type) <> ''),
+    CONSTRAINT ck_workflow_reviews_status CHECK (
+        status IN ('pending', 'claimed', 'approved', 'rejected', 'cancelled', 'expired')
+    ),
+    CONSTRAINT ck_workflow_reviews_priority
+        CHECK (priority IN ('low', 'normal', 'high', 'critical')),
+    CONSTRAINT ck_workflow_reviews_title_nonblank CHECK (btrim(title) <> ''),
+    CONSTRAINT ck_workflow_reviews_input_object CHECK (jsonb_typeof(input_data) = 'object'),
+    CONSTRAINT ck_workflow_reviews_suggested_object CHECK (
+        suggested_result IS NULL OR jsonb_typeof(suggested_result) = 'object'
+    ),
+    CONSTRAINT ck_workflow_reviews_final_object CHECK (
+        final_result IS NULL OR jsonb_typeof(final_result) = 'object'
+    ),
+    CONSTRAINT ck_workflow_reviews_decision_shape CHECK (
+        (status IN ('approved', 'rejected')
+         AND reviewer_subject_id IS NOT NULL
+         AND reviewed_at IS NOT NULL
+         AND final_result IS NOT NULL
+         AND decision_idempotency_key IS NOT NULL
+         AND btrim(decision_idempotency_key) <> '')
+        OR (status NOT IN ('approved', 'rejected') AND reviewed_at IS NULL)
+    ),
+    CONSTRAINT ck_workflow_reviews_node_requires_run CHECK (
+        node_execution_id IS NULL OR run_id IS NOT NULL
+    ),
+    CONSTRAINT ck_workflow_reviews_due_time CHECK (due_at IS NULL OR due_at >= created_at),
+    CONSTRAINT ck_workflow_reviews_version_positive CHECK (version > 0)
+);
+
+CREATE INDEX ix_workflow_tasks_scope_status
+    ON bridgeai_workflow.workflow_tasks (organization_id, project_id, status, updated_at);
+CREATE INDEX ix_workflow_runs_task_status
+    ON bridgeai_workflow.workflow_runs
+       (organization_id, project_id, task_id, status, run_number DESC);
+CREATE INDEX ix_workflow_events_task_time
+    ON bridgeai_workflow.workflow_events
+       (organization_id, project_id, task_id, occurred_at DESC);
+CREATE INDEX ix_workflow_events_trace_time
+    ON bridgeai_workflow.workflow_events
+       (organization_id, project_id, trace_id, occurred_at DESC);
+CREATE INDEX ix_workflow_node_executions_run_status
+    ON bridgeai_workflow.workflow_node_executions
+       (organization_id, project_id, run_id, status, node_name);
+CREATE INDEX ix_workflow_reviews_pending
+    ON bridgeai_workflow.workflow_reviews
+       (organization_id, project_id, priority, due_at)
+    WHERE status IN ('pending', 'claimed');
+```
+
+`created_by`、`updated_by`、`triggered_by`、`actor_subject_id` 和 `reviewer_subject_id` 都是稳定审计主体 UUID，可能指人员或服务主体，因此不伪造指向 `users` 的单表外键；其身份类型和当时权限快照由 8.19 审计域解释。事件以 `occurred_at` 为范围分区键；生产迁移应预建月分区并保留 DEFAULT 分区作为短时故障护栏，监控不得容忍 DEFAULT 分区长期积压。
+
+### 8.15.2 第五章兼容迁移矩阵
+
+共同顺序固定为：**新增可空列/宽松检查 → 回填并隔离异常 → 建唯一索引 → 外键 `NOT VALID` → `VALIDATE CONSTRAINT` → `SET NOT NULL` 与最终 `CHECK` → 启用并强制 RLS**。组合外键统一按“被引用主键在前，随后 `organization_id, project_id`，再加父实体键”的顺序；不得把列顺序互换后依赖偶然存在的另一条唯一约束。
+
+| 旧表 | 旧字段 → 最终字段 | 回填与默认 | 约束启用顺序 | 验证查询 |
+|---|---|---|---|---|
+| `workflow_tasks` | `id → id`；`thread_id → thread_id`（移除全局唯一）；`project_id → project_id`；`bridge_id → asset_id`；`input_batch_id → acquisition_dataset_id`；其余业务字段同名；新增 `organization_id/idempotency_key/requested_at/updated_by/version` | `organization_id` 从 `projects.organization_id`；`asset_id` 先按旧 bridge UUID 匹配 `assets.id` 且 `asset_type='bridge'`；批次映射到同项目 `acquisition_datasets.id`；`idempotency_key='legacy:task:'||id`；`requested_at=created_at`；`updated_by=created_by`；终态缺失 `started_at/completed_at` 时以不早于 `created_at/updated_at` 的值回填 | 先检查孤儿项目、资产和数据集；再建作用域唯一键与幂等唯一键；项目/资产/数据集外键先 `NOT VALID` 后验证；规范化状态后启用 CHECK；最后非空、RLS | `SELECT t.id FROM bridgeai_workflow.workflow_tasks t LEFT JOIN bridgeai_core.projects p ON (p.id,p.organization_id)=(t.project_id,t.organization_id) WHERE p.id IS NULL OR t.organization_id IS NULL OR t.idempotency_key IS NULL;` 应为 0 行 |
+| `workflow_runs` | `id/task_id/run_number/status/start_node/end_node/trigger_type/triggered_by/config` 同名；新增 `organization_id/project_id/thread_id/idempotency_key/error_*/created_*/updated_*/version` | 边界从父 `workflow_tasks`；历史 run 无独立 thread 时只在迁移时复制父任务 `thread_id`，之后禁止自动同步；`idempotency_key='legacy:run:'||id`；`created_at=COALESCE(started_at, task.created_at)`；`created_by/updated_by=COALESCE(triggered_by, task.created_by)` | 先验证 `(task_id,organization_id,project_id)`；再建 run 作用域唯一键和 `(task_id,run_number)` 范围唯一；外键 `NOT VALID`/验证；最后状态、时间、非空和 RLS | `SELECT r.id FROM bridgeai_workflow.workflow_runs r LEFT JOIN bridgeai_workflow.workflow_tasks t ON (t.id,t.organization_id,t.project_id)=(r.task_id,r.organization_id,r.project_id) WHERE t.id IS NULL OR r.thread_id IS NULL;` 应为 0 行 |
+| `workflow_events` | `id → id` 保留 BIGINT；`created_at → occurred_at`；新增 `recorded_at/organization_id/project_id/producer_event_key/actor_subject_id`；其余同名 | 边界从任务；`run_id` 存在时必须属于同一任务；`producer_event_key='legacy:event:'||id`；`event_level=lower(event_level)`；`recorded_at=GREATEST(created_at,迁移写入时间)` | 普通旧表先完成边界和 run 校验；再创建按 `occurred_at` 分区的影子表，逐分区 `INSERT ... SELECT` 保留全部 id，核对总数/每月数/min-max/hash 后在短事务切换名称；外键 `NOT VALID`/验证后启用 RLS。影子表不是空表替代，任何核对不一致即回滚切换 | `SELECT e.id,e.occurred_at FROM bridgeai_workflow.workflow_events e LEFT JOIN bridgeai_workflow.workflow_tasks t ON (t.id,t.organization_id,t.project_id)=(e.task_id,e.organization_id,e.project_id) LEFT JOIN bridgeai_workflow.workflow_runs r ON (r.id,r.organization_id,r.project_id,r.task_id)=(e.run_id,e.organization_id,e.project_id,e.task_id) WHERE t.id IS NULL OR (e.run_id IS NOT NULL AND r.id IS NULL);` 应为 0 行；切换前后另比 `count(*),min(id),max(id),min(occurred_at),max(occurred_at)` |
+| `workflow_node_executions` | 原字段同名；新增 `organization_id/project_id/created_by/created_at/updated_by/updated_at/version` | 边界从 task，并以 run 反查交叉确认；审计主体优先取 run 的 `triggered_by/created_by`，否则取 task；`created_at=COALESCE(started_at,task.created_at)`；旧全局幂等键保留，但最终唯一范围改为组织/项目 | 先查 task/run 不一致；建 `(id,organization_id,project_id)` 和 run+node+attempt 唯一键；task/run 外键 `NOT VALID`/验证；再状态、时间、非空与 RLS | `SELECT n.id FROM bridgeai_workflow.workflow_node_executions n LEFT JOIN bridgeai_workflow.workflow_runs r ON (r.id,r.organization_id,r.project_id,r.task_id)=(n.run_id,n.organization_id,n.project_id,n.task_id) WHERE r.id IS NULL OR n.idempotency_key IS NULL;` 应为 0 行 |
+| `workflow_reviews` | `reviewer_id → reviewer_subject_id`；原字段同名；新增 `organization_id/project_id/run_id/node_execution_id/decision_idempotency_key/updated_at/updated_by/version` | 边界从 task；能从事件/节点确定的历史 review 回填 run/node，否则保持可空；终态决策键为 `'legacy:review:'||id`；`updated_by=COALESCE(reviewer_id,created_by)`，`updated_at=COALESCE(reviewed_at,created_at)`；历史 `input_data` 的 SQL NULL 先改为 `{}` | 先确认可选 run/node 均与 task 同范围；建作用域唯一和决策幂等唯一；FK `NOT VALID`/验证；最后决策形态 CHECK、非空与 RLS | `SELECT v.id FROM bridgeai_workflow.workflow_reviews v LEFT JOIN bridgeai_workflow.workflow_tasks t ON (t.id,t.organization_id,t.project_id)=(v.task_id,v.organization_id,v.project_id) LEFT JOIN bridgeai_workflow.workflow_runs r ON (r.id,r.organization_id,r.project_id,r.task_id)=(v.run_id,v.organization_id,v.project_id,v.task_id) WHERE t.id IS NULL OR (v.run_id IS NOT NULL AND r.id IS NULL) OR (v.status IN ('approved','rejected') AND (v.reviewer_subject_id IS NULL OR v.final_result IS NULL));` 应为 0 行 |
+
+旧状态必须通过版本化映射先收敛，典型映射为 `in_progress → running`、`awaiting_human → waiting_review`、`completed → succeeded`、`error → failed`、事件级别 `INFO/WARN/ERROR → info/warning/error`。迁移脚本遇到映射表之外的值必须停止并输出待裁决清单，不得用默认状态吞掉语义。
+
+外键在线启用范式如下；其余组合外键使用同一顺序：
+
+```sql
+ALTER TABLE bridgeai_workflow.workflow_runs
+    ADD CONSTRAINT fk_workflow_runs_task_scope
+    FOREIGN KEY (task_id, organization_id, project_id)
+    REFERENCES bridgeai_workflow.workflow_tasks (id, organization_id, project_id)
+    ON DELETE RESTRICT NOT VALID;
+
+ALTER TABLE bridgeai_workflow.workflow_runs
+    VALIDATE CONSTRAINT fk_workflow_runs_task_scope;
+
+ALTER TABLE bridgeai_workflow.workflow_runs
+    ALTER COLUMN organization_id SET NOT NULL,
+    ALTER COLUMN project_id SET NOT NULL,
+    ALTER COLUMN thread_id SET NOT NULL,
+    ALTER COLUMN idempotency_key SET NOT NULL;
+```
+
+五张表完成异常清零和约束验证后才启用 RLS。项目级策略基线如下；迁移/表所有者不得授予应用角色 `BYPASSRLS`，并使用 `FORCE ROW LEVEL SECURITY` 防止表所有者误走普通服务连接。审计主体的角色、成员关系和操作授权仍由服务层验证，RLS 只承担组织/项目的数据库纵深隔离。
+
+```sql
+DO $workflow_rls$
+DECLARE
+    table_name TEXT;
+BEGIN
+    FOREACH table_name IN ARRAY ARRAY[
+        'workflow_tasks', 'workflow_runs', 'workflow_events',
+        'workflow_node_executions', 'workflow_reviews'
+    ]
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE bridgeai_workflow.%I ENABLE ROW LEVEL SECURITY', table_name
+        );
+        EXECUTE format(
+            'ALTER TABLE bridgeai_workflow.%I FORCE ROW LEVEL SECURITY', table_name
+        );
+        EXECUTE format(
+            'CREATE POLICY %I ON bridgeai_workflow.%I USING (
+                 organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
+                 AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+             ) WITH CHECK (
+                 organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
+                 AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+             )',
+            'pl_' || table_name || '_scope', table_name
+        );
+    END LOOP;
+END
+$workflow_rls$;
+```
+
 ## 8.16 RAG 知识库数据模型
 
+RAG 的权威链为 `knowledge_sources → documents → document_versions → chunks`，发布决定写入追加式 `publications`，对外使用的证据快照写入 `citations`，Qdrant 投影结果只登记在 `index_sync_jobs`。本节将第六章概念名 `knowledge_documents/knowledge_document_versions/knowledge_chunks/knowledge_publications` 收敛为 `bridgeai_knowledge.documents/document_versions/chunks/publications`；不得再建立带 `knowledge_` 表名前缀的第二套物理表。
+
+### 8.16.1 来源、文档、不可变版本与结构化 Chunk
+
+```sql
+CREATE TABLE bridgeai_knowledge.knowledge_sources (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    source_code TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    issuing_organization TEXT,
+    authority_level TEXT NOT NULL,
+    source_artifact_id UUID NOT NULL,
+    source_artifact_version_id UUID NOT NULL,
+    origin_uri TEXT,
+    sensitivity_level TEXT NOT NULL DEFAULT 'internal',
+    status TEXT NOT NULL DEFAULT 'registered',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_knowledge_sources_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_knowledge_sources_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_knowledge_sources_artifact_scope
+        FOREIGN KEY (source_artifact_id, organization_id, project_id)
+        REFERENCES bridgeai_core.artifacts (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_knowledge_sources_artifact_version
+        FOREIGN KEY (
+            source_artifact_version_id, organization_id, project_id, source_artifact_id
+        ) REFERENCES bridgeai_core.artifact_versions
+          (id, organization_id, project_id, artifact_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_knowledge_sources_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_knowledge_sources_project_code
+        UNIQUE (organization_id, project_id, source_code),
+    CONSTRAINT ck_knowledge_sources_code_nonblank CHECK (btrim(source_code) <> ''),
+    CONSTRAINT ck_knowledge_sources_type CHECK (
+        source_type IN (
+            'official_standard', 'official_notice', 'project_contract', 'project_plan',
+            'inspection_report', 'review_record', 'case_record', 'domain_manual',
+            'equipment_manual', 'model_card'
+        )
+    ),
+    CONSTRAINT ck_knowledge_sources_name_nonblank CHECK (btrim(name) <> ''),
+    CONSTRAINT ck_knowledge_sources_authority CHECK (authority_level IN ('A', 'B', 'C', 'D')),
+    CONSTRAINT ck_knowledge_sources_origin_uri CHECK (
+        origin_uri IS NULL OR btrim(origin_uri) <> ''
+    ),
+    CONSTRAINT ck_knowledge_sources_sensitivity CHECK (
+        sensitivity_level IN ('public', 'internal', 'confidential', 'restricted')
+    ),
+    CONSTRAINT ck_knowledge_sources_status CHECK (
+        status IN ('registered', 'active', 'suspended', 'revoked', 'archived')
+    ),
+    CONSTRAINT ck_knowledge_sources_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_knowledge_sources_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_knowledge.documents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    knowledge_source_id UUID NOT NULL,
+    document_code TEXT NOT NULL,
+    title TEXT NOT NULL,
+    document_number TEXT,
+    knowledge_domain TEXT NOT NULL,
+    asset_types JSONB NOT NULL DEFAULT '[]'::jsonb,
+    component_types JSONB NOT NULL DEFAULT '[]'::jsonb,
+    disease_types JSONB NOT NULL DEFAULT '[]'::jsonb,
+    region_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_documents_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_documents_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_documents_source_scope
+        FOREIGN KEY (knowledge_source_id, organization_id, project_id)
+        REFERENCES bridgeai_knowledge.knowledge_sources (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_documents_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_documents_id_scope_source
+        UNIQUE (id, organization_id, project_id, knowledge_source_id),
+    CONSTRAINT uq_documents_project_code
+        UNIQUE (organization_id, project_id, document_code),
+    CONSTRAINT ck_documents_code_nonblank CHECK (btrim(document_code) <> ''),
+    CONSTRAINT ck_documents_title_nonblank CHECK (btrim(title) <> ''),
+    CONSTRAINT ck_documents_number_nonblank CHECK (
+        document_number IS NULL OR btrim(document_number) <> ''
+    ),
+    CONSTRAINT ck_documents_domain_nonblank CHECK (btrim(knowledge_domain) <> ''),
+    CONSTRAINT ck_documents_asset_types_array CHECK (jsonb_typeof(asset_types) = 'array'),
+    CONSTRAINT ck_documents_component_types_array CHECK (jsonb_typeof(component_types) = 'array'),
+    CONSTRAINT ck_documents_disease_types_array CHECK (jsonb_typeof(disease_types) = 'array'),
+    CONSTRAINT ck_documents_region_codes_array CHECK (jsonb_typeof(region_codes) = 'array'),
+    CONSTRAINT ck_documents_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT ck_documents_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_knowledge.document_versions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    document_id UUID NOT NULL,
+    version_no INTEGER NOT NULL,
+    edition_label TEXT,
+    status TEXT NOT NULL DEFAULT 'registered',
+    content_sha256 TEXT NOT NULL,
+    source_artifact_id UUID NOT NULL,
+    source_artifact_version_id UUID NOT NULL,
+    supersedes_version_id UUID,
+    parser_name TEXT,
+    parser_version TEXT,
+    chunking_policy_version TEXT,
+    effective_from DATE,
+    effective_to DATE,
+    published_at TIMESTAMPTZ,
+    superseded_at TIMESTAMPTZ,
+    archived_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_document_versions_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_document_versions_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_document_versions_document_scope
+        FOREIGN KEY (document_id, organization_id, project_id)
+        REFERENCES bridgeai_knowledge.documents (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_document_versions_artifact_scope
+        FOREIGN KEY (source_artifact_id, organization_id, project_id)
+        REFERENCES bridgeai_core.artifacts (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_document_versions_artifact_version
+        FOREIGN KEY (
+            source_artifact_version_id, organization_id, project_id, source_artifact_id
+        ) REFERENCES bridgeai_core.artifact_versions
+          (id, organization_id, project_id, artifact_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_document_versions_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_document_versions_id_scope_document
+        UNIQUE (id, organization_id, project_id, document_id),
+    CONSTRAINT uq_document_versions_number
+        UNIQUE (organization_id, project_id, document_id, version_no),
+    CONSTRAINT fk_document_versions_supersedes_same_document
+        FOREIGN KEY (supersedes_version_id, organization_id, project_id, document_id)
+        REFERENCES bridgeai_knowledge.document_versions
+                   (id, organization_id, project_id, document_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT ck_document_versions_number_positive CHECK (version_no > 0),
+    CONSTRAINT ck_document_versions_status CHECK (
+        status IN (
+            'registered', 'parsing', 'validating', 'indexing', 'review_pending',
+            'published', 'rejected', 'failed', 'superseded', 'archived'
+        )
+    ),
+    CONSTRAINT ck_document_versions_sha256 CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_document_versions_effective_range CHECK (
+        effective_to IS NULL OR (effective_from IS NOT NULL AND effective_to >= effective_from)
+    ),
+    CONSTRAINT ck_document_versions_lifecycle_times CHECK (
+        (status <> 'published' OR published_at IS NOT NULL)
+        AND (status <> 'superseded' OR (published_at IS NOT NULL AND superseded_at IS NOT NULL))
+        AND (status <> 'archived' OR archived_at IS NOT NULL)
+    ),
+    CONSTRAINT ck_document_versions_no_self_supersede CHECK (supersedes_version_id IS DISTINCT FROM id),
+    CONSTRAINT ck_document_versions_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_knowledge.chunks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    document_id UUID NOT NULL,
+    document_version_id UUID NOT NULL,
+    ordinal_no INTEGER NOT NULL,
+    chunk_type TEXT NOT NULL,
+    content_text TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    token_count INTEGER,
+    page_start INTEGER,
+    page_end INTEGER,
+    section_path JSONB NOT NULL DEFAULT '[]'::jsonb,
+    clause_number TEXT,
+    table_number TEXT,
+    figure_number TEXT,
+    char_start BIGINT,
+    char_end BIGINT,
+    source_bbox JSONB,
+    parent_chunk_id UUID,
+    previous_chunk_id UUID,
+    next_chunk_id UUID,
+    parser_version TEXT NOT NULL,
+    chunking_policy_version TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_chunks_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_chunks_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_chunks_document_version_scope
+        FOREIGN KEY (document_version_id, organization_id, project_id, document_id)
+        REFERENCES bridgeai_knowledge.document_versions
+                   (id, organization_id, project_id, document_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_chunks_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_chunks_id_scope_version
+        UNIQUE (id, organization_id, project_id, document_version_id),
+    CONSTRAINT uq_chunks_ordinal
+        UNIQUE (organization_id, project_id, document_version_id, ordinal_no),
+    CONSTRAINT fk_chunks_parent_same_version
+        FOREIGN KEY (parent_chunk_id, organization_id, project_id, document_version_id)
+        REFERENCES bridgeai_knowledge.chunks
+                   (id, organization_id, project_id, document_version_id)
+        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT fk_chunks_previous_same_version
+        FOREIGN KEY (previous_chunk_id, organization_id, project_id, document_version_id)
+        REFERENCES bridgeai_knowledge.chunks
+                   (id, organization_id, project_id, document_version_id)
+        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT fk_chunks_next_same_version
+        FOREIGN KEY (next_chunk_id, organization_id, project_id, document_version_id)
+        REFERENCES bridgeai_knowledge.chunks
+                   (id, organization_id, project_id, document_version_id)
+        ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT ck_chunks_ordinal_nonnegative CHECK (ordinal_no >= 0),
+    CONSTRAINT ck_chunks_type CHECK (
+        chunk_type IN (
+            'clause', 'paragraph', 'list', 'table', 'figure_caption',
+            'case_summary', 'model_card'
+        )
+    ),
+    CONSTRAINT ck_chunks_content_nonblank CHECK (btrim(content_text) <> ''),
+    CONSTRAINT ck_chunks_sha256 CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_chunks_token_count CHECK (token_count IS NULL OR token_count >= 0),
+    CONSTRAINT ck_chunks_page_range CHECK (
+        page_start IS NULL OR (page_start > 0 AND page_end IS NOT NULL AND page_end >= page_start)
+    ),
+    CONSTRAINT ck_chunks_section_path_array CHECK (jsonb_typeof(section_path) = 'array'),
+    CONSTRAINT ck_chunks_char_range CHECK (
+        (char_start IS NULL AND char_end IS NULL)
+        OR (char_start IS NOT NULL AND char_start >= 0 AND char_end > char_start)
+    ),
+    CONSTRAINT ck_chunks_bbox_object CHECK (
+        source_bbox IS NULL OR jsonb_typeof(source_bbox) = 'object'
+    ),
+    CONSTRAINT ck_chunks_locator_present CHECK (
+        page_start IS NOT NULL OR clause_number IS NOT NULL OR char_start IS NOT NULL
+    ),
+    CONSTRAINT ck_chunks_no_self_links CHECK (
+        parent_chunk_id IS DISTINCT FROM id
+        AND previous_chunk_id IS DISTINCT FROM id
+        AND next_chunk_id IS DISTINCT FROM id
+    ),
+    CONSTRAINT ck_chunks_parser_nonblank CHECK (btrim(parser_version) <> ''),
+    CONSTRAINT ck_chunks_policy_nonblank CHECK (btrim(chunking_policy_version) <> '')
+);
+```
+
+`content_text` 保存发布时实际引用的原文片段，`content_sha256` 防止静默变化；页码、章节路径、条款号、字符区间和可选页面坐标使片段可以回到原文。Qdrant 的 collection、point_id、index_version 不进入 `chunks`，避免把派生索引身份误当成知识身份。
+
+### 8.16.2 追加发布、引用快照与索引同步
+
+```sql
+CREATE TABLE bridgeai_knowledge.publications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    document_id UUID NOT NULL,
+    document_version_id UUID NOT NULL,
+    publication_no INTEGER NOT NULL,
+    publication_action TEXT NOT NULL,
+    superseded_by_version_id UUID,
+    review_reference TEXT NOT NULL,
+    release_policy_version TEXT NOT NULL,
+    reason TEXT,
+    published_at TIMESTAMPTZ NOT NULL,
+    published_by UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_publications_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_publications_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_publications_document_version_scope
+        FOREIGN KEY (document_version_id, organization_id, project_id, document_id)
+        REFERENCES bridgeai_knowledge.document_versions
+                   (id, organization_id, project_id, document_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_publications_successor_scope
+        FOREIGN KEY (superseded_by_version_id, organization_id, project_id, document_id)
+        REFERENCES bridgeai_knowledge.document_versions
+                   (id, organization_id, project_id, document_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_publications_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_publications_number
+        UNIQUE (organization_id, project_id, document_id, publication_no),
+    CONSTRAINT ck_publications_number_positive CHECK (publication_no > 0),
+    CONSTRAINT ck_publications_action
+        CHECK (publication_action IN ('publish', 'supersede', 'archive', 'withdraw')),
+    CONSTRAINT ck_publications_supersede_shape CHECK (
+        (publication_action = 'supersede' AND superseded_by_version_id IS NOT NULL)
+        OR (publication_action <> 'supersede' AND superseded_by_version_id IS NULL)
+    ),
+    CONSTRAINT ck_publications_review_nonblank CHECK (btrim(review_reference) <> ''),
+    CONSTRAINT ck_publications_policy_nonblank CHECK (btrim(release_policy_version) <> ''),
+    CONSTRAINT ck_publications_reason CHECK (
+        publication_action = 'publish' OR (reason IS NOT NULL AND btrim(reason) <> '')
+    )
+);
+
+CREATE UNIQUE INDEX uq_publications_one_publish_per_version
+    ON bridgeai_knowledge.publications
+       (organization_id, project_id, document_version_id)
+    WHERE publication_action = 'publish';
+
+CREATE TABLE bridgeai_knowledge.citations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    document_id UUID NOT NULL,
+    document_version_id UUID NOT NULL,
+    chunk_id UUID NOT NULL,
+    source_artifact_id UUID NOT NULL,
+    source_artifact_version_id UUID NOT NULL,
+    cited_by_type TEXT NOT NULL,
+    cited_by_id TEXT NOT NULL,
+    page_number INTEGER,
+    section_path JSONB NOT NULL DEFAULT '[]'::jsonb,
+    clause_number TEXT,
+    table_number TEXT,
+    figure_number TEXT,
+    source_span JSONB NOT NULL DEFAULT '{}'::jsonb,
+    excerpt TEXT NOT NULL,
+    excerpt_sha256 TEXT NOT NULL,
+    applicability TEXT NOT NULL,
+    applicability_reason TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_citations_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_citations_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_citations_chunk_version_scope
+        FOREIGN KEY (chunk_id, organization_id, project_id, document_version_id)
+        REFERENCES bridgeai_knowledge.chunks
+                   (id, organization_id, project_id, document_version_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_citations_document_version_scope
+        FOREIGN KEY (document_version_id, organization_id, project_id, document_id)
+        REFERENCES bridgeai_knowledge.document_versions
+                   (id, organization_id, project_id, document_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_citations_artifact_scope
+        FOREIGN KEY (source_artifact_id, organization_id, project_id)
+        REFERENCES bridgeai_core.artifacts (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_citations_artifact_version
+        FOREIGN KEY (
+            source_artifact_version_id, organization_id, project_id, source_artifact_id
+        ) REFERENCES bridgeai_core.artifact_versions
+          (id, organization_id, project_id, artifact_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_citations_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT ck_citations_consumer_type CHECK (
+        cited_by_type IN (
+            'workflow_event', 'context_manifest', 'report_revision', 'external_export'
+        )
+    ),
+    CONSTRAINT ck_citations_consumer_id_nonblank CHECK (btrim(cited_by_id) <> ''),
+    CONSTRAINT ck_citations_page_positive CHECK (page_number IS NULL OR page_number > 0),
+    CONSTRAINT ck_citations_section_path_array CHECK (jsonb_typeof(section_path) = 'array'),
+    CONSTRAINT ck_citations_source_span_object CHECK (jsonb_typeof(source_span) = 'object'),
+    CONSTRAINT ck_citations_locator_present CHECK (
+        page_number IS NOT NULL OR clause_number IS NOT NULL
+        OR jsonb_typeof(source_span) = 'object' AND source_span <> '{}'::jsonb
+    ),
+    CONSTRAINT ck_citations_excerpt_nonblank CHECK (btrim(excerpt) <> ''),
+    CONSTRAINT ck_citations_excerpt_sha256 CHECK (excerpt_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_citations_applicability CHECK (
+        applicability IN ('applicable', 'partially_applicable', 'not_confirmed', 'not_applicable')
+    ),
+    CONSTRAINT ck_citations_reason_nonblank CHECK (btrim(applicability_reason) <> '')
+);
+
+CREATE TABLE bridgeai_knowledge.index_sync_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    chunk_id UUID,
+    publication_id UUID,
+    operation TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    idempotency_key TEXT NOT NULL,
+    qdrant_collection TEXT NOT NULL,
+    qdrant_point_id TEXT,
+    qdrant_index_version TEXT NOT NULL,
+    source_revision_sha256 TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    available_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_index_sync_jobs_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_index_sync_jobs_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_index_sync_jobs_chunk_scope
+        FOREIGN KEY (chunk_id, organization_id, project_id)
+        REFERENCES bridgeai_knowledge.chunks (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_index_sync_jobs_publication_scope
+        FOREIGN KEY (publication_id, organization_id, project_id)
+        REFERENCES bridgeai_knowledge.publications (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_index_sync_jobs_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_index_sync_jobs_idempotency
+        UNIQUE (organization_id, project_id, idempotency_key),
+    CONSTRAINT ck_index_sync_jobs_target_shape CHECK (
+        (operation IN ('upsert', 'delete_point', 'verify_point')
+         AND chunk_id IS NOT NULL AND publication_id IS NULL)
+        OR (operation IN ('publish_collection', 'withdraw_collection', 'verify_collection')
+            AND publication_id IS NOT NULL AND chunk_id IS NULL)
+    ),
+    CONSTRAINT ck_index_sync_jobs_status CHECK (
+        status IN ('queued', 'running', 'succeeded', 'failed', 'dead_letter', 'cancelled')
+    ),
+    CONSTRAINT ck_index_sync_jobs_key_nonblank CHECK (btrim(idempotency_key) <> ''),
+    CONSTRAINT ck_index_sync_jobs_collection_namespace CHECK (
+        qdrant_collection LIKE 'bridgeai_knowledge_%'
+    ),
+    CONSTRAINT ck_index_sync_jobs_point_shape CHECK (
+        operation IN ('publish_collection', 'withdraw_collection', 'verify_collection')
+        OR qdrant_point_id IS NOT NULL
+    ),
+    CONSTRAINT ck_index_sync_jobs_index_version_nonblank
+        CHECK (btrim(qdrant_index_version) <> ''),
+    CONSTRAINT ck_index_sync_jobs_source_sha256
+        CHECK (source_revision_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_index_sync_jobs_attempt_nonnegative CHECK (attempt_count >= 0),
+    CONSTRAINT ck_index_sync_jobs_completion CHECK (
+        (status = 'succeeded' AND completed_at IS NOT NULL AND last_error IS NULL)
+        OR status <> 'succeeded'
+    ),
+    CONSTRAINT ck_index_sync_jobs_version_positive CHECK (version > 0)
+);
+
+CREATE INDEX ix_document_versions_scope_status
+    ON bridgeai_knowledge.document_versions
+       (organization_id, project_id, status, effective_from, effective_to);
+CREATE INDEX ix_chunks_version_locator
+    ON bridgeai_knowledge.chunks
+       (organization_id, project_id, document_version_id, page_start, ordinal_no);
+CREATE INDEX ix_citations_consumer
+    ON bridgeai_knowledge.citations
+       (organization_id, project_id, cited_by_type, cited_by_id);
+CREATE INDEX ix_index_sync_jobs_claim
+    ON bridgeai_knowledge.index_sync_jobs
+       (organization_id, project_id, status, available_at)
+    WHERE status IN ('queued', 'failed');
+```
+
+`cited_by_type + cited_by_id` 是受控的多态消费方引用，不伪装成数据库外键：允许类型只有上表 CHECK 中四种，写入入口统一为 Citation Service；该服务在同一请求中按类型解析目标表、校验组织/项目可见性并保存目标稳定 ID，删除/撤签事件再由一致性作业复核引用。强业务关系位于引用的证据一侧，因此 chunk、文档版本和 Artifact 版本全部使用可验证组合外键。`workflow_events.id` 是 BIGINT 且带分区键，报告修订与外部导出又有不同键形状，强行把这些消费方塞入一个 UUID 外键只会产生无法验证的伪关系。
+
+`qdrant_collection`、`qdrant_point_id` 和 `qdrant_index_version` 明确是派生同步字段：只能由索引投影器更新 `index_sync_jobs`，不得由 Qdrant 回写 `document_versions`、`chunks`、`publications` 或 `citations`。知识集合强制使用 `bridgeai_knowledge_` 前缀。
+
+### 8.16.3 版本与发布保护
+
+已发布版本不可覆盖。文档版本允许状态推进，但来源 Artifact、哈希、版本号、有效期及解析/切分版本一旦离开 `registered` 就冻结；正文片段、发布记录和引用快照均追加写。需要纠错时创建新的 `document_versions` 和 `chunks`，以 `supersedes_version_id` 关联旧版本，再追加 `publications(publication_action='supersede')`。
+
+```sql
+CREATE OR REPLACE FUNCTION bridgeai_knowledge.enforce_document_version_transition()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status <> 'registered' THEN
+            RAISE EXCEPTION 'document version initial status must be registered';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.status <> 'registered' AND ROW(
+        NEW.organization_id, NEW.project_id, NEW.document_id, NEW.version_no,
+        NEW.content_sha256, NEW.source_artifact_id, NEW.source_artifact_version_id,
+        NEW.supersedes_version_id, NEW.effective_from, NEW.effective_to
+    ) IS DISTINCT FROM ROW(
+        OLD.organization_id, OLD.project_id, OLD.document_id, OLD.version_no,
+        OLD.content_sha256, OLD.source_artifact_id, OLD.source_artifact_version_id,
+        OLD.supersedes_version_id, OLD.effective_from, OLD.effective_to
+    ) THEN
+        RAISE EXCEPTION 'document version identity and processing inputs are immutable';
+    END IF;
+
+    IF OLD.status IN ('indexing', 'review_pending', 'published', 'superseded', 'archived')
+       AND ROW(NEW.parser_name, NEW.parser_version, NEW.chunking_policy_version)
+           IS DISTINCT FROM ROW(OLD.parser_name, OLD.parser_version, OLD.chunking_policy_version)
+    THEN
+        RAISE EXCEPTION 'document parsing and chunking versions are frozen at indexing';
+    END IF;
+
+    IF OLD.status <> NEW.status AND NOT (
+        (OLD.status = 'registered' AND NEW.status IN ('parsing', 'rejected', 'failed'))
+        OR (OLD.status = 'parsing' AND NEW.status IN ('validating', 'failed'))
+        OR (OLD.status = 'validating' AND NEW.status IN ('indexing', 'rejected', 'failed'))
+        OR (OLD.status = 'indexing' AND NEW.status IN ('review_pending', 'failed'))
+        OR (OLD.status = 'review_pending' AND NEW.status IN ('published', 'rejected'))
+        OR (OLD.status = 'published' AND NEW.status IN ('superseded', 'archived'))
+        OR (OLD.status = 'failed' AND NEW.status = 'parsing')
+    ) THEN
+        RAISE EXCEPTION 'invalid document version transition: % -> %', OLD.status, NEW.status;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_document_versions_transition
+BEFORE INSERT OR UPDATE ON bridgeai_knowledge.document_versions
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.enforce_document_version_transition();
+
+CREATE OR REPLACE FUNCTION bridgeai_knowledge.validate_publication_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    version_status TEXT;
+    successor_status TEXT;
+BEGIN
+    SELECT status INTO version_status
+    FROM bridgeai_knowledge.document_versions
+    WHERE id = NEW.document_version_id
+      AND organization_id = NEW.organization_id
+      AND project_id = NEW.project_id
+      AND document_id = NEW.document_id;
+
+    IF NEW.publication_action = 'publish' AND version_status <> 'published' THEN
+        RAISE EXCEPTION 'publish record requires published document version';
+    ELSIF NEW.publication_action = 'supersede' THEN
+        SELECT status INTO successor_status
+        FROM bridgeai_knowledge.document_versions
+        WHERE id = NEW.superseded_by_version_id
+          AND organization_id = NEW.organization_id
+          AND project_id = NEW.project_id
+          AND document_id = NEW.document_id;
+        IF version_status <> 'superseded' OR successor_status <> 'published' THEN
+            RAISE EXCEPTION 'supersede record requires superseded source and published successor';
+        END IF;
+    ELSIF NEW.publication_action = 'archive' AND version_status <> 'archived' THEN
+        RAISE EXCEPTION 'archive record requires archived document version';
+    ELSIF NEW.publication_action = 'withdraw'
+          AND version_status NOT IN ('superseded', 'archived') THEN
+        RAISE EXCEPTION 'withdraw record requires non-serving document version';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_publications_validate_insert
+BEFORE INSERT ON bridgeai_knowledge.publications
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.validate_publication_insert();
+
+CREATE OR REPLACE FUNCTION bridgeai_knowledge.reject_immutable_row_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION '% rows are append-only', TG_TABLE_NAME;
+END;
+$$;
+
+CREATE TRIGGER trg_chunks_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_knowledge.chunks
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.reject_immutable_row_change();
+CREATE TRIGGER trg_publications_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_knowledge.publications
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.reject_immutable_row_change();
+CREATE TRIGGER trg_citations_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_knowledge.citations
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.reject_immutable_row_change();
+```
+
+### 8.16.4 RLS 与一致性验证
+
+```sql
+DO $knowledge_rls$
+DECLARE
+    table_name TEXT;
+BEGIN
+    FOREACH table_name IN ARRAY ARRAY[
+        'knowledge_sources', 'documents', 'document_versions', 'chunks',
+        'publications', 'citations', 'index_sync_jobs'
+    ]
+    LOOP
+        EXECUTE format('ALTER TABLE bridgeai_knowledge.%I ENABLE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('ALTER TABLE bridgeai_knowledge.%I FORCE ROW LEVEL SECURITY', table_name);
+        EXECUTE format(
+            'CREATE POLICY %I ON bridgeai_knowledge.%I USING (
+                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
+                AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+             ) WITH CHECK (
+                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
+                AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+             )',
+            'pl_' || table_name || '_scope', table_name
+        );
+    END LOOP;
+END
+$knowledge_rls$;
+```
+
+发布切换前后至少执行以下验证；任何一项非零都禁止切换生产别名：
+
+```sql
+-- 发布版本必须存在唯一 publish 记录，且所有 chunk 均可定位。
+SELECT dv.id
+FROM bridgeai_knowledge.document_versions AS dv
+LEFT JOIN bridgeai_knowledge.publications AS p
+  ON p.document_version_id = dv.id
+ AND p.organization_id = dv.organization_id
+ AND p.project_id = dv.project_id
+ AND p.publication_action = 'publish'
+WHERE dv.status = 'published'
+GROUP BY dv.id
+HAVING count(p.id) <> 1;
+
+SELECT c.id
+FROM bridgeai_knowledge.chunks AS c
+WHERE c.page_start IS NULL
+  AND c.clause_number IS NULL
+  AND c.char_start IS NULL;
+
+-- Qdrant 只能是可重建投影；成功 job 的来源哈希须仍等于权威 chunk 哈希。
+SELECT j.id
+FROM bridgeai_knowledge.index_sync_jobs AS j
+JOIN bridgeai_knowledge.chunks AS c
+  ON (c.id,c.organization_id,c.project_id) = (j.chunk_id,j.organization_id,j.project_id)
+WHERE j.status = 'succeeded'
+  AND j.operation IN ('upsert', 'verify_point')
+  AND j.source_revision_sha256 <> c.content_sha256;
+```
+
 ## 8.17 Memory 与 Context 数据模型
+
+Memory 不是 RAG 知识的副本，也不是 LangGraph Checkpoint。`memory_records` 保存作用域、治理状态和当前修订指针，`memory_revisions` 保存内容修订，`memory_sources` 保存可复核来源版本，`context_manifests/context_manifest_items` 冻结每次实际召回和裁剪清单。普通 Agent 只能读取 Context Pack，不能直连这些表或 Qdrant。
+
+完整生命周期覆盖 `candidate → validating → review_pending → active → superseded/expired/revoked/quarantined → tombstoned → deleted`，并保留 `conflicted/rejected` 分支；只有 `active` 可默认召回。
+
+第七章同时要求 task/project/user/organization 作用域，因此 `memory_records` 是 8.7 表类别矩阵的一个明确“受控和类型”：`organization_id` 始终非空；`project_id` 只在 project/task 分支非空，且由组合外键验证；`scope_type` 和互斥列共同决定唯一主作用域，**绝不只凭 `project_id IS NULL` 推断组织级**，也不再增加含义重复且无法强校验的通用 `scope_id`。`system` 产品默认值属于真正全局配置，不写入承载租户内容的业务 Memory 表。
+
+### 8.17.1 Memory 权威记录、修订与来源
+
+```sql
+CREATE TABLE bridgeai_memory.memory_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID,
+    scope_type TEXT NOT NULL,
+    task_id UUID,
+    user_id UUID,
+    memory_family_id UUID NOT NULL,
+    memory_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'candidate',
+    risk_level TEXT NOT NULL,
+    confidence NUMERIC(5, 4) NOT NULL,
+    validation_status TEXT NOT NULL DEFAULT 'unverified',
+    owner_subject_id UUID NOT NULL,
+    visibility TEXT NOT NULL,
+    sensitivity TEXT NOT NULL DEFAULT 'internal',
+    current_revision_id UUID,
+    current_revision_no INTEGER,
+    supersedes_memory_id UUID,
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    valid_until TIMESTAMPTZ,
+    retention_policy_version TEXT NOT NULL,
+    deletion_status TEXT NOT NULL DEFAULT 'none',
+    activated_at TIMESTAMPTZ,
+    terminal_at TIMESTAMPTZ,
+    terminal_reason TEXT,
+    last_used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_memory_records_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_memory_records_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_memory_records_task_scope
+        FOREIGN KEY (task_id, organization_id, project_id)
+        REFERENCES bridgeai_workflow.workflow_tasks (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_memory_records_user_scope
+        FOREIGN KEY (user_id, organization_id)
+        REFERENCES bridgeai_identity.users (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT uq_memory_records_id_organization UNIQUE (id, organization_id),
+    CONSTRAINT uq_memory_records_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT fk_memory_records_supersedes_same_organization
+        FOREIGN KEY (supersedes_memory_id, organization_id)
+        REFERENCES bridgeai_memory.memory_records (id, organization_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT ck_memory_records_scope_type
+        CHECK (scope_type IN ('organization', 'project', 'task', 'user')),
+    CONSTRAINT ck_memory_records_single_primary_scope CHECK (
+        (scope_type = 'organization'
+         AND project_id IS NULL AND task_id IS NULL AND user_id IS NULL)
+        OR (scope_type = 'project'
+            AND project_id IS NOT NULL AND task_id IS NULL AND user_id IS NULL)
+        OR (scope_type = 'task'
+            AND project_id IS NOT NULL AND task_id IS NOT NULL AND user_id IS NULL)
+        OR (scope_type = 'user'
+            AND project_id IS NULL AND task_id IS NULL AND user_id IS NOT NULL)
+    ),
+    CONSTRAINT ck_memory_records_type CHECK (
+        memory_type IN ('task_memory', 'project_memory', 'preference_memory', 'operational_memory')
+    ),
+    CONSTRAINT ck_memory_records_status CHECK (
+        status IN (
+            'candidate', 'validating', 'review_pending', 'active', 'conflicted',
+            'rejected', 'superseded', 'expired', 'revoked', 'quarantined',
+            'tombstoned', 'deleted'
+        )
+    ),
+    CONSTRAINT ck_memory_records_risk CHECK (risk_level IN ('low', 'medium', 'high', 'critical')),
+    CONSTRAINT ck_memory_records_confidence CHECK (confidence BETWEEN 0 AND 1),
+    CONSTRAINT ck_memory_records_validation CHECK (
+        validation_status IN ('unverified', 'rule_validated', 'source_verified', 'human_confirmed')
+    ),
+    CONSTRAINT ck_memory_records_visibility CHECK (
+        visibility IN ('private', 'project', 'organization')
+        AND ((scope_type = 'user' AND visibility = 'private') OR scope_type <> 'user')
+    ),
+    CONSTRAINT ck_memory_records_sensitivity CHECK (
+        sensitivity IN ('public', 'internal', 'confidential', 'restricted')
+    ),
+    CONSTRAINT ck_memory_records_current_revision_shape CHECK (
+        (current_revision_id IS NULL AND current_revision_no IS NULL)
+        OR (current_revision_id IS NOT NULL AND current_revision_no > 0)
+    ),
+    CONSTRAINT ck_memory_records_no_self_supersede CHECK (supersedes_memory_id IS DISTINCT FROM id),
+    CONSTRAINT ck_memory_records_valid_range CHECK (
+        valid_until IS NULL OR valid_until > valid_from
+    ),
+    CONSTRAINT ck_memory_records_retention_nonblank CHECK (btrim(retention_policy_version) <> ''),
+    CONSTRAINT ck_memory_records_deletion_status CHECK (
+        deletion_status IN ('none', 'pending', 'partial', 'complete', 'blocked')
+    ),
+    CONSTRAINT ck_memory_records_activation CHECK (
+        (status = 'active' AND activated_at IS NOT NULL AND current_revision_id IS NOT NULL)
+        OR status <> 'active'
+    ),
+    CONSTRAINT ck_memory_records_terminal CHECK (
+        (status IN ('superseded', 'expired', 'revoked', 'quarantined', 'tombstoned', 'deleted')
+         AND terminal_at IS NOT NULL AND terminal_reason IS NOT NULL
+         AND btrim(terminal_reason) <> '')
+        OR status NOT IN ('superseded', 'expired', 'revoked', 'quarantined', 'tombstoned', 'deleted')
+    ),
+    CONSTRAINT ck_memory_records_deleted_state CHECK (
+        status <> 'deleted' OR deletion_status = 'complete'
+    ),
+    CONSTRAINT ck_memory_records_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_memory.memory_revisions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID,
+    memory_id UUID NOT NULL,
+    revision_no INTEGER NOT NULL,
+    content_text TEXT,
+    summary TEXT,
+    structured_facts JSONB NOT NULL DEFAULT '{}'::jsonb,
+    content_sha256 TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    embedding_model_version TEXT,
+    qdrant_collection TEXT,
+    qdrant_point_id TEXT,
+    qdrant_index_version TEXT,
+    index_status TEXT NOT NULL DEFAULT 'not_requested',
+    indexed_at TIMESTAMPTZ,
+    redacted_at TIMESTAMPTZ,
+    redacted_by UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_memory_revisions_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_memory_revisions_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_memory_revisions_memory_organization
+        FOREIGN KEY (memory_id, organization_id)
+        REFERENCES bridgeai_memory.memory_records (id, organization_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_memory_revisions_id_organization UNIQUE (id, organization_id),
+    CONSTRAINT uq_memory_revisions_id_memory
+        UNIQUE (id, organization_id, memory_id),
+    CONSTRAINT uq_memory_revisions_number
+        UNIQUE (organization_id, memory_id, revision_no),
+    CONSTRAINT ck_memory_revisions_number_positive CHECK (revision_no > 0),
+    CONSTRAINT ck_memory_revisions_content_shape CHECK (
+        (redacted_at IS NULL AND content_text IS NOT NULL AND btrim(content_text) <> '')
+        OR (redacted_at IS NOT NULL AND content_text IS NULL AND summary IS NULL
+            AND structured_facts = '{}'::jsonb AND redacted_by IS NOT NULL)
+    ),
+    CONSTRAINT ck_memory_revisions_facts_object CHECK (jsonb_typeof(structured_facts) = 'object'),
+    CONSTRAINT ck_memory_revisions_sha256 CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_memory_revisions_schema_nonblank CHECK (btrim(schema_version) <> ''),
+    CONSTRAINT ck_memory_revisions_index_status CHECK (
+        index_status IN ('not_requested', 'queued', 'ready', 'failed', 'deleting', 'deleted')
+    ),
+    CONSTRAINT ck_memory_revisions_index_fields CHECK (
+        (qdrant_collection IS NULL AND qdrant_point_id IS NULL AND qdrant_index_version IS NULL)
+        OR (qdrant_collection LIKE 'bridgeai_memory_%'
+            AND qdrant_point_id IS NOT NULL AND btrim(qdrant_point_id) <> ''
+            AND qdrant_index_version IS NOT NULL AND btrim(qdrant_index_version) <> '')
+    ),
+    CONSTRAINT ck_memory_revisions_ready_index CHECK (
+        index_status <> 'ready'
+        OR (qdrant_collection IS NOT NULL AND indexed_at IS NOT NULL AND redacted_at IS NULL)
+    ),
+    CONSTRAINT ck_memory_revisions_redacted_index CHECK (
+        redacted_at IS NULL OR index_status IN ('deleting', 'deleted')
+    )
+);
+
+ALTER TABLE bridgeai_memory.memory_records
+    ADD CONSTRAINT fk_memory_records_current_revision
+    FOREIGN KEY (current_revision_id, organization_id, id)
+    REFERENCES bridgeai_memory.memory_revisions (id, organization_id, memory_id)
+    ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
+
+CREATE TABLE bridgeai_memory.memory_sources (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID,
+    memory_id UUID NOT NULL,
+    memory_revision_id UUID NOT NULL,
+    source_type TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    source_locator JSONB NOT NULL DEFAULT '{}'::jsonb,
+    relation_type TEXT NOT NULL,
+    source_sha256 TEXT,
+    availability_status TEXT NOT NULL DEFAULT 'active',
+    captured_at TIMESTAMPTZ NOT NULL,
+    last_verified_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_memory_sources_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_memory_sources_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_memory_sources_revision_memory
+        FOREIGN KEY (memory_revision_id, organization_id, memory_id)
+        REFERENCES bridgeai_memory.memory_revisions (id, organization_id, memory_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_memory_sources_id_organization UNIQUE (id, organization_id),
+    CONSTRAINT uq_memory_sources_identity UNIQUE (
+        organization_id, memory_revision_id, source_type, source_id, source_version, relation_type
+    ),
+    CONSTRAINT ck_memory_sources_type CHECK (
+        source_type IN (
+            'business_record', 'workflow_event', 'tool_result', 'human_review',
+            'signed_report', 'user_action', 'evaluation_report', 'rag_evidence'
+        )
+    ),
+    CONSTRAINT ck_memory_sources_id_nonblank CHECK (btrim(source_id) <> ''),
+    CONSTRAINT ck_memory_sources_version_nonblank CHECK (btrim(source_version) <> ''),
+    CONSTRAINT ck_memory_sources_locator_object CHECK (jsonb_typeof(source_locator) = 'object'),
+    CONSTRAINT ck_memory_sources_relation CHECK (
+        relation_type IN ('supports', 'corrects', 'supersedes', 'derived_from')
+    ),
+    CONSTRAINT ck_memory_sources_sha256 CHECK (
+        source_sha256 IS NULL OR source_sha256 ~ '^[0-9a-f]{64}$'
+    ),
+    CONSTRAINT ck_memory_sources_availability CHECK (
+        availability_status IN ('active', 'unavailable', 'revoked', 'deleted')
+    ),
+    CONSTRAINT ck_memory_sources_verify_time CHECK (
+        last_verified_at IS NULL OR last_verified_at >= captured_at
+    )
+);
+
+CREATE TABLE bridgeai_memory.memory_feedback (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID,
+    memory_id UUID NOT NULL,
+    memory_revision_id UUID NOT NULL,
+    feedback_type TEXT NOT NULL,
+    actor_subject_id UUID NOT NULL,
+    review_id UUID,
+    reason TEXT NOT NULL,
+    correction_payload JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_memory_feedback_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_memory_feedback_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_memory_feedback_revision_memory
+        FOREIGN KEY (memory_revision_id, organization_id, memory_id)
+        REFERENCES bridgeai_memory.memory_revisions (id, organization_id, memory_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_memory_feedback_review_organization
+        FOREIGN KEY (review_id, organization_id)
+        REFERENCES bridgeai_workflow.workflow_reviews (id, organization_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_memory_feedback_id_organization UNIQUE (id, organization_id),
+    CONSTRAINT ck_memory_feedback_type CHECK (
+        feedback_type IN ('accepted', 'ignored', 'corrected', 'negated', 'reported')
+    ),
+    CONSTRAINT ck_memory_feedback_reason_nonblank CHECK (btrim(reason) <> ''),
+    CONSTRAINT ck_memory_feedback_correction_shape CHECK (
+        (feedback_type = 'corrected' AND correction_payload IS NOT NULL
+         AND jsonb_typeof(correction_payload) = 'object')
+        OR (feedback_type <> 'corrected' AND
+            (correction_payload IS NULL OR jsonb_typeof(correction_payload) = 'object'))
+    )
+);
+```
+
+`memory_sources` 使用受控多态来源，因为业务记录、分区 Workflow Event、ToolResult、复核、签发报告、用户操作、评测和 RAG citation 的键形状不同；`source_id` 不是数据库强外键。唯一写入入口是 Memory Write Service：它按 `source_type` 调用相应领域只读服务或表适配器，校验 `organization_id`、可选 `project_id`、稳定 ID、`source_version` 和哈希；Workflow Event 还在 `source_locator` 保存 `occurred_at` 分区键，RAG 来源解析到 `citations` 的强版本链。Source Monitor 在来源撤回/删改事件和周期巡检中重复验证。允许类型仅限 CHECK 列表，无法验证的输入进入 `quarantined`，不得伪装成已由数据库证明的业务强关系。
+
+### 8.17.2 Context Manifest 与实际召回清单
+
+```sql
+CREATE TABLE bridgeai_memory.context_manifests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    task_id UUID NOT NULL,
+    run_id UUID NOT NULL,
+    thread_id TEXT NOT NULL,
+    trace_id TEXT NOT NULL,
+    current_node TEXT NOT NULL,
+    as_of TIMESTAMPTZ NOT NULL,
+    query_fingerprint TEXT NOT NULL,
+    retrieval_config_version TEXT NOT NULL,
+    context_policy_version TEXT NOT NULL,
+    candidate_item_count INTEGER NOT NULL,
+    used_item_count INTEGER NOT NULL,
+    omitted_item_count INTEGER NOT NULL,
+    input_token_count INTEGER NOT NULL,
+    memory_token_count INTEGER NOT NULL,
+    reserved_token_count INTEGER NOT NULL,
+    context_hash TEXT NOT NULL,
+    schema_version TEXT NOT NULL DEFAULT 'context-manifest.v1',
+    degraded BOOLEAN NOT NULL DEFAULT false,
+    degradation_reason TEXT,
+    requires_review BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_context_manifests_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_context_manifests_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_context_manifests_task_scope
+        FOREIGN KEY (task_id, organization_id, project_id)
+        REFERENCES bridgeai_workflow.workflow_tasks (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_context_manifests_run_thread
+        FOREIGN KEY (run_id, organization_id, project_id, task_id, thread_id)
+        REFERENCES bridgeai_workflow.workflow_runs
+                   (id, organization_id, project_id, task_id, thread_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_context_manifests_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT ck_context_manifests_thread_nonblank CHECK (btrim(thread_id) <> ''),
+    CONSTRAINT ck_context_manifests_trace_nonblank CHECK (btrim(trace_id) <> ''),
+    CONSTRAINT ck_context_manifests_node_nonblank CHECK (btrim(current_node) <> ''),
+    CONSTRAINT ck_context_manifests_query_hash CHECK (query_fingerprint ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_context_manifests_context_hash CHECK (context_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_context_manifests_counts CHECK (
+        candidate_item_count >= 0 AND used_item_count >= 0 AND omitted_item_count >= 0
+        AND used_item_count + omitted_item_count <= candidate_item_count
+    ),
+    CONSTRAINT ck_context_manifests_tokens CHECK (
+        input_token_count >= 0 AND memory_token_count >= 0 AND reserved_token_count >= 0
+    ),
+    CONSTRAINT ck_context_manifests_degradation CHECK (
+        (degraded AND degradation_reason IS NOT NULL AND btrim(degradation_reason) <> '')
+        OR (NOT degraded AND degradation_reason IS NULL)
+    ),
+    CONSTRAINT ck_context_manifests_policy_nonblank CHECK (
+        btrim(retrieval_config_version) <> '' AND btrim(context_policy_version) <> ''
+    )
+);
+
+CREATE TABLE bridgeai_memory.context_manifest_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    context_manifest_id UUID NOT NULL,
+    ordinal_no INTEGER NOT NULL,
+    item_kind TEXT NOT NULL,
+    memory_id UUID,
+    memory_revision_id UUID,
+    citation_id UUID,
+    business_ref_type TEXT,
+    business_ref_id TEXT,
+    disposition TEXT NOT NULL,
+    omission_reason TEXT,
+    candidate_rank INTEGER,
+    token_count INTEGER NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    compression_record JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_context_manifest_items_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_context_manifest_items_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_context_manifest_items_manifest_scope
+        FOREIGN KEY (context_manifest_id, organization_id, project_id)
+        REFERENCES bridgeai_memory.context_manifests (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_context_manifest_items_memory_revision
+        FOREIGN KEY (memory_revision_id, organization_id, memory_id)
+        REFERENCES bridgeai_memory.memory_revisions (id, organization_id, memory_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_context_manifest_items_citation_scope
+        FOREIGN KEY (citation_id, organization_id, project_id)
+        REFERENCES bridgeai_knowledge.citations (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_context_manifest_items_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_context_manifest_items_ordinal
+        UNIQUE (organization_id, project_id, context_manifest_id, ordinal_no),
+    CONSTRAINT ck_context_manifest_items_ordinal_nonnegative CHECK (ordinal_no >= 0),
+    CONSTRAINT ck_context_manifest_items_kind CHECK (
+        item_kind IN ('memory_revision', 'rag_evidence', 'business_fact')
+    ),
+    CONSTRAINT ck_context_manifest_items_target_shape CHECK (
+        (item_kind = 'memory_revision'
+         AND memory_id IS NOT NULL AND memory_revision_id IS NOT NULL
+         AND citation_id IS NULL AND business_ref_type IS NULL AND business_ref_id IS NULL)
+        OR (item_kind = 'rag_evidence'
+            AND memory_id IS NULL AND memory_revision_id IS NULL
+            AND citation_id IS NOT NULL AND business_ref_type IS NULL AND business_ref_id IS NULL)
+        OR (item_kind = 'business_fact'
+            AND memory_id IS NULL AND memory_revision_id IS NULL AND citation_id IS NULL
+            AND business_ref_type IS NOT NULL AND btrim(business_ref_type) <> ''
+            AND business_ref_id IS NOT NULL AND btrim(business_ref_id) <> '')
+    ),
+    CONSTRAINT ck_context_manifest_items_disposition CHECK (
+        disposition IN ('used', 'omitted', 'compressed')
+    ),
+    CONSTRAINT ck_context_manifest_items_omission CHECK (
+        (disposition = 'omitted' AND omission_reason IN (
+            'unauthorized', 'expired', 'duplicate', 'budget_exceeded',
+            'conflicted', 'source_unavailable', 'revoked', 'quarantined'
+        )) OR (disposition <> 'omitted' AND omission_reason IS NULL)
+    ),
+    CONSTRAINT ck_context_manifest_items_rank CHECK (
+        candidate_rank IS NULL OR candidate_rank > 0
+    ),
+    CONSTRAINT ck_context_manifest_items_tokens CHECK (token_count >= 0),
+    CONSTRAINT ck_context_manifest_items_sha256 CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_context_manifest_items_compression CHECK (
+        (disposition = 'compressed' AND compression_record IS NOT NULL
+         AND jsonb_typeof(compression_record) = 'object')
+        OR (disposition <> 'compressed' AND compression_record IS NULL)
+    )
+);
+```
+
+每条 `context_manifest_items` 都是候选清单的一项，`candidate_rank` 保存进入裁剪前的位置，`disposition` 冻结最终 used/omitted/compressed 结果，且引用具体 `memory_revision_id` 或 RAG `citation_id`，不会在历史复现时漂移到“最新版本”。`business_ref_type/id` 与 Citation 消费端一样只是受控外部引用，由 Context Builder 通过领域服务校验，不宣称数据库强关系。
+
+### 8.17.3 删除传播与最小墓碑
+
+```sql
+CREATE TABLE bridgeai_memory.deletion_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID,
+    memory_id UUID NOT NULL,
+    request_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    idempotency_key TEXT NOT NULL,
+    requested_by UUID NOT NULL,
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    legal_basis TEXT NOT NULL,
+    postgres_redaction_status TEXT NOT NULL DEFAULT 'pending',
+    qdrant_delete_status TEXT NOT NULL DEFAULT 'pending',
+    cache_invalidation_status TEXT NOT NULL DEFAULT 'pending',
+    artifact_cleanup_status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    blocked_reason TEXT,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_deletion_jobs_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_deletion_jobs_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_deletion_jobs_memory_organization
+        FOREIGN KEY (memory_id, organization_id)
+        REFERENCES bridgeai_memory.memory_records (id, organization_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_deletion_jobs_id_organization UNIQUE (id, organization_id),
+    CONSTRAINT uq_deletion_jobs_idempotency
+        UNIQUE (organization_id, idempotency_key),
+    CONSTRAINT ck_deletion_jobs_request_type
+        CHECK (request_type IN ('revoke', 'retention_expiry', 'subject_request', 'source_deleted')),
+    CONSTRAINT ck_deletion_jobs_status CHECK (
+        status IN ('pending', 'running', 'blocked', 'failed', 'complete')
+    ),
+    CONSTRAINT ck_deletion_jobs_key_nonblank CHECK (btrim(idempotency_key) <> ''),
+    CONSTRAINT ck_deletion_jobs_basis_nonblank CHECK (btrim(legal_basis) <> ''),
+    CONSTRAINT ck_deletion_jobs_postgres_status CHECK (
+        postgres_redaction_status IN ('pending', 'running', 'succeeded', 'not_required', 'failed')
+    ),
+    CONSTRAINT ck_deletion_jobs_qdrant_status CHECK (
+        qdrant_delete_status IN ('pending', 'running', 'succeeded', 'not_required', 'failed')
+    ),
+    CONSTRAINT ck_deletion_jobs_cache_status CHECK (
+        cache_invalidation_status IN ('pending', 'running', 'succeeded', 'not_required', 'failed')
+    ),
+    CONSTRAINT ck_deletion_jobs_artifact_status CHECK (
+        artifact_cleanup_status IN ('pending', 'running', 'succeeded', 'not_required', 'failed')
+    ),
+    CONSTRAINT ck_deletion_jobs_attempt_nonnegative CHECK (attempt_count >= 0),
+    CONSTRAINT ck_deletion_jobs_blocked_reason CHECK (
+        (status = 'blocked' AND blocked_reason IS NOT NULL AND btrim(blocked_reason) <> '')
+        OR status <> 'blocked'
+    ),
+    CONSTRAINT ck_deletion_jobs_complete CHECK (
+        status <> 'complete'
+        OR (
+            completed_at IS NOT NULL
+            AND postgres_redaction_status IN ('succeeded', 'not_required')
+            AND qdrant_delete_status IN ('succeeded', 'not_required')
+            AND cache_invalidation_status IN ('succeeded', 'not_required')
+            AND artifact_cleanup_status IN ('succeeded', 'not_required')
+            AND last_error IS NULL
+        )
+    ),
+    CONSTRAINT ck_deletion_jobs_version_positive CHECK (version > 0)
+);
+
+CREATE INDEX ix_memory_records_recall
+    ON bridgeai_memory.memory_records
+       (organization_id, project_id, scope_type, status, memory_type, valid_until)
+    WHERE status = 'active';
+CREATE INDEX ix_memory_sources_revalidation
+    ON bridgeai_memory.memory_sources
+       (organization_id, availability_status, last_verified_at);
+CREATE INDEX ix_context_manifests_task_time
+    ON bridgeai_memory.context_manifests
+       (organization_id, project_id, task_id, created_at DESC);
+CREATE INDEX ix_deletion_jobs_claim
+    ON bridgeai_memory.deletion_jobs
+       (organization_id, status, requested_at)
+    WHERE status IN ('pending', 'failed');
+```
+
+删除顺序固定为：同一 PostgreSQL 事务先将 active 记录转为 `revoked` 并创建幂等 job → 使缓存失效 → 只从 `bridgeai_memory_*` 集合删除 Memory point → 按保留/法律冻结策略清理 Artifact → 将记录转为 `tombstoned` 并通过受控过程清除修订正文 → 逐项核对成功后将 job 与记录标记 `complete/deleted`。`context_manifest_items`、原内容哈希、来源 ID/版本、删除依据、主体和时间作为不含正文的最小墓碑保留，使历史运行能说明“来源已删除”而不是静默换用新记忆。
+
+Memory 与 RAG 的 Qdrant 集合强制隔离：Memory 仅允许 `bridgeai_memory_*`，知识同步仅允许 `bridgeai_knowledge_*`；不得共享集合或生产别名，Memory 命中不得冒充 `citations`/RAG Evidence。
+
+### 8.17.4 作用域、状态和不可变行为
+
+数据库函数补上普通外键无法表达的“可空项目仍必须与父记录完全一致”和版本状态机。只有 `active` 可进入普通 Context Pack；模型或自动归纳只能创建 `candidate`。
+
+```sql
+CREATE OR REPLACE FUNCTION bridgeai_memory.enforce_memory_record_transition()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    source_count INTEGER;
+    predecessor bridgeai_memory.memory_records%ROWTYPE;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status <> 'candidate' THEN
+            RAISE EXCEPTION 'memory initial status must be candidate';
+        END IF;
+    ELSE
+        IF ROW(NEW.organization_id, NEW.project_id, NEW.scope_type, NEW.task_id,
+               NEW.user_id, NEW.memory_family_id, NEW.memory_type)
+           IS DISTINCT FROM
+           ROW(OLD.organization_id, OLD.project_id, OLD.scope_type, OLD.task_id,
+               OLD.user_id, OLD.memory_family_id, OLD.memory_type) THEN
+            RAISE EXCEPTION 'memory primary scope, family and type are immutable';
+        END IF;
+        IF OLD.status = 'active'
+           AND NEW.current_revision_id IS DISTINCT FROM OLD.current_revision_id THEN
+            RAISE EXCEPTION 'active memory revision cannot be replaced in place';
+        END IF;
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND OLD.status <> NEW.status AND NOT (
+        (OLD.status = 'candidate' AND NEW.status IN ('validating', 'rejected', 'quarantined', 'revoked'))
+        OR (OLD.status = 'validating' AND NEW.status IN (
+            'review_pending', 'conflicted', 'rejected', 'quarantined', 'revoked'
+        ))
+        OR (OLD.status = 'review_pending' AND NEW.status IN ('active', 'rejected', 'quarantined', 'revoked'))
+        OR (OLD.status = 'conflicted' AND NEW.status IN ('review_pending', 'rejected', 'quarantined'))
+        OR (OLD.status = 'active' AND NEW.status IN (
+            'superseded', 'expired', 'revoked', 'quarantined'
+        ))
+        OR (OLD.status IN ('superseded', 'expired', 'revoked', 'quarantined')
+            AND NEW.status = 'tombstoned')
+        OR (OLD.status = 'tombstoned' AND NEW.status = 'deleted')
+    ) THEN
+        RAISE EXCEPTION 'invalid memory transition: % -> %', OLD.status, NEW.status;
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND NEW.status = 'active' AND OLD.status <> 'active' THEN
+        IF NEW.current_revision_id IS NULL OR NEW.activated_at IS NULL THEN
+            RAISE EXCEPTION 'active memory requires current revision and activated_at';
+        END IF;
+        SELECT count(*) INTO source_count
+        FROM bridgeai_memory.memory_sources AS s
+        WHERE s.memory_id = NEW.id
+          AND s.organization_id = NEW.organization_id
+          AND s.memory_revision_id = NEW.current_revision_id
+          AND s.availability_status = 'active';
+        IF source_count = 0 THEN
+            RAISE EXCEPTION 'active memory requires an active versioned source';
+        END IF;
+    END IF;
+
+    IF NEW.supersedes_memory_id IS NOT NULL THEN
+        SELECT * INTO predecessor
+        FROM bridgeai_memory.memory_records
+        WHERE id = NEW.supersedes_memory_id AND organization_id = NEW.organization_id;
+        IF predecessor.id IS NULL
+           OR predecessor.scope_type <> NEW.scope_type
+           OR predecessor.project_id IS DISTINCT FROM NEW.project_id
+           OR predecessor.task_id IS DISTINCT FROM NEW.task_id
+           OR predecessor.user_id IS DISTINCT FROM NEW.user_id
+           OR predecessor.memory_family_id <> NEW.memory_family_id THEN
+            RAISE EXCEPTION 'superseded memory must have identical scope and family';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_memory_records_transition
+BEFORE INSERT OR UPDATE ON bridgeai_memory.memory_records
+FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.enforce_memory_record_transition();
+
+CREATE OR REPLACE FUNCTION bridgeai_memory.enforce_memory_revision_scope_and_content()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    parent_project_id UUID;
+    parent_status TEXT;
+    has_deletion_job BOOLEAN;
+BEGIN
+    SELECT project_id, status INTO parent_project_id, parent_status
+    FROM bridgeai_memory.memory_records
+    WHERE id = NEW.memory_id AND organization_id = NEW.organization_id;
+
+    IF NOT FOUND OR parent_project_id IS DISTINCT FROM NEW.project_id THEN
+        RAISE EXCEPTION 'memory revision project scope differs from parent';
+    END IF;
+
+    IF TG_OP = 'UPDATE' THEN
+        IF ROW(
+            NEW.organization_id, NEW.project_id, NEW.memory_id, NEW.revision_no,
+            NEW.content_sha256, NEW.schema_version
+        ) IS DISTINCT FROM ROW(
+            OLD.organization_id, OLD.project_id, OLD.memory_id, OLD.revision_no,
+            OLD.content_sha256, OLD.schema_version
+        ) THEN
+            RAISE EXCEPTION 'memory revision identity and digest are immutable';
+        END IF;
+
+        IF ROW(NEW.content_text, NEW.summary, NEW.structured_facts)
+           IS DISTINCT FROM ROW(OLD.content_text, OLD.summary, OLD.structured_facts) THEN
+            SELECT EXISTS (
+                SELECT 1 FROM bridgeai_memory.deletion_jobs AS d
+                WHERE d.memory_id = NEW.memory_id
+                  AND d.organization_id = NEW.organization_id
+                  AND d.status IN ('running', 'blocked')
+            ) INTO has_deletion_job;
+            IF NOT (
+                OLD.redacted_at IS NULL AND NEW.redacted_at IS NOT NULL
+                AND NEW.content_text IS NULL AND NEW.summary IS NULL
+                AND NEW.structured_facts = '{}'::jsonb
+                AND parent_status = 'tombstoned' AND has_deletion_job
+            ) THEN
+                RAISE EXCEPTION 'memory revision content is immutable except controlled redaction';
+            END IF;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_memory_revisions_scope_content
+BEFORE INSERT OR UPDATE ON bridgeai_memory.memory_revisions
+FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.enforce_memory_revision_scope_and_content();
+
+CREATE OR REPLACE FUNCTION bridgeai_memory.enforce_memory_child_scope()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    parent_project_id UUID;
+    review_project_id UUID;
+BEGIN
+    SELECT project_id INTO parent_project_id
+    FROM bridgeai_memory.memory_records
+    WHERE id = NEW.memory_id AND organization_id = NEW.organization_id;
+
+    IF NOT FOUND OR parent_project_id IS DISTINCT FROM NEW.project_id THEN
+        RAISE EXCEPTION '% project scope differs from memory parent', TG_TABLE_NAME;
+    END IF;
+
+    IF TG_TABLE_NAME = 'memory_feedback'
+       AND (to_jsonb(NEW) ->> 'review_id') IS NOT NULL THEN
+        SELECT project_id INTO review_project_id
+        FROM bridgeai_workflow.workflow_reviews
+        WHERE id = (to_jsonb(NEW) ->> 'review_id')::uuid
+          AND organization_id = NEW.organization_id;
+        IF parent_project_id IS NULL OR review_project_id IS DISTINCT FROM parent_project_id THEN
+            RAISE EXCEPTION 'feedback review must belong to the same project-scoped memory';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_memory_sources_parent_scope
+BEFORE INSERT OR UPDATE ON bridgeai_memory.memory_sources
+FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.enforce_memory_child_scope();
+CREATE TRIGGER trg_memory_feedback_parent_scope
+BEFORE INSERT OR UPDATE ON bridgeai_memory.memory_feedback
+FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.enforce_memory_child_scope();
+CREATE TRIGGER trg_deletion_jobs_parent_scope
+BEFORE INSERT OR UPDATE ON bridgeai_memory.deletion_jobs
+FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.enforce_memory_child_scope();
+
+CREATE OR REPLACE FUNCTION bridgeai_memory.enforce_manifest_memory_scope()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    memory_project_id UUID;
+BEGIN
+    IF NEW.item_kind = 'memory_revision' THEN
+        SELECT project_id INTO memory_project_id
+        FROM bridgeai_memory.memory_records
+        WHERE id = NEW.memory_id AND organization_id = NEW.organization_id;
+        IF NOT FOUND
+           OR (memory_project_id IS NOT NULL AND memory_project_id <> NEW.project_id) THEN
+            RAISE EXCEPTION 'project/task memory cannot enter another project manifest';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_context_manifest_items_memory_scope
+BEFORE INSERT ON bridgeai_memory.context_manifest_items
+FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.enforce_manifest_memory_scope();
+
+CREATE OR REPLACE FUNCTION bridgeai_memory.reject_manifest_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION '% rows are append-only', TG_TABLE_NAME;
+END;
+$$;
+
+CREATE TRIGGER trg_context_manifests_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_memory.context_manifests
+FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.reject_manifest_mutation();
+CREATE TRIGGER trg_context_manifest_items_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_memory.context_manifest_items
+FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.reject_manifest_mutation();
+CREATE TRIGGER trg_memory_feedback_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_memory.memory_feedback
+FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.reject_manifest_mutation();
+```
+
+### 8.17.5 RLS 与验证查询
+
+混合作用域表的 RLS 先验证组织，再允许“组织/用户分支”或当前项目；组织管理员跨项目读取必须显式设置受审计的 `app.all_projects=true`。用户私有记忆再以 RESTRICTIVE policy 限制到 `app.subject_id`，除非受控 Memory 管理入口设置 `app.memory_admin=true`。服务层仍负责用途、角色、敏感级别和 ACL 版本判断。
+
+```sql
+DO $memory_rls$
+DECLARE
+    table_name TEXT;
+BEGIN
+    FOREACH table_name IN ARRAY ARRAY[
+        'memory_records', 'memory_revisions', 'memory_sources',
+        'memory_feedback', 'deletion_jobs'
+    ]
+    LOOP
+        EXECUTE format('ALTER TABLE bridgeai_memory.%I ENABLE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('ALTER TABLE bridgeai_memory.%I FORCE ROW LEVEL SECURITY', table_name);
+        EXECUTE format(
+            'CREATE POLICY %I ON bridgeai_memory.%I USING (
+                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
+                AND (
+                    project_id IS NULL
+                    OR current_setting(''app.all_projects'', true) = ''true''
+                    OR project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+                )
+             ) WITH CHECK (
+                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
+                AND (
+                    project_id IS NULL
+                    OR current_setting(''app.all_projects'', true) = ''true''
+                    OR project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+                )
+             )',
+            'pl_' || table_name || '_scope', table_name
+        );
+    END LOOP;
+
+    CREATE POLICY pl_memory_records_private_user
+        ON bridgeai_memory.memory_records AS RESTRICTIVE
+        USING (
+            scope_type <> 'user'
+            OR user_id = NULLIF(current_setting('app.subject_id', true), '')::uuid
+            OR current_setting('app.memory_admin', true) = 'true'
+        )
+        WITH CHECK (
+            scope_type <> 'user'
+            OR user_id = NULLIF(current_setting('app.subject_id', true), '')::uuid
+            OR current_setting('app.memory_admin', true) = 'true'
+        );
+
+    FOREACH table_name IN ARRAY ARRAY[
+        'memory_revisions', 'memory_sources', 'memory_feedback', 'deletion_jobs'
+    ]
+    LOOP
+        EXECUTE format(
+            'CREATE POLICY %I ON bridgeai_memory.%I AS RESTRICTIVE USING (
+                EXISTS (
+                    SELECT 1 FROM bridgeai_memory.memory_records AS m
+                    WHERE m.id = %I.memory_id
+                      AND m.organization_id = %I.organization_id
+                      AND (
+                          m.scope_type <> ''user''
+                          OR m.user_id = NULLIF(current_setting(''app.subject_id'', true), '''')::uuid
+                          OR current_setting(''app.memory_admin'', true) = ''true''
+                      )
+                )
+             ) WITH CHECK (
+                EXISTS (
+                    SELECT 1 FROM bridgeai_memory.memory_records AS m
+                    WHERE m.id = %I.memory_id
+                      AND m.organization_id = %I.organization_id
+                      AND (
+                          m.scope_type <> ''user''
+                          OR m.user_id = NULLIF(current_setting(''app.subject_id'', true), '''')::uuid
+                          OR current_setting(''app.memory_admin'', true) = ''true''
+                      )
+                )
+             )',
+            'pl_' || table_name || '_private_user', table_name,
+            table_name, table_name, table_name, table_name
+        );
+    END LOOP;
+END
+$memory_rls$;
+
+DO $manifest_rls$
+DECLARE
+    table_name TEXT;
+BEGIN
+    FOREACH table_name IN ARRAY ARRAY['context_manifests', 'context_manifest_items']
+    LOOP
+        EXECUTE format('ALTER TABLE bridgeai_memory.%I ENABLE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('ALTER TABLE bridgeai_memory.%I FORCE ROW LEVEL SECURITY', table_name);
+        EXECUTE format(
+            'CREATE POLICY %I ON bridgeai_memory.%I USING (
+                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
+                AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+             ) WITH CHECK (
+                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
+                AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+             )',
+            'pl_' || table_name || '_scope', table_name
+        );
+    END LOOP;
+END
+$manifest_rls$;
+```
+
+上线门禁至少包括以下查询，均应返回 0 行：
+
+```sql
+-- 当前修订必须真正属于该 memory；task scope 已由强组合 FK 绑定同一项目。
+SELECT m.id
+FROM bridgeai_memory.memory_records AS m
+LEFT JOIN bridgeai_memory.memory_revisions AS r
+  ON (r.id,r.organization_id,r.memory_id) = (m.current_revision_id,m.organization_id,m.id)
+WHERE m.current_revision_id IS NOT NULL AND r.id IS NULL;
+
+-- 普通召回资格：只有 active、有效、来源 active、当前修订索引版本一致。
+SELECT m.id
+FROM bridgeai_memory.memory_records AS m
+JOIN bridgeai_memory.memory_revisions AS r
+  ON (r.id,r.organization_id,r.memory_id) = (m.current_revision_id,m.organization_id,m.id)
+WHERE m.status = 'active'
+  AND (
+      (m.valid_until IS NOT NULL AND m.valid_until <= CURRENT_TIMESTAMP)
+      OR NOT EXISTS (
+          SELECT 1 FROM bridgeai_memory.memory_sources AS s
+          WHERE s.memory_revision_id = r.id
+            AND s.organization_id = r.organization_id
+            AND s.availability_status = 'active'
+      )
+      OR (r.index_status = 'ready' AND r.qdrant_collection NOT LIKE 'bridgeai_memory_%')
+  );
+
+-- Manifest 声明数与实际清单必须相等；删除完成必须已跨存储收敛。
+SELECT m.id
+FROM bridgeai_memory.context_manifests AS m
+LEFT JOIN bridgeai_memory.context_manifest_items AS i
+  ON (i.context_manifest_id,i.organization_id,i.project_id) = (m.id,m.organization_id,m.project_id)
+GROUP BY m.id, m.candidate_item_count, m.used_item_count, m.omitted_item_count
+HAVING count(i.id) <> m.candidate_item_count
+    OR count(i.id) FILTER (WHERE i.disposition IN ('used','compressed')) <> m.used_item_count
+    OR count(i.id) FILTER (WHERE i.disposition = 'omitted') <> m.omitted_item_count;
+
+SELECT d.id
+FROM bridgeai_memory.deletion_jobs AS d
+JOIN bridgeai_memory.memory_records AS m
+  ON (m.id,m.organization_id) = (d.memory_id,d.organization_id)
+WHERE d.status = 'complete'
+  AND (m.status <> 'deleted' OR m.deletion_status <> 'complete');
+```
 
 ## 8.18 报告、引用、复核与签发模型
 
