@@ -1616,17 +1616,779 @@ class EffectivePreference(BaseModel):
 
 ## 7.18 反馈、冲突、更正与负向记忆
 
+Memory 的价值不仅取决于写入和召回，还取决于错误是否能被及时发现、纠正并阻止再次传播。
+
+### 7.18.1 反馈类型
+
+| 类型 | 含义 | 对权威记忆的影响 |
+|---|---|---|
+| accepted | 用户或节点确认本次上下文有用 | 增加使用反馈，不自动提高工程权威 |
+| ignored | 本次未采用，可能与节点无关 | 调整用途相关排序，不失效原记忆 |
+| corrected | 内容、作用域或适用条件需要修正 | 创建新版本并进入确认流程 |
+| rejected | 记忆错误、不适用或不应保存 | revoke/reject 并形成负向记录 |
+| reported | 疑似越权、污染、敏感泄漏或提示注入 | 立即隔离并触发安全事件 |
+
+accepted 次数不能把未经确认的候选升级为 high 事实，也不能把个人偏好推广到项目或组织。
+
+### 7.18.2 反馈契约
+
+```python
+class MemoryFeedbackInput(BaseModel):
+    memory_id: str
+    context_manifest_id: str
+    feedback_type: Literal[
+        "accepted", "ignored", "corrected", "rejected", "reported"
+    ]
+    reason_code: str
+    comment: str | None = Field(default=None, max_length=2000)
+    task_id: str
+    current_node: str
+    expected_memory_version: str
+    idempotency_key: str
+    schema_version: str = "memory-feedback.v1"
+
+
+class MemoryCorrectionInput(BaseModel):
+    memory_id: str
+    expected_memory_version: str
+    corrected_content: str = Field(min_length=1, max_length=16000)
+    corrected_facts: dict[str, Any] = Field(default_factory=dict)
+    source_refs: list[SourceRef] = Field(min_length=1)
+    correction_reason: str = Field(min_length=1, max_length=2000)
+    requested_scope: MemoryScope
+    idempotency_key: str
+    schema_version: str = "memory-correction.v1"
+```
+
+服务端从认证上下文取得 actor_id、organization_id 和角色，不信任客户端在 comment 中声明的身份和权限。
+
+### 7.18.3 更正流程
+
+```text
+提交 correction
+      ↓
+校验原版本和权限
+      ↓
+比较来源与作用域
+      ↓
+创建新 candidate
+      ↓
+风险与确认门
+      ├──→ rejected / conflicted / quarantined
+      └──→ active
+              ↓
+      原版本 superseded
+              ↓
+       索引与缓存失效
+```
+
+expected_memory_version 用于乐观并发控制。原版本已经变化时返回 MEM-409-CONFLICT，客户端重新读取后再决定，禁止最后写入者静默覆盖。
+
+### 7.18.4 冲突优先级
+
+冲突处理使用确定性优先级：
+
+1. 系统安全和权限策略；
+2. 当前有效的权威业务事实；
+3. 最新有效人工复核或签发记录；
+4. 项目强制配置；
+5. 用户明确偏好；
+6. 经确认运行经验；
+7. 自动摘要和模型候选。
+
+优先级用于决定“不能自动采用谁”，不是自动生成新的工程结论。high/critical 冲突仍需人工复核。
+
+### 7.18.5 负向记忆
+
+负向记忆用于记录已被明确否定的模式：
+
+- 错误内容指纹和结构化特征；
+- 原候选类型、来源和提取器版本；
+- 否定原因和 reviewer_id；
+- 适用作用域和有效期；
+- 关联回归样例；
+- 是否需要阻断相似候选。
+
+负向记忆不把错误原文送入普通 Context Pack。Candidate Extractor 在写入前查询负向指纹；命中时拒绝、隔离或要求更强确认。
+
+### 7.18.6 反馈学习边界
+
+反馈可以更新排序特征和评测集，但在线生产系统不得直接基于单次 accepted/rejected 自动微调模型、修改 Prompt、改变安全阈值或跨项目传播。任何模型或策略更新由第十二章的评测和发布流程控制。
+
 ## 7.19 生命周期、保留与遗忘机制
+
+### 7.19.1 生命周期
+
+```text
+candidate → validating → review_pending → active
+   │            │              │            ├→ superseded
+   │            │              │            ├→ expired
+   │            │              │            ├→ revoked
+   │            │              │            └→ quarantined
+   │            │              └→ rejected
+   │            └→ conflicted / quarantined
+   └→ rejected
+
+superseded / expired / revoked / quarantined
+                    ↓
+               tombstoned
+                    ↓
+                 deleted
+```
+
+### 7.19.2 保留策略
+
+保留策略由记忆类型、敏感级别、项目状态、来源保留要求和合同要求共同确定。本章定义策略名称和行为，不在此写死所有项目的时间。
+
+| 策略 | 适用内容 | 到期行为 |
+|---|---|---|
+| task_operational | 阶段摘要和临时未决事项 | 任务完成后归档或删除 |
+| project_active | 活跃项目术语、规则和修订 | 项目归档后停止默认召回 |
+| signed_trace | 签发和人工复核的引用摘要 | 与来源保留和审计要求一致 |
+| user_preference | 用户明确偏好 | 撤销或删除后停止生效 |
+| operational_baseline | 已发布运行经验 | 模型或评测版本失效后重新校验 |
+| security_quarantine | 污染和安全样例 | 按安全事件策略隔离保留 |
+
+每条记录必须引用 retention_policy_version。策略更新不自动物理删除，先生成可审计的生命周期任务。
+
+### 7.19.3 过期与撤销
+
+- expired：因时间、项目状态、模型版本或适用条件自然失效；
+- revoked：因权限、安全、人工操作或来源撤回立即停止使用；
+- superseded：有明确新版本替代；
+- quarantined：内容暂时隔离，等待安全或质量处理。
+
+四种状态都不可默认召回，但保留原因、来源和历史 Context Manifest 关系。
+
+### 7.19.4 项目归档
+
+project.archived 触发：
+
+1. 停止项目记忆对新任务的默认继承；
+2. 使相关缓存和预计算 Profile 失效；
+3. 评估哪些任务摘要保留、聚合或删除；
+4. 评估是否有经审批运行经验可以脱敏后另行发布；
+5. 记录归档快照和保留策略版本。
+
+归档不是删除。获授权的历史复现仍可以按 as_of 读取保留内容。
+
+### 7.19.5 遗忘请求
+
+遗忘请求必须解析目标范围：
+
+- 单条 memory_id；
+- 某用户的可删除偏好；
+- 某 task 的任务记忆；
+- 某 project 的项目记忆；
+- 由特定来源派生的全部摘要；
+- 某安全事件关联的污染记忆。
+
+请求先经过权限、共享引用、保留冲突和审计要求检查。调用者无权删除时返回拒绝，不暴露其他项目中同源记忆的存在性。
+
+### 7.19.6 删除传播
+
+```text
+Deletion Approved
+       ↓
+PostgreSQL: revoked + deletion_pending
+       ↓
+并行清理
+  ├── Semantic Index
+  ├── Redis / Context Cache
+  ├── Derived Summaries
+  ├── MinIO Artifact Versions
+  └── Precomputed Profiles
+       ↓
+一致性核对
+       ├── complete → tombstone / deleted
+       └── partial / blocked → retry + alert
+```
+
+在全部清理完成前，权威记录保持不可召回。删除 Worker 使用 deletion_job_id 和目标版本作为幂等键。
+
+### 7.19.7 最小墓碑
+
+为证明删除已经执行，可以保留：
+
+- 不可逆 memory_id 哈希；
+- organization_id 和作用域类型；
+- 删除任务 ID、时间、操作者和原因码；
+- 原敏感级别和保留策略版本；
+- 各派生系统的完成状态。
+
+墓碑不得包含原 content、summary、structured_facts、Embedding 或个人偏好值。
+
+### 7.19.8 共享来源
+
+删除一个记忆不一定删除其业务来源或 RAG 文档。Memory Service 只删除自己拥有的记录和派生物。多个记忆引用同一 MinIO Artifact 时使用引用关系和保留策略判断；不得因删除一个引用破坏其他获授权记录的来源。
+
+### 7.19.9 备份与恢复
+
+备份恢复后必须重放删除日志、权限撤销和墓碑状态，避免旧备份使已删除内容重新可见。恢复流程先加载删除与 ACL 基线，再开放 Memory 读取；索引从恢复后的权威状态重建。
 
 ## 7.20 Memory Service/Tool 协议
 
+Memory Service 是业务治理入口；Memory Tool 是符合第四章 Tool SDK 的受控适配。不是所有服务操作都暴露为 Agent 可调用 Tool。
+
+### 7.20.1 核心操作
+
+| 操作 | 调用者 | 风险 | 说明 |
+|---|---|---|---|
+| memory.propose | Workflow、受控 Agent、用户操作 | 写 | 只创建候选 |
+| memory.confirm | 用户、复核者、管理员 | 高风险写 | 按权限和确认门发布 |
+| memory.search | Context Builder、管理界面 | 读 | 权限先于召回 |
+| memory.feedback | 用户、Agent 节点、复核者 | 写 | 记录使用反馈 |
+| memory.correct | 用户、复核者、项目管理员 | 高风险写 | 新建修订版本 |
+| memory.revoke | 安全、项目管理员、来源监控 | 高风险写 | 立即停止召回 |
+| memory.forget | 获授权用户、管理员、生命周期 Worker | 高风险写 | 编排删除传播 |
+| context.build | Workflow Runtime | 内部读 | 生成 Pack 和 Manifest |
+
+Agent 可以提出 propose、search 和 feedback，但必须通过 Policy Engine。confirm、revoke、forget、跨项目发布和 context.build 不作为模型自由调用能力。
+
+### 7.20.2 遗忘输入
+
+```python
+class MemoryForgetInput(BaseModel):
+    target_type: Literal["memory", "task", "project", "user_preference", "source"]
+    target_id: str
+    organization_id: str
+    project_id: str | None = None
+    reason_code: str
+    requested_mode: Literal["revoke_only", "delete_content", "full_propagation"]
+    expected_policy_version: str
+    idempotency_key: str
+    schema_version: str = "memory-forget.v1"
+```
+
+### 7.20.3 统一操作结果
+
+```python
+class MemoryOperationResult(BaseModel):
+    operation_id: str
+    status: Literal[
+        "accepted",
+        "completed",
+        "review_pending",
+        "conflicted",
+        "partial",
+        "rejected",
+        "failed",
+    ]
+    memory_ids: list[str] = Field(default_factory=list)
+    context_manifest_id: str | None = None
+    review_id: str | None = None
+    deletion_job_id: str | None = None
+    retryable: bool = False
+    retry_after_seconds: int | None = None
+    error_code: str | None = None
+    error_details: dict[str, Any] = Field(default_factory=dict)
+    audit_event_id: str
+    schema_version: str = "memory-operation-result.v1"
+```
+
+error_details 只返回调用者有权查看的信息。权限拒绝不返回目标标题、摘要、来源和所属项目。
+
+### 7.20.4 Tool Manifest 建议
+
+```yaml
+name: memory_search
+version: 1.0.0
+category: memory
+description: Search governed task and project memories within authorized scope
+input_schema: MemorySearchInput
+output_schema: MemoryOperationResult
+side_effect: none
+timeout_seconds: 5
+retry_policy:
+  max_attempts: 2
+  retryable_errors:
+    - MEM-503-STORE_UNAVAILABLE
+    - MEM-504-TIMEOUT
+permissions:
+  - memory:read
+audit: required
+```
+
+写操作使用不同 Tool Manifest，并明确 side_effect、审批和幂等要求。不得用一个通用“memory_admin” Tool 暴露全部高风险动作。
+
+### 7.20.5 错误码
+
+| 错误码 | 含义 | 可重试 | 处理 |
+|---|---|---:|---|
+| MEM-400-SCOPE_INVALID | 作用域字段缺失或关系无效 | 否 | 修正输入 |
+| MEM-403-DENIED | 无权限执行或读取 | 否 | 拒绝且不暴露存在性 |
+| MEM-404-NOT_FOUND | 授权范围内目标不存在 | 否 | 返回空或提示刷新 |
+| MEM-409-CONFLICT | 版本、状态或来源冲突 | 否 | 重新读取并人工处理 |
+| MEM-412-SOURCE_REQUIRED | 缺少强制来源 | 否 | 补充来源或拒绝 |
+| MEM-422-VALIDATION_FAILED | Schema 或业务校验失败 | 否 | 返回字段级错误 |
+| MEM-423-QUARANTINED | 目标或输入处于安全隔离 | 否 | 转安全处理 |
+| MEM-429-RATE_LIMITED | 超过调用或写入限额 | 是 | 按 retry_after 重试 |
+| MEM-503-STORE_UNAVAILABLE | 权威存储或依赖不可用 | 是 | 限次重试或降级 |
+| MEM-504-TIMEOUT | 请求超时 | 是 | 使用幂等键重试 |
+
+### 7.20.6 幂等与并发
+
+- propose 使用 event_id 和内容指纹；
+- feedback 使用 context_manifest_id、memory_id 和 idempotency_key；
+- correct 使用 expected_memory_version；
+- confirm 使用 candidate 版本和 review_id；
+- revoke/forget 使用 operation_id 或 deletion_job_id；
+- context.build 使用 task、run、node、as_of 和 policy 版本形成请求指纹。
+
+状态迁移采用乐观锁或行锁，避免确认、更正和删除并发覆盖。
+
+### 7.20.7 服务认证
+
+Memory Service 只信任网关或服务网格提供的认证身份。内部调用至少携带 actor_id、service_id、organization_id、trace_id 和授权上下文。Agent 生成的自然语言、Tool 参数和 Memory 内容都不能直接声明自己拥有管理员权限。
+
 ## 7.21 与 Agent、Workflow 和 RAG 集成
+
+### 7.21.1 调用时序
+
+```text
+Workflow Node
+    │
+    ├─→ Policy Engine：解析用户、组织、项目、节点和用途
+    │
+    └─→ Context Builder
+            │
+            ├─→ Business Service：读取当前权威事实引用
+            ├─→ Memory Service
+            │       ├─→ PostgreSQL：授权与结构化检索
+            │       └─→ Semantic Index：已过滤语义候选
+            │
+            └─→ ContextPack + ContextManifest
+                     │
+                     ▼
+                   Agent
+                     │
+          ┌──────────┼───────────┐
+          ▼          ▼           ▼
+        Tool       RAG Tool    Human Review
+          │          │           │
+          └──────────┴───────────┘
+                     │
+                     ▼
+               Workflow Event
+                     │
+                     └─→ Memory Candidate
+```
+
+### 7.21.2 Workflow State 增量
+
+第五章的 Workflow State 继续作为当前运行快照。第七章只建议增加必要引用：
+
+```python
+class MemoryStateFields(TypedDict, total=False):
+    context_manifest_id: str
+    memory_result_ids: list[str]
+    memory_degraded: bool
+    memory_degradation_reason: str | None
+    memory_review_required: bool
+    memory_review_reasons: list[str]
+```
+
+State 不保存完整 MemoryRecord、Context Pack、向量和长摘要。完整 Context Manifest 独立持久化，通过 ID 读取。
+
+### 7.21.3 节点集成
+
+| Workflow 节点 | Memory 用途 | 写入候选 |
+|---|---|---|
+| validate_input | 项目术语、模板和资产范围 | 用户明确修订 |
+| preprocess_images | 设备、环境和既往失败模式 | 运行异常摘要 |
+| detect_damage | 模型适用性和项目构件映射 | ToolResult 引用 |
+| map_components | 构件别名和历史人工修订 | 映射修订候选 |
+| retrieve_knowledge | 只提供查询上下文 | RAG Result 引用，不复制知识 |
+| human_review | 显示冲突、来源和历史修订 | 确认、更正、否定 |
+| generate_report | 模板、术语、单位和签发规则 | 报告表达候选 |
+| archive_task | 任务总结和未决风险 | 项目候选、保留任务 |
+
+### 7.21.4 与 Agent 集成
+
+Agent 接收已组装的 Context Pack，不获得 Memory 数据库连接、Qdrant 客户端和管理权限。Agent 必须区分：
+
+- current_facts：当前业务服务返回；
+- memory_context：历史摘要、偏好和修订；
+- rag_evidence：可引用知识证据；
+- workflow_state：当前运行状态；
+- conflict_notices：不能自行裁决的问题。
+
+生成计划或回答时，Memory 内容以“上下文线索”标识。需要正式依据时调用 RAG 或业务 Tool。
+
+### 7.21.5 与 Workflow 恢复集成
+
+恢复顺序：
+
+1. 根据 thread_id 加载 Checkpoint；
+2. 核对 workflow_tasks、workflow_runs 和复核状态；
+3. 根据 task_id 和 current_node 构建新的 Context Pack；
+4. 对比 Checkpoint 中原 context_manifest_id 的版本和权限；
+5. 权限或来源变化时，使用新 Manifest 并记录差异；
+6. 若关键上下文无法恢复，进入人工复核而不是静默继续。
+
+Checkpoint 恢复本身不触发长期记忆提取，避免重放事件产生重复候选。
+
+### 7.21.6 与 RAG 集成
+
+Memory 可以帮助构造 RAG 查询，例如提供项目术语、资产类型和历史未决问题。RAG 返回 Evidence Pack 后：
+
+- Workflow State 保存 knowledge_result_ids；
+- Context Manifest 保存本次使用的 Evidence 引用；
+- Memory 候选只保存查询线索、结果 ID 和必要摘要；
+- 规范、标准和案例正文继续由 RAG 管理；
+- 后续使用时重新检查知识版本、权限和适用性。
+
+### 7.21.7 与业务事实集成
+
+Context Builder 通过业务服务读取资产、构件、病害、检测和报告引用。MemoryRecord 的 structured_facts 可以保存用于检索的实体 ID，但不得保存一份独立“当前病害状态”。
+
+business.fact_changed 事件使相关记忆重新校验。若历史摘要与新事实不同，保留历史 as_of 语义，并阻止其作为当前事实使用。
+
+### 7.21.8 人工复核触发
+
+以下情况强制创建或关联 workflow_reviews：
+
+- high/critical 候选没有足够来源；
+- 同一实体存在冲突 active 记忆；
+- 摘要与结构化事实或来源不一致；
+- 记忆建议影响正式等级、处治、签发或设备控制；
+- 归档项目记忆试图用于新项目；
+- 运行经验适用范围与当前设备、环境或模型版本不匹配；
+- 删除或保留策略发生无法自动裁决的冲突。
 
 ## 7.22 权限、隐私与记忆污染防护
 
+Memory 会跨时间影响后续 Agent，因此错误、越权或恶意内容可能形成持久化风险。安全控制必须覆盖写入、存储、召回、上下文组装、Tool 调用和删除。
+
+### 7.22.1 威胁模型
+
+| 威胁 | 示例 | 主要影响 |
+|---|---|---|
+| 跨项目泄漏 | 项目 A 的摘要被项目 B 召回 | 数据泄漏、错误判断 |
+| 直接提示注入 | 用户要求“保存并绕过复核” | 安全规则被污染 |
+| 间接提示注入 | 文件或 Tool 输出中隐藏指令 | 持久化攻击和越权动作 |
+| 错误记忆污染 | 模型把未确认推断写成项目事实 | 后续任务持续受影响 |
+| 权限撤销滞后 | 离组用户仍命中旧缓存 | 未授权访问 |
+| 删除不完整 | 向量或摘要仍可召回 | 删除失效 |
+| 来源替换 | source_id 不变但内容被改写 | 历史上下文不可复现 |
+| 过度记录 | 保存无关对话和敏感个人信息 | 隐私和容量风险 |
+
+### 7.22.2 分层授权
+
+```text
+身份认证
+   ↓
+组织成员关系
+   ↓
+项目成员关系
+   ↓
+角色与操作权限
+   ↓
+Memory 类型和作用域
+   ↓
+敏感级别和用途
+   ↓
+状态、有效期和来源权限
+   ↓
+字段脱敏与返回限制
+```
+
+任一层失败即拒绝。权限判断结果必须绑定 ACL 版本，避免缓存使用过期授权。
+
+### 7.22.3 PostgreSQL RLS
+
+PostgreSQL Row-Level Security 可作为纵深防御：
+
+- 普通应用查询角色启用 RLS；
+- 表所有者、迁移角色和具备 bypass 能力的角色与运行角色分离；
+- Policy 至少使用 organization_id 和项目访问关系；
+- 写操作还需检查 actor、action、scope 和 risk；
+- 服务层授权测试与 RLS 负向测试同时存在。
+
+RLS 不替代 Memory Service 的状态、来源、敏感级别和用途校验。
+
+### 7.22.4 Qdrant Payload Filter
+
+语义查询必须带 organization_id、project_id 或允许的全局作用域、scope、status、sensitivity、ACL 版本和有效期过滤。过滤表达式由服务端生成。
+
+Qdrant Payload 只是索引副本。候选返回后再次核对 PostgreSQL。不得接受 Agent 传入的任意 Filter JSON。
+
+### 7.22.5 提示注入防护
+
+按照输入即数据原则：
+
+- 会话、文档、Tool 输出、RAG 片段和 Memory 内容都视为不可信数据；
+- 系统规则、权限、Tool 能力和确认状态放在独立控制层；
+- 检测“忽略规则”“扩大权限”“读取其他项目”“执行删除”等指令模式；
+- 编码、隐藏文本和多模态内容在进入候选前规范化与检查；
+- 高风险 Tool 调用根据原始用户意图和 Policy 再次校验；
+- 疑似持久化攻击内容进入 quarantined，不进入普通 Context Pack；
+- 安全测试覆盖跨多轮、间接和已存储内容的攻击。
+
+过滤器和 Guardrail 只是纵深防御，不能替代最小权限、结构化输入和人工审批。
+
+### 7.22.6 记忆污染防护
+
+- 模型不能直接设置 active；
+- high/critical 候选要求权威来源或人工确认；
+- 来源哈希和版本防止静默替换；
+- 冲突不自动覆盖；
+- 负向记忆阻止已知错误重复写入；
+- 提取器、摘要器、Embedding 和策略版本可回溯；
+- 发布后持续监控来源失效和异常反馈。
+
+### 7.22.7 数据最小化
+
+只保存完成任务连续性和项目复用所需内容：
+
+- 默认不保存全部会话；
+- 不保存密码、令牌、私钥和连接串；
+- 不保存与巡检业务无关的个人画像；
+- 大型内容放受控 Artifact，Prompt 只读必要片段；
+- 审计日志记录标识、哈希、状态和原因，避免复制 restricted 正文；
+- 导出和管理页面按字段脱敏。
+
+### 7.22.8 加密与访问
+
+- PostgreSQL、Qdrant、MinIO 和缓存之间使用受控网络与传输加密；
+- restricted Memory 内容和 Artifact 使用符合项目基线的静态加密；
+- MinIO 访问使用短期签名或服务身份，不向 Agent 暴露长期凭证；
+- 密钥由独立秘密管理系统托管；
+- 导出包带权限、有效期和审计。
+
+完整部署与密钥策略由第十三章定义。
+
+### 7.22.9 高风险动作隔离
+
+Memory 结果不得直接执行：
+
+- 无人机、机器人和现场设备控制；
+- 正式技术状况评定；
+- 维修处治方案批准；
+- 报告签发；
+- 用户、项目和角色授权；
+- 批量删除和跨项目发布。
+
+这些动作由独立 Tool、确定性 Policy 和人工复核控制。
+
 ## 7.23 缓存、性能、降级与资源控制
 
+### 7.23.1 缓存层级
+
+| 缓存 | 内容 | 典型位置 | 失效条件 |
+|---|---|---|---|
+| 授权缓存 | 项目成员、角色、ACL 版本 | Redis / 进程缓存 | 成员或角色变化 |
+| 精确查询缓存 | active ID 和结构化查询结果 | Redis | 状态、版本、来源变化 |
+| 语义结果缓存 | 候选 memory_id 和分数 | Redis | 索引、Embedding、ACL 变化 |
+| Context Pack 缓存 | Pack 和 Manifest ID | Redis / PostgreSQL | 任一引用记忆或策略变化 |
+| Project Profile 缓存 | Profile 版本和记忆 ID | Redis / PostgreSQL | 项目配置和记忆变化 |
+| Artifact 读取缓存 | 解压后的受控片段 | 本地短时缓存 | 对象版本和权限变化 |
+
+### 7.23.2 安全缓存键
+
+```text
+sha256(
+  organization_id
+  + project_id
+  + user_id
+  + role_set_hash
+  + acl_version
+  + purpose
+  + query_hash
+  + as_of_bucket
+  + memory_version_set_hash
+  + retrieval_config_version
+  + context_policy_version
+)
+```
+
+不能只用自然语言 query 作为缓存键。缓存条目保存创建时的 ACL 版本和过期时间，读取前再次校验调用者。
+
+### 7.23.3 缓存失效
+
+以下事件强制失效：
+
+- memory activated、corrected、superseded、expired、revoked、quarantined 或 deleted；
+- project.permission_changed；
+- source withdrawn 或 business.fact_changed；
+- Project Context Profile 更新；
+- retrieval、Embedding、摘要或 Context Policy 版本变化；
+- 用户偏好撤销；
+- 项目归档和重新启用。
+
+缓存失效失败时，权威记录的不可召回状态仍必须生效。高风险查询不得在 ACL 服务异常时使用旧缓存放行。
+
+### 7.23.4 第一阶段性能目标
+
+在 Mac Studio 本地基线环境、20 个并发会话和预热连接池下：
+
+| 指标 | 目标 |
+|---|---:|
+| PostgreSQL 精确记忆查询 P95 | ≤ 200 ms |
+| 已过滤语义召回 P95 | ≤ 700 ms |
+| 不含模型压缩的 Context 构建 P95 | ≤ 1.5 s |
+| 缓存命中 Context Pack P95 | ≤ 150 ms |
+| revoke 对新请求生效 | ≤ 2 s |
+| 索引 Outbox 正常积压延迟 P95 | ≤ 5 s |
+
+指标不包含外部大模型摘要时间。摘要节点使用独立预算和超时，并在失败时按 7.14.6 降级。
+
+### 7.23.5 并发与资源隔离
+
+- 查询、写入、索引、摘要和删除使用独立 Worker 池；
+- project 和 organization 设置并发及速率上限；
+- Embedding、摘要和 RAG 推理共享本地算力时由 Model Gateway 调度；
+- high 风险确认和删除任务使用独立队列；
+- 大型 Artifact 按范围读取，禁止一次装入全部项目归档；
+- 索引重建使用独立集合和资源额度，不影响生产别名；
+- 写入背压不能阻断专业 ToolResult 持久化。
+
+### 7.23.6 超时与重试
+
+| 操作 | 建议超时 | 重试 |
+|---|---:|---|
+| 权限解析 | 1 s | 一次短重试，失败拒绝 |
+| 精确检索 | 2 s | 只读可重试 |
+| 语义召回 | 3 s | 一次；失败降级 |
+| Context 构建 | 5 s，不含摘要模型 | 按请求指纹重试 |
+| propose | 5 s | 幂等重试 |
+| confirm/correct | 10 s | 冲突不自动重试 |
+| revoke | 5 s | 幂等优先完成权威状态 |
+| forget | 异步 | 返回 deletion_job_id |
+
+### 7.23.7 降级矩阵
+
+| 故障 | 允许降级 | 禁止行为 |
+|---|---|---|
+| 语义索引不可用 | PostgreSQL 精确和结构化检索 | 全表模糊扫描、扩大项目范围 |
+| 摘要模型不可用 | 使用短原文、结构化事实和来源 | 写入不完整摘要 |
+| Memory Service 不可用 | 使用 Workflow State、业务数据和 RAG | 编造项目历史或偏好 |
+| PostgreSQL 权限不可用 | 拒绝 Memory 查询 | 依赖旧 ACL 缓存放行高风险请求 |
+| MinIO Artifact 不可用 | 返回短摘要并标记来源不可读 | 声称已核对原文 |
+| 写入失败 | ToolResult 正常落库，创建补偿任务 | 丢弃专业结果或伪造成功 |
+| 删除 Worker 不可用 | 保持 revoked 和不可召回 | 恢复 active |
+| Context 超预算 | 减少低价值候选 | 裁剪安全规则和复核结论 |
+
+### 7.23.8 熔断
+
+连续出现索引超时、权限失败或摘要异常时，对对应依赖熔断。熔断状态进入 Context Manifest 和可观测指标。恢复前使用健康检查和小流量探测，不一次性释放积压高风险写入。
+
 ## 7.24 可观测性、审计与异常恢复
+
+### 7.24.1 Trace 关联
+
+一次 Memory 使用至少关联：
+
+```text
+trace_id
+  ├── task_id
+  ├── thread_id
+  ├── run_id
+  ├── workflow_node
+  ├── tool_execution_id
+  ├── memory_operation_id
+  ├── memory_id / version
+  └── context_manifest_id
+```
+
+写入和删除还关联 event_id、outbox_id、review_id 或 deletion_job_id。
+
+### 7.24.2 审计字段
+
+| 字段 | 说明 |
+|---|---|
+| actor_id / service_id | 用户和服务身份 |
+| organization_id / project_id | 授权作用域 |
+| action | propose、search、confirm、correct、revoke、forget、build |
+| purpose / current_node | 使用目的和 Workflow 节点 |
+| memory_ids / versions | 操作的具体版本 |
+| source_ref_ids | 使用或校验的来源 |
+| policy_version / acl_version | 决策依据 |
+| before_status / after_status | 状态迁移 |
+| result / error_code | 成功、拒绝或失败 |
+| context_manifest_id | 上下文组装记录 |
+| latency_ms / token_count | 性能和容量 |
+| occurred_at | 事件时间 |
+
+restricted 内容默认只记录哈希和标识。审计记录自身也需要访问控制和保留策略。
+
+### 7.24.3 指标
+
+**写入质量**
+
+- candidate 创建率；
+- 各类型 active 转化率；
+- 来源缺失率；
+- 人工确认率和等待时间；
+- 重复、冲突、拒绝和隔离率；
+- 每个 extractor_version 的错误反馈率。
+
+**检索与上下文**
+
+- 精确、结构化和语义通道命中率；
+- Recall@K、空结果率和去重率；
+- 被权限、状态、有效期和删除过滤的数量；
+- Context Token 使用、压缩率和裁剪原因；
+- requires_review 比例；
+- Context Pack 缓存命中率。
+
+**生命周期**
+
+- active、expired、revoked、quarantined 和 tombstoned 数量；
+- 删除任务完成率和延迟；
+- Outbox 积压和索引不一致数；
+- 来源失效传播延迟；
+- 归档项目仍被普通召回的数量。
+
+### 7.24.4 告警
+
+| 告警 | 触发示例 | 动作 |
+|---|---|---|
+| 跨项目候选 | 返回结果 project_id 不在授权集 | 阻断、P0 安全事件 |
+| 持久化注入 | quarantined 突增或命中高危模式 | 阻断并安全分析 |
+| 来源缺失 | high 候选进入发布事务前无来源 | 阻断发布 |
+| 索引不一致 | PostgreSQL 与索引版本或状态不一致 | 丢弃候选并修复 |
+| 删除失败 | deletion_job 超过目标时间 | 保持 revoke、重试和升级 |
+| 摘要失真 | 字段比对或回归指标低于阈值 | 隔离相关版本 |
+| Outbox 积压 | 延迟超过容量阈值 | 扩容或熔断写入派生链 |
+| 权限服务异常 | 拒绝率或超时突增 | 熔断 Memory 读取 |
+
+### 7.24.5 异常恢复
+
+| 故障 | 恢复方式 |
+|---|---|
+| PostgreSQL 短暂断连 | 保留请求指纹，限次重试，不绕过授权 |
+| Outbox Worker 重启 | 按未完成 outbox_id 重放 |
+| Qdrant 数据丢失 | 从 active 权威记录重建版本化集合 |
+| MinIO 对象版本不可读 | 标记来源不可用，阻断依赖原文的 high 使用 |
+| 缓存集群丢失 | 从 PostgreSQL 和索引重建，不影响权威状态 |
+| 摘要版本发现系统性错误 | 隔离相关 summarizer 版本并从来源重建 |
+| 权限变更事件遗漏 | 定期对比 ACL 版本并强制失效旧缓存 |
+| 删除任务部分完成 | 从 deletion_job 步骤恢复并执行一致性核对 |
+
+### 7.24.6 补偿与死信
+
+可重试操作必须记录 attempt、last_error、next_retry_at 和 max_attempts。超过上限进入死信，并保存：
+
+- 原操作和幂等键；
+- 已完成步骤；
+- 尚未完成的索引、缓存或 Artifact；
+- 当前不可召回状态；
+- 人工处理入口。
+
+死信不得使 revoked 或 deletion_pending 自动回到 active。
+
+### 7.24.7 运行核对
+
+建议定期执行：
+
+- PostgreSQL active 数量与索引 Point 数比对；
+- 索引 Payload 状态、版本和 ACL 抽样；
+- MinIO Artifact 哈希和可读性抽样；
+- Context Manifest 引用完整性；
+- 删除任务和墓碑一致性；
+- 归档项目默认召回负向检查；
+- 随机越权查询和提示注入回归。
 
 ## 7.25 评测与测试体系
 
