@@ -2583,7 +2583,7 @@ DECLARE
 BEGIN
     FOREACH table_name IN ARRAY ARRAY[
         'workflow_tasks', 'workflow_runs', 'workflow_events',
-        'workflow_node_executions', 'workflow_reviews'
+        'workflow_events_default', 'workflow_node_executions', 'workflow_reviews'
     ]
     LOOP
         EXECUTE format(
@@ -2594,11 +2594,9 @@ BEGIN
         );
         EXECUTE format(
             'CREATE POLICY %I ON bridgeai_workflow.%I USING (
-                 organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
-                 AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+                 bridgeai_core.has_project_access(organization_id, project_id, false)
              ) WITH CHECK (
-                 organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
-                 AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+                 bridgeai_core.has_project_access(organization_id, project_id, true)
              )',
             'pl_' || table_name || '_scope', table_name
         );
@@ -3713,11 +3711,9 @@ BEGIN
         EXECUTE format('ALTER TABLE bridgeai_knowledge.%I FORCE ROW LEVEL SECURITY', table_name);
         EXECUTE format(
             'CREATE POLICY %I ON bridgeai_knowledge.%I USING (
-                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
-                AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+                bridgeai_core.has_project_access(organization_id, project_id, false)
              ) WITH CHECK (
-                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
-                AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+                bridgeai_core.has_project_access(organization_id, project_id, true)
              )',
             'pl_' || table_name || '_scope', table_name
         );
@@ -4751,7 +4747,7 @@ FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.reject_manifest_mutation();
 
 ### 8.17.5 RLS 与验证查询
 
-混合作用域表的 RLS 先验证组织，再允许“组织/用户分支”或当前项目；组织管理员跨项目读取必须显式设置受审计的 `app.all_projects=true`。用户私有记忆再以 RESTRICTIVE policy 限制到 `app.subject_id`，除非受控 Memory 管理入口设置 `app.memory_admin=true`。服务层仍负责用途、角色、敏感级别和 ACL 版本判断。
+混合作用域表的 RLS 对 `project_id IS NULL` 使用组织成员 helper，对项目记录使用项目成员 helper；不接受任何 caller-set 的“全部项目”或“Memory 管理员”标志扩权。用户私有记忆再以 RESTRICTIVE policy 限制到 `app.subject_id`，跨用户读取只能经由查询组织／项目成员角色的 `has_memory_admin_access` helper。服务层仍负责用途、角色、敏感级别和 ACL 版本判断。
 
 ```sql
 DO $memory_rls$
@@ -4767,19 +4763,13 @@ BEGIN
         EXECUTE format('ALTER TABLE bridgeai_memory.%I FORCE ROW LEVEL SECURITY', table_name);
         EXECUTE format(
             'CREATE POLICY %I ON bridgeai_memory.%I USING (
-                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
-                AND (
-                    project_id IS NULL
-                    OR current_setting(''app.all_projects'', true) = ''true''
-                    OR project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
-                )
+                (project_id IS NULL AND bridgeai_core.has_organization_access(organization_id))
+                OR (project_id IS NOT NULL
+                    AND bridgeai_core.has_project_access(organization_id, project_id, false))
              ) WITH CHECK (
-                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
-                AND (
-                    project_id IS NULL
-                    OR current_setting(''app.all_projects'', true) = ''true''
-                    OR project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
-                )
+                (project_id IS NULL AND bridgeai_core.has_organization_access(organization_id))
+                OR (project_id IS NOT NULL
+                    AND bridgeai_core.has_project_access(organization_id, project_id, true))
              )',
             'pl_' || table_name || '_scope', table_name
         );
@@ -4790,12 +4780,12 @@ BEGIN
         USING (
             scope_type <> 'user'
             OR user_id = NULLIF(current_setting('app.subject_id', true), '')::uuid
-            OR current_setting('app.memory_admin', true) = 'true'
+            OR bridgeai_core.has_memory_admin_access(organization_id, project_id)
         )
         WITH CHECK (
             scope_type <> 'user'
             OR user_id = NULLIF(current_setting('app.subject_id', true), '')::uuid
-            OR current_setting('app.memory_admin', true) = 'true'
+            OR bridgeai_core.has_memory_admin_access(organization_id, project_id)
         );
 
     FOREACH table_name IN ARRAY ARRAY[
@@ -4811,7 +4801,7 @@ BEGIN
                       AND (
                           m.scope_type <> ''user''
                           OR m.user_id = NULLIF(current_setting(''app.subject_id'', true), '''')::uuid
-                          OR current_setting(''app.memory_admin'', true) = ''true''
+                          OR bridgeai_core.has_memory_admin_access(m.organization_id, m.project_id)
                       )
                 )
              ) WITH CHECK (
@@ -4822,7 +4812,7 @@ BEGIN
                       AND (
                           m.scope_type <> ''user''
                           OR m.user_id = NULLIF(current_setting(''app.subject_id'', true), '''')::uuid
-                          OR current_setting(''app.memory_admin'', true) = ''true''
+                          OR bridgeai_core.has_memory_admin_access(m.organization_id, m.project_id)
                       )
                 )
              )',
@@ -4843,11 +4833,9 @@ BEGIN
         EXECUTE format('ALTER TABLE bridgeai_memory.%I FORCE ROW LEVEL SECURITY', table_name);
         EXECUTE format(
             'CREATE POLICY %I ON bridgeai_memory.%I USING (
-                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
-                AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+                bridgeai_core.has_project_access(organization_id, project_id, false)
              ) WITH CHECK (
-                organization_id = NULLIF(current_setting(''app.organization_id'', true), '''')::uuid
-                AND project_id = NULLIF(current_setting(''app.project_id'', true), '''')::uuid
+                bridgeai_core.has_project_access(organization_id, project_id, true)
              )',
             'pl_' || table_name || '_scope', table_name
         );
@@ -6575,7 +6563,8 @@ AS $$
 BEGIN
     IF p_organization_id::text <> current_setting('app.organization_id', true)
        OR p_project_id::text <> current_setting('app.project_id', true)
-       OR btrim(p_worker) = '' OR p_limit < 1
+       OR p_worker IS NULL OR btrim(p_worker) = ''
+       OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 500
        OR p_lease <= INTERVAL '0 seconds' OR p_lease > INTERVAL '15 minutes' THEN
         RAISE EXCEPTION 'invalid outbox claim context or lease';
     END IF;
@@ -6647,8 +6636,9 @@ SET search_path = pg_catalog, bridgeai_core
 AS $$
 BEGIN
     IF p_organization_id::text <> current_setting('app.organization_id', true)
-       OR p_project_id::text <> current_setting('app.project_id', true) THEN
-        RAISE EXCEPTION 'reaper scope differs from trusted context';
+       OR p_project_id::text <> current_setting('app.project_id', true)
+       OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 500 THEN
+        RAISE EXCEPTION 'invalid reaper scope or batch limit';
     END IF;
     RETURN QUERY
     WITH expired AS (
@@ -6890,7 +6880,7 @@ REVOKE ALL ON FUNCTION bridgeai_core.has_controlled_retention_outbox_access(
 ) FROM PUBLIC;
 ```
 
-Outbox 幂等键同时冻结租户、聚合身份/版本、事件类型/模式版本、规范化 JSONB payload 和重试上限。同 key 同语义返回原 UUID；任一语义字段不同则明确冲突并回滚，包括两个并发事务竞争同 key 的情形。`SKIP LOCKED` 使并发 Worker 不会领取同一行；`attempt_count` 在 Claim 时递增，达到上限必然死信。重放函数只接受死信源行，完整复制聚合身份、事件类型/版本和 payload，只产生新 ID、新幂等键与服务器记录的重放人/时间。Lease Reaper 只把过期 `processing` 转为 `retry/dead_letter`，不执行业务补偿。核对任务按 `aggregate_type/id/version + event_type` 比较 PostgreSQL 权威状态、Outbox 终态和外部派生版本。
+Outbox 幂等键同时冻结租户、聚合身份/版本、事件类型/模式版本、规范化 JSONB payload 和重试上限。同 key 同语义返回原 UUID；任一语义字段不同则明确冲突并回滚，包括两个并发事务竞争同 key 的情形。`SKIP LOCKED` 使并发 Worker 不会领取同一行；`attempt_count` 在 Claim 时递增，达到上限必然死信。Claim 与 Lease Reaper 的批准批量上限固定为 **500**：`NULL`、0、负数或大于 500 都必须在读取候选行前抛错，`LIMIT NULL` 绝不能成为无限领取。重放函数只接受死信源行，完整复制聚合身份、事件类型/版本和 payload，只产生新 ID、新幂等键与服务器记录的重放人/时间。Lease Reaper 只把过期 `processing` 转为 `retry/dead_letter`，不执行业务补偿。核对任务按 `aggregate_type/id/version + event_type` 比较 PostgreSQL 权威状态、Outbox 终态和外部派生版本；负向测试至少覆盖 Claim/Reaper 的 `p_limit=NULL`、0、501，均应拒绝且不更新任何行。
 
 ### 8.20.1 跨存储创建与激活
 
@@ -6930,6 +6920,7 @@ Outbox 幂等键同时冻结租户、聚合身份/版本、事件类型/模式�
 | `bridgeai_audit_writer` | 追加审计/访问/安全/血缘事件 | 只 `INSERT`，不 `UPDATE/DELETE` |
 | `bridgeai_backup_restore` | 受控备份和恢复演练 | 无常驻 LOGIN，作业结束即撤销成员资格 |
 | `bridgeai_break_glass` | 紧急运维 | 可 `BYPASSRLS` 但 `NOLOGIN`，双人授权、限时、全程审计 |
+| `bridgeai_rls_helper_owner` | 仅执行 RLS 成员关系谓词 | `NOLOGIN`；仅为在 `FORCE RLS` 下读取成员关系而持有 `BYPASSRLS`，无应用成员资格、无业务 DML grant、仅拥有固定 search_path 的布尔 helper |
 
 ```sql
 DO $$
@@ -6939,7 +6930,7 @@ BEGIN
     FOREACH v_role IN ARRAY ARRAY[
         'bridgeai_migration_owner', 'bridgeai_app_rw', 'bridgeai_readonly',
         'bridgeai_index_worker', 'bridgeai_audit_writer', 'bridgeai_backup_restore',
-        'bridgeai_break_glass'
+        'bridgeai_break_glass', 'bridgeai_rls_helper_owner'
     ] LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
             EXECUTE format('CREATE ROLE %I', v_role);
@@ -6956,6 +6947,7 @@ ALTER ROLE bridgeai_index_worker NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREA
 ALTER ROLE bridgeai_audit_writer NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 ALTER ROLE bridgeai_backup_restore NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS;
 ALTER ROLE bridgeai_break_glass NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS;
+ALTER ROLE bridgeai_rls_helper_owner NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS;
 
 ALTER TABLE bridgeai_report.reports OWNER TO bridgeai_migration_owner;
 ALTER TABLE bridgeai_report.report_revisions OWNER TO bridgeai_migration_owner;
@@ -7131,17 +7123,162 @@ AS $$
                        NULLIF(current_setting('app.actor_id', true), '')::uuid)
               )
               AND (NOT p_write OR pm.role_code IN (
-                  'project_admin', 'inspector', 'reviewer', 'report_issuer', 'service_writer'
+                  'project_admin', 'inspector', 'reviewer', 'report_issuer', 'service_writer',
+                  'memory_admin', 'memory_service'
               ))
         );
 $$;
 
+CREATE OR REPLACE FUNCTION bridgeai_core.has_memory_admin_access(
+    p_organization_id UUID,
+    p_project_id UUID
+) RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core, bridgeai_identity
+AS $$
+    SELECT bridgeai_core.has_organization_access(p_organization_id)
+       AND (
+           (current_setting('app.actor_type', true) = 'user' AND EXISTS (
+               SELECT 1
+               FROM bridgeai_identity.organization_memberships AS om
+               WHERE om.organization_id = p_organization_id
+                 AND om.user_id = NULLIF(current_setting('app.actor_id', true), '')::uuid
+                 AND om.status = 'active'
+                 AND om.role_code IN ('organization_admin', 'memory_admin')
+                 AND om.valid_from <= statement_timestamp()
+                 AND (om.valid_to IS NULL OR om.valid_to > statement_timestamp())
+           ))
+           OR
+           (p_project_id IS NOT NULL AND EXISTS (
+               SELECT 1
+               FROM bridgeai_core.project_memberships AS pm
+               WHERE pm.organization_id = p_organization_id
+                 AND pm.project_id = p_project_id
+                 AND pm.status = 'active'
+                 AND pm.role_code IN ('project_admin', 'memory_admin', 'memory_service')
+                 AND pm.valid_from <= statement_timestamp()
+                 AND (pm.valid_to IS NULL OR pm.valid_to > statement_timestamp())
+                 AND (
+                     (current_setting('app.actor_type', true) = 'user'
+                      AND pm.principal_type = 'user'
+                      AND pm.user_id = NULLIF(current_setting('app.actor_id', true), '')::uuid)
+                     OR
+                     (current_setting('app.actor_type', true) = 'service_principal'
+                      AND pm.principal_type = 'service_principal'
+                      AND pm.service_principal_id =
+                          NULLIF(current_setting('app.actor_id', true), '')::uuid)
+                 )
+           ))
+       );
+$$;
+
 ALTER FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN)
-    OWNER TO bridgeai_migration_owner;
+    OWNER TO bridgeai_rls_helper_owner;
 ALTER FUNCTION bridgeai_core.has_organization_access(UUID)
-    OWNER TO bridgeai_migration_owner;
+    OWNER TO bridgeai_rls_helper_owner;
+ALTER FUNCTION bridgeai_core.has_memory_admin_access(UUID, UUID)
+    OWNER TO bridgeai_rls_helper_owner;
 REVOKE ALL ON FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN) FROM PUBLIC;
 REVOKE ALL ON FUNCTION bridgeai_core.has_organization_access(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_core.has_memory_admin_access(UUID, UUID) FROM PUBLIC;
+GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core TO bridgeai_rls_helper_owner;
+GRANT SELECT ON bridgeai_identity.organizations, bridgeai_identity.users,
+    bridgeai_identity.service_principals, bridgeai_identity.organization_memberships,
+    bridgeai_core.projects, bridgeai_core.project_memberships
+    TO bridgeai_rls_helper_owner;
+
+### 8.21.1 RLS tenant table inventory 与完整覆盖基线
+
+下表是迁移必须覆盖的**全部租户业务逻辑表**。每个列出的逻辑表都必须
+`ENABLE ROW LEVEL SECURITY`、`FORCE ROW LEVEL SECURITY` 且至少有一条 policy；分区父表、
+DEFAULT 和每个 ATTACH 的月分区都分别执行同一 policy 模式，不能只保护父表。没有
+`organization_id/project_id` 的全局迁移元数据和无租户载荷受控字典是唯一例外；
+`organizations` 虽是组织根表，仍只能读取当前已验证组织自身。`users`、
+`service_principals`、`organization_memberships` 是组织级身份表，使用组织成员验证；它们
+不是全局 lookup，也不要求不存在的 `project_id`。
+
+| 覆盖类别 | 逻辑表／物理分区 | policy 基线 |
+|---|---|---|
+| 组织根与组织级身份 | `organizations`；`users`、`service_principals`、`organization_memberships` | 当前已验证组织；组织根只允许 `id=app.organization_id` |
+| Core | `projects`、`project_memberships`、`artifacts`、`artifact_versions`、`idempotency_requests`、`outbox_events` | 项目成员 helper；Outbox 仅额外允许受控 retention 通道 |
+| Asset | `assets`、`bridge_profiles`、`road_sections`、`components`、`component_aliases`、`spatial_locations` | 项目成员 helper |
+| Inspection | `inspection_campaigns`、`acquisition_sessions`、`acquisition_datasets`、`dataset_artifacts`、`damage_entities`、`model_inference_runs`、`damage_observations`、`damage_revisions`、`damage_measurements`、`damage_evidence` | 项目成员 helper |
+| Workflow | `workflow_tasks`、`workflow_runs`、`workflow_events` 及 DEFAULT/月分区、`workflow_node_executions`、`workflow_reviews`、node registry/shadow/DEFAULT/月分区 | 项目成员 helper |
+| Knowledge | `knowledge_sources`、`documents`、`document_versions`、`chunks`、`publications`、`citations`、`knowledge_releases`、`publication_items`、`index_sync_jobs` | 项目成员 helper |
+| Memory | `memory_records`、`memory_revisions`、`memory_sources`、`memory_feedback`、`deletion_jobs`、`context_manifests`、`context_manifest_items` | 组织级记录用组织 helper；项目级记录用项目 helper；用户私有记录再加 restrictive owner/admin helper |
+| Report 与 Audit | `reports`、`report_revisions`、`report_items`、`report_citations`、`report_artifacts`、`report_signatures`；`audit_events`/DEFAULT/月分区、`data_access_events`/DEFAULT/月分区、`security_events`、`retention_executions`、`lineage_edges` | 项目成员 helper；可空项目的审计记录退回组织 helper |
+
+下列初始化块覆盖此前没有专用 RLS 块的 identity、Core、Asset 与 Inspection 表；同名 policy
+先删除再重建，保证迁移重跑不会保留较弱的旧策略。Workflow、Knowledge、Memory、Report 和
+Audit 的专用块也必须使用下方相同 helper，不能以 caller-set GUC 单独作允许条件。
+
+```sql
+DO $complete_tenant_rls$
+DECLARE
+    qualified_name TEXT;
+    schema_name TEXT;
+    table_name TEXT;
+BEGIN
+    ALTER TABLE bridgeai_identity.organizations ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE bridgeai_identity.organizations FORCE ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS pl_organizations_scope ON bridgeai_identity.organizations;
+    CREATE POLICY pl_organizations_scope ON bridgeai_identity.organizations
+        USING (id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+               AND bridgeai_core.has_organization_access(id))
+        WITH CHECK (false);
+
+    FOREACH qualified_name IN ARRAY ARRAY[
+        'bridgeai_identity.users', 'bridgeai_identity.service_principals',
+        'bridgeai_identity.organization_memberships'
+    ] LOOP
+        schema_name := split_part(qualified_name, '.', 1);
+        table_name := split_part(qualified_name, '.', 2);
+        EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', schema_name, table_name);
+        EXECUTE format('ALTER TABLE %I.%I FORCE ROW LEVEL SECURITY', schema_name, table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I',
+            'pl_' || table_name || '_org_scope', schema_name, table_name);
+        EXECUTE format(
+            'CREATE POLICY %I ON %I.%I USING (bridgeai_core.has_organization_access(organization_id)) WITH CHECK (bridgeai_core.has_organization_access(organization_id))',
+            'pl_' || table_name || '_org_scope', schema_name, table_name
+        );
+    END LOOP;
+
+    FOREACH qualified_name IN ARRAY ARRAY[
+        'bridgeai_core.project_memberships', 'bridgeai_core.artifacts',
+        'bridgeai_core.artifact_versions',
+        'bridgeai_asset.assets', 'bridgeai_asset.bridge_profiles',
+        'bridgeai_asset.road_sections', 'bridgeai_asset.components',
+        'bridgeai_asset.component_aliases', 'bridgeai_asset.spatial_locations',
+        'bridgeai_inspection.inspection_campaigns',
+        'bridgeai_inspection.acquisition_sessions',
+        'bridgeai_inspection.acquisition_datasets',
+        'bridgeai_inspection.dataset_artifacts',
+        'bridgeai_inspection.damage_entities',
+        'bridgeai_inspection.model_inference_runs',
+        'bridgeai_inspection.damage_observations',
+        'bridgeai_inspection.damage_revisions',
+        'bridgeai_inspection.damage_measurements',
+        'bridgeai_inspection.damage_evidence'
+    ] LOOP
+        schema_name := split_part(qualified_name, '.', 1);
+        table_name := split_part(qualified_name, '.', 2);
+        EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', schema_name, table_name);
+        EXECUTE format('ALTER TABLE %I.%I FORCE ROW LEVEL SECURITY', schema_name, table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I',
+            'pl_' || table_name || '_project_scope', schema_name, table_name);
+        EXECUTE format(
+            'CREATE POLICY %I ON %I.%I USING (bridgeai_core.has_project_access(organization_id, project_id, false)) WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true))',
+            'pl_' || table_name || '_project_scope', schema_name, table_name
+        );
+    END LOOP;
+END
+$complete_tenant_rls$;
+```
+
+迁移验收必须把以上 inventory 与 `pg_class/pg_policy` 对账：每个逻辑表及其已 ATTACH 分区均应
+满足 `relrowsecurity=true`、`relforcerowsecurity=true` 和至少一个 policy；缺一个即阻断发布。
 ALTER TABLE bridgeai_core.projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bridgeai_core.projects FORCE ROW LEVEL SECURITY;
 CREATE POLICY projects_org_isolation ON bridgeai_core.projects
@@ -7313,7 +7450,8 @@ GRANT USAGE ON SCHEMA bridgeai_core, bridgeai_report
 GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core, bridgeai_audit
     TO bridgeai_audit_writer;
 GRANT EXECUTE ON FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN),
-    bridgeai_core.has_organization_access(UUID)
+    bridgeai_core.has_organization_access(UUID),
+    bridgeai_core.has_memory_admin_access(UUID, UUID)
     TO bridgeai_app_rw, bridgeai_readonly, bridgeai_index_worker, bridgeai_audit_writer;
 
 GRANT SELECT, INSERT ON bridgeai_report.reports TO bridgeai_app_rw;
@@ -7624,9 +7762,35 @@ CREATE TABLE bridgeai_audit.audit_events_2026_08
 CREATE TABLE bridgeai_audit.data_access_events_2026_08
     PARTITION OF bridgeai_audit.data_access_events
     FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00');
+
+DO $attached_partition_rls$
+DECLARE table_name TEXT;
+BEGIN
+    FOREACH table_name IN ARRAY ARRAY['workflow_events_2026_08'] LOOP
+        EXECUTE format('ALTER TABLE bridgeai_workflow.%I ENABLE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('ALTER TABLE bridgeai_workflow.%I FORCE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON bridgeai_workflow.%I',
+            'pl_' || table_name || '_scope', table_name);
+        EXECUTE format(
+            'CREATE POLICY %I ON bridgeai_workflow.%I USING (bridgeai_core.has_project_access(organization_id, project_id, false)) WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true))',
+            'pl_' || table_name || '_scope', table_name
+        );
+    END LOOP;
+    FOREACH table_name IN ARRAY ARRAY['audit_events_2026_08', 'data_access_events_2026_08'] LOOP
+        EXECUTE format('ALTER TABLE bridgeai_audit.%I ENABLE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('ALTER TABLE bridgeai_audit.%I FORCE ROW LEVEL SECURITY', table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON bridgeai_audit.%I',
+            'pl_' || table_name || '_scope', table_name);
+        EXECUTE format(
+            'CREATE POLICY %I ON bridgeai_audit.%I USING (CASE WHEN project_id IS NULL THEN bridgeai_core.has_organization_access(organization_id) ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END) WITH CHECK (CASE WHEN project_id IS NULL THEN bridgeai_core.has_organization_access(organization_id) ELSE bridgeai_core.has_project_access(organization_id, project_id, true) END)',
+            'pl_' || table_name || '_scope', table_name
+        );
+    END LOOP;
+END
+$attached_partition_rls$;
 ```
 
-运维任务每天检查并至少预建“当月 + 下两月”。经父表访问使用父表 RLS；父表权限不会变成对子表的直接访问权限，因此默认不向应用角色 grant 子表。若特权运维必须直读子表，须对子表单独 `ENABLE/FORCE ROW LEVEL SECURITY`、建等价 Policy 并只 grant 该运维角色。新分区 owner、RLS、Policy、grant、行级触发器和索引继承均以系统目录验收。
+运维任务每天检查并至少预建“当月 + 下两月”。父表权限不会变成对子表的直接访问权限，且本章要求每个新子表无论经父表还是直读都完成同等 `ENABLE/FORCE RLS` 与 policy；默认不向应用角色 grant 子表。新分区 owner、RLS、Policy、grant、行级触发器和索引继承均以系统目录验收。
 
 ### 8.23.2 默认分区、迟到数据与 ATTACH
 
@@ -7904,38 +8068,30 @@ ALTER TABLE bridgeai_workflow.workflow_node_executions_partitioned_2026_08
 CREATE POLICY pl_workflow_node_execution_keys_scope
 ON bridgeai_workflow.workflow_node_execution_keys
 USING (
-    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
-    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+    bridgeai_core.has_project_access(organization_id, project_id, false)
 ) WITH CHECK (
-    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
-    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+    bridgeai_core.has_project_access(organization_id, project_id, true)
 );
 CREATE POLICY pl_workflow_node_executions_partitioned_scope
 ON bridgeai_workflow.workflow_node_executions_partitioned
 USING (
-    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
-    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+    bridgeai_core.has_project_access(organization_id, project_id, false)
 ) WITH CHECK (
-    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
-    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+    bridgeai_core.has_project_access(organization_id, project_id, true)
 );
 CREATE POLICY pl_workflow_node_executions_partitioned_default_scope
 ON bridgeai_workflow.workflow_node_executions_partitioned_default
 USING (
-    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
-    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+    bridgeai_core.has_project_access(organization_id, project_id, false)
 ) WITH CHECK (
-    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
-    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+    bridgeai_core.has_project_access(organization_id, project_id, true)
 );
 CREATE POLICY pl_workflow_node_executions_partitioned_2026_08_scope
 ON bridgeai_workflow.workflow_node_executions_partitioned_2026_08
 USING (
-    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
-    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+    bridgeai_core.has_project_access(organization_id, project_id, false)
 ) WITH CHECK (
-    organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
-    AND project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+    bridgeai_core.has_project_access(organization_id, project_id, true)
 );
 
 REVOKE ALL ON bridgeai_workflow.workflow_node_execution_keys,
