@@ -7292,6 +7292,8 @@ $complete_tenant_rls$;
 
 迁移验收必须把以上 inventory 与 `pg_class/pg_policy` 对账：每个逻辑表及其已 ATTACH 分区均应
 满足 `relrowsecurity=true`、`relforcerowsecurity=true` 和至少一个 policy；缺一个即阻断发布。
+
+```sql
 ALTER TABLE bridgeai_core.projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bridgeai_core.projects FORCE ROW LEVEL SECURITY;
 CREATE POLICY projects_org_isolation ON bridgeai_core.projects
