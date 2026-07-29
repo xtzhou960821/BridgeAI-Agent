@@ -573,11 +573,431 @@ MemoryRecord 的 schema_version 与数据库迁移版本、API 版本和索引�
 
 ## 7.8 记忆来源与写入触发
 
+Memory 不监听并保存全部会话、日志和中间状态。只有登记在 Memory Event Catalog 中的事件可以进入候选流水线。
+
+### 7.8.1 来源类型
+
+| 来源类型 | 典型对象 | 可形成的记忆 | 默认确认方式 |
+|---|---|---|---|
+| user_action | 用户点击“保存偏好”、明确更正 | 偏好、术语、显示规则 | 低风险可规则确认 |
+| workflow_event | 阶段完成、Interrupt、重试耗尽、任务结束 | 任务摘要、未决事项、降级原因 | 确定性字段校验 |
+| tool_result | 检测、测量、GIS、报告 Tool 输出 | 结果引用、运行经验候选 | 不复制结果；高风险需复核 |
+| human_review | 复核通过、驳回、修订和签发 | 项目修订、负向记忆、复核规则 | 来源有效时可发布 |
+| signed_report | 已签发报告及其数据包 | 报告规则、经确认项目表达 | 绑定报告版本 |
+| business_record | 资产、构件、病害或配置变化 | 稳定引用、失效触发 | 业务服务校验 |
+| evaluation_report | 模型、设备和 Workflow 评测发布 | 运行经验 | 模型管理员或领域负责人确认 |
+| rag_evidence | Evidence Pack 和检索结果 | 查询线索、证据引用 | 不复制规范正文 |
+
+每个来源必须有稳定 source_id。可变对象还必须有 source_version 或不可变哈希。来源不存在、调用者无权访问或版本不可解析时，不得发布关联高风险记忆。
+
+### 7.8.2 事件白名单
+
+第一阶段建议登记以下事件：
+
+| 事件名 | 触发点 | 主要候选 |
+|---|---|---|
+| memory.preference_saved | 用户明确保存设置 | 用户偏好 |
+| workflow.stage_completed | Workflow 稳定节点完成 | 任务阶段摘要 |
+| workflow.interrupted | 人工复核或外部条件导致暂停 | 交接摘要和未决事项 |
+| workflow.completed | 任务完成 | 任务总结和项目候选 |
+| review.completed | 人工复核完成 | 修订、否定和项目规则 |
+| report.signed | 正式报告签发 | 报告模板和项目表达 |
+| project.archived | 项目归档 | 停止默认召回和保留评估 |
+| project.permission_changed | 成员或角色变化 | 缓存失效和权限重算 |
+| business.fact_changed | 权威业务事实修订 | 关联记忆重新校验 |
+| evaluation.published | 评测结果发布 | 运行经验候选 |
+| deletion.approved | 删除申请批准 | 撤销、墓碑和清理任务 |
+
+事件版本必须登记。未知事件版本进入死信或人工处理，不以宽松解析继续写入。
+
+### 7.8.3 写入触发矩阵
+
+| 内容 | 自动候选 | 规则确认 | 人工确认 | 禁止写入 |
+|---|---:|---:|---:|---:|
+| 用户明确选择的显示语言 | 是 | 是 | 否 | 否 |
+| 模型从对话推测的个人偏好 | 是 | 否 | 是，由用户确认 | 否 |
+| Workflow 阶段摘要 | 是 | 是，需字段一致 | 异常时 | 否 |
+| ToolResult 完整正文或影像 | 否 | 否 | 否 | 是，保存引用或 Artifact |
+| 人工复核修订 | 是 | 来源与作用域校验 | 跨项目或冲突时 | 否 |
+| 构件业务事实 | 仅生成引用候选 | 否 | 来源冲突时 | 禁止复制为权威副本 |
+| 规范条款正文 | 否 | 否 | 否 | 是，由 RAG 管理 |
+| 已发布模型失败模式 | 是 | 来源校验 | 是 | 否 |
+| 密码、令牌、私钥 | 否 | 否 | 否 | 是 |
+| 未签发的 critical 工程结论 | 否 | 否 | 否 | 是 |
+
+### 7.8.4 写入时机
+
+记忆提取不应在每个 Token 或每条日志后运行。推荐在稳定业务边界触发：
+
+- 用户完成明确设置；
+- Workflow 进入稳定 Checkpoint 后；
+- ToolResult 已持久化并获得 execution_id 后；
+- 人工复核事务提交后；
+- 报告签发和项目归档后；
+- 评测报告正式发布后。
+
+这样可以避免重复提取未完成状态，也便于使用 event_id 和版本建立幂等键。
+
 ## 7.9 候选提取与处理流水线
+
+### 7.9.1 状态流转
+
+```text
+captured
+   ↓
+classified
+   ↓
+deduplicated
+   ↓
+risk_assessed
+   ↓
+source_bound
+   ↓
+validating
+   ├──→ rejected
+   ├──→ conflicted
+   ├──→ quarantined
+   └──→ review_pending ──→ active
+                 │
+                 └──────→ rejected
+```
+
+流水线内部步骤可以重试，但业务状态迁移必须由 Memory Service 执行并写入事件记录。Extractor、Embedding Worker 和索引客户端不得自行把候选标记为 active。
+
+### 7.9.2 处理步骤
+
+1. **捕获：** 校验事件类型、版本、签名、组织、项目和操作者。
+2. **分类：** 识别记忆类型、主作用域、业务实体、敏感级别和建议风险。
+3. **最小化：** 删除无业务价值的寒暄、重复日志和不应长期保存的敏感内容。
+4. **提取：** 生成 content、summary、structured_facts 和 source_refs。
+5. **去重：** 比较事件 ID、内容哈希、结构化事实、来源和当前有效版本。
+6. **风险评估：** 规则优先确定风险下限，模型只能提高风险或建议复核，不能降低强制等级。
+7. **来源绑定：** 核对业务记录、ToolResult、Review 或报告是否存在且调用者有权访问。
+8. **安全检查：** 将会话、外部文件和模型输出按不可信内容处理，识别提示注入、越权指令和秘密信息。
+9. **验证与确认：** 按 7.10 的矩阵进入规则确认、人工确认、冲突、拒绝或隔离。
+10. **持久化与索引：** 先提交 PostgreSQL 权威记录，再通过 Outbox 更新派生索引。
+
+### 7.9.3 MemoryProposalInput
+
+```python
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+class MemoryProposalInput(BaseModel):
+    event_id: str
+    trace_id: str
+    task_id: str | None = None
+    requested_type: MemoryType
+    requested_scope: MemoryScope
+    content: str = Field(min_length=1, max_length=16000)
+    summary: str | None = Field(default=None, max_length=2000)
+    structured_facts: dict[str, Any] = Field(default_factory=dict)
+    source_refs: list[SourceRef] = Field(min_length=1)
+    proposed_risk: MemoryRiskLevel
+    extraction_method: Literal[
+        "explicit_user",
+        "deterministic_rule",
+        "model_extraction",
+        "human_review",
+        "system_evaluation",
+    ]
+    extractor_version: str
+    schema_version: str = "memory-proposal.v1"
+```
+
+客户端不得提交 status、validation_status、allowed_roles、confidence 最终值和发布时间。这些字段由服务端根据权限、来源和确认流程计算。
+
+### 7.9.4 幂等设计
+
+候选幂等键由以下字段规范化后计算：
+
+```text
+sha256(
+    organization_id
+    + primary_scope
+    + event_id
+    + requested_type
+    + extractor_version
+    + normalized_content_hash
+)
+```
+
+同一幂等键重复提交时：
+
+- 已成功：返回现有 memory_id 和状态；
+- 正在处理：返回 accepted 和 retry_after；
+- 上次失败且可重试：复用原处理记录继续；
+- 内容哈希不同：视为事件版本冲突，不覆盖原候选。
+
+### 7.9.5 去重与合并
+
+去重分三层：
+
+1. **精确重复：** 同 event_id、来源、类型和内容哈希，直接复用。
+2. **结构化重复：** structured_facts 的业务主键和有效字段相同，折叠为同一版本或更新 last_observed_at。
+3. **语义近似：** 只用于发现候选，不自动合并。高风险近似内容必须比较来源和适用范围。
+
+任务阶段摘要可以增量更新候选，但一旦发布为 active，后续修订必须创建新版本。
+
+### 7.9.6 事务与补偿
+
+PostgreSQL 事务包含候选记录、来源关系、状态事件、审计记录和 Outbox。MinIO 与语义索引不参与同一数据库事务：
+
+- Artifact 写入失败：候选不进入 active，并记录可重试任务；
+- PostgreSQL 提交成功、索引失败：权威记录保持有效，Outbox 重试；
+- 索引成功、后续权限变化：先在 PostgreSQL 使其不可召回，再提交删除或更新事件；
+- 补偿多次失败：进入死信，产生告警，不绕过权限继续召回。
+
+### 7.9.7 提示注入隔离
+
+候选提取 Prompt 必须把事件正文标记为数据，不允许其中的自然语言修改系统规则、作用域、风险、Tool 权限或确认状态。疑似“忽略规则”“扩大权限”“调用删除”等指令性内容进入 quarantined，并保存安全标签而不是继续作为上下文传播。
 
 ## 7.10 校验、确认、发布与版本管理
 
+### 7.10.1 校验门
+
+候选至少经过以下检查：
+
+| 校验 | 失败处理 |
+|---|---|
+| Schema 与字段长度 | rejected，返回字段错误 |
+| 事件类型和版本 | 拒绝未知版本或进入死信 |
+| 操作者权限 | 拒绝且不暴露目标记忆存在性 |
+| 作用域完整性 | rejected；project 记忆必须有 project_id |
+| 来源存在性和版本 | high/critical 阻断；低风险进入待补充来源 |
+| 来源访问权限 | rejected 并记录安全事件 |
+| 内容最小化和敏感信息 | 脱敏、隔离或拒绝 |
+| 重复和版本关系 | 复用、折叠或创建修订 |
+| 与 active 记忆冲突 | conflicted，不自动覆盖 |
+| 与权威业务事实冲突 | conflicted 并强制复核 |
+| 提示注入和可执行指令 | quarantined |
+| 有效期与项目状态 | 过期或归档项目不默认发布 |
+
+### 7.10.2 确认矩阵
+
+| 记忆类型与风险 | 最低确认要求 | 可发布状态 |
+|---|---|---|
+| 用户明确 low 偏好 | user_action + 权限校验 | active |
+| 模型推断的 low 偏好 | 用户明确确认 | active |
+| medium 任务摘要 | Workflow 字段比对、来源可读 | active |
+| medium 项目术语 | 项目配置或人工确认 | active |
+| high 构件映射与历史修订 | 业务记录或 human_review | active |
+| high 运行经验 | 已发布评测 + 负责人确认 | active |
+| critical 工程结论 | 不作为普通记忆发布；仅保存权威引用 | active 引用记录 |
+| 来源冲突或适用范围不明 | 人工处理冲突 | active / rejected |
+
+人工确认操作必须记录 reviewer_id、review_id、前后值、理由、时间和权限快照。确认者不能审批自己无权访问的来源，也不能借确认把项目记忆发布到组织作用域。
+
+### 7.10.3 状态语义
+
+| 状态 | 是否可默认召回 | 说明 |
+|---|---:|---|
+| candidate | 否 | 已接收但未完成验证 |
+| validating | 否 | 正在校验来源、权限、风险和重复 |
+| review_pending | 否 | 等待用户或人工复核 |
+| active | 是 | 已发布且仍满足权限、有效期和来源要求 |
+| conflicted | 否 | 与现有记忆或业务事实冲突 |
+| rejected | 否 | 不满足发布条件 |
+| superseded | 否 | 已被明确新版本替代 |
+| expired | 否 | 超过有效期或适用条件 |
+| revoked | 否 | 因权限、安全或人工操作立即停止使用 |
+| quarantined | 否 | 疑似污染、越权或安全问题 |
+| tombstoned | 否 | 正文已移除或待清理，仅保留最小审计 |
+| deleted | 否 | 允许删除的内容和派生物已完成清理 |
+
+只有 active 可以进入普通 Context Pack。诊断和管理界面可在单独权限下查询其他状态，但不得把它们送给普通 Agent。
+
+### 7.10.4 发布事务
+
+发布 active 至少需要在同一 PostgreSQL 事务内完成：
+
+1. 锁定候选当前版本；
+2. 重新检查来源、权限和项目状态；
+3. 写入最终风险、确认方式和有效期；
+4. 如果替代旧版本，将旧版本标记为 superseded；
+5. 写入状态事件和审计记录；
+6. 写入索引 Outbox；
+7. 提交事务。
+
+索引完成不是 PostgreSQL 发布事务的一部分。索引尚未同步时，结构化检索仍可读取 active 记录；语义召回必须等待 index_status 为 ready。
+
+### 7.10.5 版本与替代
+
+每次语义更正创建新 memory_id。版本关系至少支持：
+
+- supersedes：新版本完全替代旧版本；
+- corrects：修正旧版本中的明确错误；
+- narrows：缩小适用范围；
+- extends：补充内容但不否定旧版本；
+- derived_from：由多个来源或记忆归纳。
+
+同一逻辑记忆可以使用 memory_family_id 聚合版本。历史 Context Manifest 始终引用具体 memory_id，不自动漂移到最新版本。
+
+### 7.10.6 冲突处理
+
+冲突检测至少比较：
+
+- 相同业务实体和字段出现不同值；
+- 相同项目规则具有重叠有效期；
+- 人工修订与最新业务事实不一致；
+- 不同来源对模型适用性给出相反结论；
+- 用户偏好与项目强制配置冲突。
+
+冲突记录保留双方来源、版本、作用域和检测规则。系统不得以 Embedding 相似度、模型投票或“最新创建时间”自动裁决 high/critical 冲突。
+
+### 7.10.7 来源变化传播
+
+业务事实修订、报告撤签、评测撤回、项目权限变化或 RAG 证据失效时，Source Monitor 生成重新校验事件：
+
+- 来源仍有效且内容不受影响：更新检查时间；
+- 内容需要修订：创建新候选；
+- 来源已撤回：立即 revoke 关联记忆；
+- 适用范围变化：expire 原版本并创建窄化候选；
+- 无法自动判断：进入 conflicted 或 review_pending。
+
 ## 7.11 存储、索引与职责分工
+
+### 7.11.1 存储职责矩阵
+
+| 组件 | 权威职责 | 主要用途 | 不承担 |
+|---|---|---|---|
+| PostgreSQL | MemoryRecord、来源、权限、状态、版本、反馈、删除任务和审计 | 事务、精确检索、治理和恢复 | 大型归档、唯一语义检索 |
+| Qdrant 或等价索引 | 无业务权威职责 | 已授权作用域内的语义候选召回 | 唯一 ACL、版本和删除状态 |
+| MinIO | 大型 Context Artifact 的版本化原件 | 长摘要、会话归档、报告附件和导出包 | 状态机、权限关系、排序逻辑 |
+| LangGraph Store | 无独立业务权威职责 | 框架节点访问 Memory Service 的适配 | 绕过 BridgeAI Schema 和 Policy |
+| LangGraph Checkpointer | thread 状态快照 | Interrupt、恢复、时间旅行和故障恢复 | 跨 thread 项目记忆 |
+| Redis | 无业务权威职责 | 短时查询、授权和 Context Pack 缓存 | 长期记忆和删除证明 |
+| Workflow State | 当前运行权威快照 | memory_id、摘要和 Manifest 引用 | 完整历史、向量和大文件 |
+
+### 7.11.2 PostgreSQL 概念实体
+
+第八章再给出完整 DDL。本章约定以下代表性实体：
+
+| 实体 | 作用 |
+|---|---|
+| memory_records | 记忆内容、类型、作用域、风险、状态和有效期 |
+| memory_sources | 来源引用、版本、哈希和可用状态 |
+| memory_relations | supersedes、corrects、derived_from 等关系 |
+| memory_acl_bindings | 项目、角色、用户和敏感级别授权 |
+| memory_events | 状态迁移和领域事件 |
+| memory_feedback | 接受、忽略、更正、否定和举报 |
+| memory_context_manifests | 每次上下文组装的输入、裁剪和哈希 |
+| memory_deletion_jobs | 撤销、墓碑和派生物清理进度 |
+| memory_outbox | 索引、缓存和生命周期异步事件 |
+
+建议使用独立 bridgeai_memory Schema，与 bridgeai_workflow、知识库和业务 Schema 分离。应用服务角色不得成为表所有者；Row-Level Security 可以作为纵深防御，但不替代应用层授权。
+
+### 7.11.3 语义索引载荷
+
+语义索引只保存召回和过滤所需的最小载荷：
+
+```json
+{
+  "memory_id": "mem_01K1C7M8V6M3Q20D5D6A9X7H4P",
+  "organization_id": "org_001",
+  "project_id": "project_bridge_2026_017",
+  "scope_type": "project",
+  "scope_id": "project_bridge_2026_017",
+  "memory_type": "project_memory",
+  "status": "active",
+  "risk_level": "high",
+  "sensitivity": "internal",
+  "acl_version": "acl_42",
+  "memory_version": "3",
+  "valid_from": "2026-07-29T14:00:00+08:00",
+  "valid_until": null,
+  "index_version": "memory-index.v1"
+}
+```
+
+organization_id、project_id、scope_type、scope_id、memory_type、status、sensitivity 和 acl_version 应建立适合精确过滤的 Payload Index。索引中不保存密码、令牌、完整 ACL 成员列表和不必要的 restricted 正文。
+
+### 7.11.4 Memory 与 RAG 索引隔离
+
+第一阶段至少使用不同集合：
+
+```text
+bridgeai_memory_v1
+bridgeai_knowledge_dense_v1
+bridgeai_knowledge_sparse_v1
+```
+
+两类索引的来源、发布状态、权限、有效期和删除语义不同，不能通过一个混合集合共享别名。Memory 检索结果也不得伪装成 RAG EvidenceItem。
+
+### 7.11.5 MinIO Artifact
+
+建议对象键由系统生成：
+
+```text
+memory-context/
+  organization/{organization_id}/
+  project/{project_id_or_global}/
+  memory/{memory_id}/
+  version/{artifact_version}/
+  {artifact_id}.json.zst
+```
+
+PostgreSQL 保存 artifact_id、bucket、object_key、object_version_id、sha256、size、content_type、encryption_profile 和 retention_policy。对象键不得直接拼接用户输入和原始文件名。
+
+### 7.11.6 Outbox 与索引一致性
+
+```text
+Memory Service
+   │ PostgreSQL Transaction
+   ├── memory_records
+   ├── memory_events
+   └── memory_outbox
+             │
+             ▼
+       Index Worker
+       ├── upsert / delete vector
+       ├── invalidate cache
+       └── report result
+```
+
+Worker 使用 outbox_id 作为幂等键。处理成功后记录 index_version、point_id 和完成时间。连续失败进入死信并告警。
+
+### 7.11.7 召回一致性规则
+
+语义候选返回后，Memory Service 必须回到 PostgreSQL 重新确认：
+
+1. status 仍为 active；
+2. 当前时间位于有效期；
+3. 来源未撤回；
+4. 当前 ACL 版本允许调用者读取；
+5. 项目未归档或调用显式允许归档查询；
+6. deletion_status 为 none；
+7. 索引 memory_version 与权威版本一致。
+
+任一条件失败即丢弃候选并产生索引修复事件。
+
+### 7.11.8 索引重建与回滚
+
+索引可以根据 PostgreSQL active 记录和受控 Artifact 重建。重建采用版本化集合和别名切换：
+
+1. 创建新集合并登记 index_version；
+2. 读取权威记录，按权限和状态批量写入；
+3. 比对记录数、哈希和抽样查询；
+4. 在控制面批准后切换生产别名；
+5. 保留旧集合到回滚窗口结束；
+6. 删除旧集合前记录审计。
+
+索引重建不得改变 memory_id、确认状态和有效期。
+
+### 7.11.9 删除顺序
+
+删除或撤权时按以下顺序处理：
+
+1. PostgreSQL 将记录变为不可召回状态；
+2. 提交缓存失效和索引删除事件；
+3. 删除或按策略保留 MinIO 对象版本；
+4. 删除派生摘要和 Context 缓存；
+5. 完成一致性核对；
+6. 将删除任务标记为 complete，或保留 blocked 原因和最小墓碑。
+
+不得先删除原始来源或 Artifact，再留下无法解释的 active 记忆。
 
 ## 7.12 检索、过滤、排序与去重
 
