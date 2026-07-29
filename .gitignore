@@ -33,3 +33,6 @@ coverage/
 .idea/
 .vscode/
 *.log
+
+# Local git worktrees
+.worktrees/
