@@ -2356,6 +2356,19 @@ CREATE TRIGGER trg_workflow_events_global_producer_key
 BEFORE INSERT ON bridgeai_workflow.workflow_events
 FOR EACH ROW EXECUTE FUNCTION bridgeai_workflow.reject_duplicate_producer_event_key();
 
+CREATE OR REPLACE FUNCTION bridgeai_workflow.reject_workflow_event_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'workflow events are append-only; append a correction event instead';
+END;
+$$;
+
+CREATE TRIGGER trg_workflow_events_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_workflow.workflow_events
+FOR EACH ROW EXECUTE FUNCTION bridgeai_workflow.reject_workflow_event_mutation();
+
 CREATE TABLE bridgeai_workflow.workflow_node_executions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     organization_id UUID NOT NULL,
@@ -2526,7 +2539,7 @@ CREATE INDEX ix_workflow_reviews_pending
     WHERE status IN ('pending', 'claimed');
 ```
 
-`created_by`、`updated_by`、`triggered_by`、`actor_subject_id` 和 `reviewer_subject_id` 都是稳定审计主体 UUID，可能指人员或服务主体，因此不伪造指向 `users` 的单表外键；其身份类型和当时权限快照由 8.19 审计域解释。事件以 `occurred_at` 为范围分区键；生产迁移应预建月分区并保留 DEFAULT 分区作为短时故障护栏，监控不得容忍 DEFAULT 分区长期积压。`producer_event_key` 是生产者对同一逻辑事件跨重试、跨进程和跨时间保持不变的稳定键；分区内唯一约束只作局部护栏，BEFORE INSERT 触发器以事务级 advisory lock 串行化同组织/项目/键的并发写入，再通过父表索引跨所有分区查重，因此不同 `occurred_at` 也不能重复。
+`created_by`、`updated_by`、`triggered_by`、`actor_subject_id` 和 `reviewer_subject_id` 都是稳定审计主体 UUID，可能指人员或服务主体，因此不伪造指向 `users` 的单表外键；其身份类型和当时权限快照由 8.19 审计域解释。事件以 `occurred_at` 为范围分区键；生产迁移应预建月分区并保留 DEFAULT 分区作为短时故障护栏，监控不得容忍 DEFAULT 分区长期积压。`producer_event_key` 是生产者对同一逻辑事件跨重试、跨进程和跨时间保持不变的稳定键；分区内唯一约束只作局部护栏，BEFORE INSERT 触发器以事务级 advisory lock 串行化同组织/项目/键的并发写入，再通过父表索引跨所有分区查重，因此不同 `occurred_at` 也不能重复。事件整行追加写，禁止 UPDATE/DELETE；纠错必须追加带关联键的新事件，不能事后改写 scope、稳定键、分区时间或语义载荷。
 
 ### 8.15.2 第五章兼容迁移矩阵
 
@@ -2789,7 +2802,7 @@ CREATE TABLE bridgeai_knowledge.document_versions (
         AND (status <> 'archived' OR archived_at IS NOT NULL)
     ),
     CONSTRAINT ck_document_versions_processing_lock CHECK (
-        status NOT IN ('indexing', 'review_pending', 'published', 'superseded', 'archived')
+        status = 'registered'
         OR (
             processing_contract_locked_at IS NOT NULL
             AND parser_name IS NOT NULL AND btrim(parser_name) <> ''
@@ -3241,11 +3254,11 @@ CREATE INDEX ix_index_sync_jobs_claim
 
 `knowledge_releases` 是一次生产发布的聚合根，`publication_items` 冻结该 release 的文档版本集合、逐版本 Chunk ID/哈希清单、生产 collection/index version 和 ACL 快照；历史查询以 `release_id` 读取这些 item，不重新计算“当前发布版本”。`publications` 仍是单文档状态动作证据，不能单独替代集合快照。
 
-`qdrant_collection`、`qdrant_point_id` 和 `qdrant_index_version` 明确是派生同步字段：只能由索引投影器更新 `index_sync_jobs`，不得由 Qdrant 回写权威版本或发布快照。`sync_phase='build'` 只允许 `indexing/review_pending` 文档写入 `bridgeai_knowledge_staging_*`；`sync_phase='activate'` 只允许依据已发布/撤回 release 操作其冻结的 `bridgeai_knowledge_prod_*` 集合。registered/rejected/failed 不得进入生产投影。
+`qdrant_collection`、`qdrant_point_id` 和 `qdrant_index_version` 明确是派生同步字段：只能由索引投影器在创建 `index_sync_jobs` 时登记，不得由 Qdrant 回写权威版本或发布快照。job 入队后 organization/project、chunk/release target、phase/operation、幂等键、collection/point/index version 与来源哈希均不可改写；worker 只能推进执行状态、次数和错误等运行字段。`sync_phase='build'` 只允许 `indexing/review_pending` 文档写入 `bridgeai_knowledge_staging_*`；`sync_phase='activate'` 只允许依据已发布/撤回 release 操作其冻结的 `bridgeai_knowledge_prod_*` 集合。registered/rejected/failed 不得进入生产投影。
 
 ### 8.16.3 版本与发布保护
 
-已发布版本不可覆盖。文档版本允许状态推进；来源 Artifact、哈希、版本号和有效期在首次更新后保持不可变，解析器、切分策略与 embedding contract 则在首次进入 `indexing` 时完整落盘并设置持久锁，之后即使 `failed → parsing` 重试也不得改写。正文片段、发布记录和引用快照均追加写。需要纠错时创建新的 `document_versions` 和 `chunks`，以 `supersedes_version_id` 关联旧版本，再追加 `publications(publication_action='supersede')`。
+已发布版本不可覆盖。文档版本允许状态推进；来源 Artifact、哈希、版本号和有效期在首次更新后保持不可变，解析器、切分策略与 embedding contract 则在首次离开 `registered`（正常路径即首次进入 `parsing`）时必须完整落盘并设置持久锁，之后即使 `failed → parsing` 重试也不得改写。正文片段、发布记录和引用快照均追加写。需要纠错时创建新的 `document_versions` 和 `chunks`，以 `supersedes_version_id` 关联旧版本，再追加 `publications(publication_action='supersede')`。
 
 ```sql
 CREATE OR REPLACE FUNCTION bridgeai_knowledge.enforce_document_version_transition()
@@ -3285,13 +3298,13 @@ BEGIN
         RAISE EXCEPTION 'locked processing contract is immutable; create a new document version';
     END IF;
 
-    IF NEW.status = 'indexing' AND OLD.processing_contract_locked_at IS NULL THEN
+    IF OLD.status = 'registered' AND NEW.status <> 'registered' THEN
         IF NEW.parser_name IS NULL OR btrim(NEW.parser_name) = ''
            OR NEW.parser_version IS NULL OR btrim(NEW.parser_version) = ''
            OR NEW.chunking_policy_version IS NULL OR btrim(NEW.chunking_policy_version) = ''
            OR NEW.embedding_contract_version IS NULL
            OR btrim(NEW.embedding_contract_version) = '' THEN
-            RAISE EXCEPTION 'indexing requires complete parser/chunker/embedding contract';
+            RAISE EXCEPTION 'leaving registered requires complete parser/chunker/embedding contract';
         END IF;
         NEW.processing_contract_locked_at := CURRENT_TIMESTAMP;
     END IF;
@@ -3577,6 +3590,32 @@ $$;
 CREATE TRIGGER trg_knowledge_releases_transition
 BEFORE INSERT OR UPDATE ON bridgeai_knowledge.knowledge_releases
 FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.enforce_knowledge_release_transition();
+
+CREATE OR REPLACE FUNCTION bridgeai_knowledge.enforce_index_sync_job_identity()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF ROW(
+        NEW.id, NEW.organization_id, NEW.project_id, NEW.chunk_id, NEW.release_id,
+        NEW.sync_phase, NEW.operation, NEW.idempotency_key,
+        NEW.qdrant_collection, NEW.qdrant_point_id, NEW.qdrant_index_version,
+        NEW.source_revision_sha256, NEW.created_at, NEW.created_by
+    ) IS DISTINCT FROM ROW(
+        OLD.id, OLD.organization_id, OLD.project_id, OLD.chunk_id, OLD.release_id,
+        OLD.sync_phase, OLD.operation, OLD.idempotency_key,
+        OLD.qdrant_collection, OLD.qdrant_point_id, OLD.qdrant_index_version,
+        OLD.source_revision_sha256, OLD.created_at, OLD.created_by
+    ) THEN
+        RAISE EXCEPTION 'queued index job target, phase and source identity are immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_index_sync_jobs_identity
+BEFORE UPDATE ON bridgeai_knowledge.index_sync_jobs
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.enforce_index_sync_job_identity();
 
 CREATE OR REPLACE FUNCTION bridgeai_knowledge.validate_index_sync_job_insert()
 RETURNS TRIGGER
@@ -4285,7 +4324,7 @@ Memory 与 RAG 的 Qdrant 集合强制隔离：Memory 仅允许 `bridgeai_memory
 
 ### 8.17.4 作用域、状态和不可变行为
 
-数据库函数补上普通外键无法表达的“可空项目仍必须与父记录完全一致”和版本状态机。只有 `active` 可进入普通 Context Pack；模型或自动归纳只能创建 `candidate`。
+数据库函数补上普通外键无法表达的“可空项目仍必须与父记录完全一致”和版本状态机。只有 `active` 可进入普通 Context Pack；模型或自动归纳只能创建 `candidate`。每次写回后只要记录仍为 active，就重新验证当前修订、来源与 high/critical 资格，不能先以 low/tool result 激活后再升级风险，或事后降低 validation。对 `memory_sources` 的 UPDATE/DELETE 也在数据库内复核父记录：active high/critical 不能撤回、删除或降级其最后一个权威来源。记录资格更新和来源失效共用 memory 级事务 advisory lock，避免“风险升级”和“最后来源撤回”并发各自基于旧快照通过。
 
 ```sql
 CREATE OR REPLACE FUNCTION bridgeai_memory.enforce_memory_record_transition()
@@ -4334,7 +4373,13 @@ BEGIN
         RAISE EXCEPTION 'invalid memory transition: % -> %', OLD.status, NEW.status;
     END IF;
 
-    IF TG_OP = 'UPDATE' AND NEW.status = 'active' AND OLD.status <> 'active' THEN
+    IF NEW.status = 'active' THEN
+        PERFORM pg_advisory_xact_lock(
+            hashtextextended(
+                NEW.organization_id::text || E'\\x1f' || NEW.id::text,
+                1
+            )
+        );
         IF NEW.current_revision_id IS NULL OR NEW.activated_at IS NULL THEN
             RAISE EXCEPTION 'active memory requires current revision and activated_at';
         END IF;
@@ -4513,6 +4558,74 @@ FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.enforce_memory_child_scope();
 CREATE TRIGGER trg_deletion_jobs_parent_scope
 BEFORE INSERT OR UPDATE ON bridgeai_memory.deletion_jobs
 FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.enforce_memory_child_scope();
+
+CREATE OR REPLACE FUNCTION bridgeai_memory.protect_active_authoritative_source()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    parent_status TEXT;
+    parent_risk_level TEXT;
+    parent_current_revision_id UUID;
+    authoritative_source_count INTEGER;
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(
+            OLD.organization_id::text || E'\\x1f' || OLD.memory_id::text,
+            1
+        )
+    );
+
+    SELECT status, risk_level, current_revision_id
+      INTO parent_status, parent_risk_level, parent_current_revision_id
+    FROM bridgeai_memory.memory_records
+    WHERE id = OLD.memory_id AND organization_id = OLD.organization_id;
+
+    IF parent_status = 'active'
+       AND parent_risk_level IN ('high', 'critical')
+       AND parent_current_revision_id = OLD.memory_revision_id THEN
+        SELECT count(*) INTO authoritative_source_count
+        FROM bridgeai_memory.memory_sources AS s
+        WHERE s.memory_id = OLD.memory_id
+          AND s.organization_id = OLD.organization_id
+          AND s.memory_revision_id = parent_current_revision_id
+          AND s.id <> OLD.id
+          AND s.availability_status = 'active'
+          AND s.source_type IN (
+              'business_record', 'human_review', 'signed_report', 'evaluation_report'
+          )
+          AND (
+              s.source_type <> 'evaluation_report'
+              OR s.source_locator ->> 'publication_status' = 'published'
+          );
+        IF TG_OP = 'UPDATE'
+           AND NEW.memory_id = OLD.memory_id
+           AND NEW.organization_id = OLD.organization_id
+           AND NEW.memory_revision_id = parent_current_revision_id
+           AND NEW.availability_status = 'active'
+           AND NEW.source_type IN (
+               'business_record', 'human_review', 'signed_report', 'evaluation_report'
+           )
+           AND (
+               NEW.source_type <> 'evaluation_report'
+               OR NEW.source_locator ->> 'publication_status' = 'published'
+           ) THEN
+            authoritative_source_count := authoritative_source_count + 1;
+        END IF;
+        IF authoritative_source_count = 0 THEN
+            RAISE EXCEPTION 'active high/critical memory cannot lose its last authoritative source';
+        END IF;
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_memory_sources_active_eligibility
+BEFORE UPDATE OR DELETE ON bridgeai_memory.memory_sources
+FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.protect_active_authoritative_source();
 
 CREATE OR REPLACE FUNCTION bridgeai_memory.enforce_deletion_job_transition()
 RETURNS TRIGGER
@@ -4766,6 +4879,26 @@ WHERE m.status = 'active'
           WHERE s.memory_revision_id = r.id
             AND s.organization_id = r.organization_id
             AND s.availability_status = 'active'
+      )
+      OR (
+          m.risk_level IN ('high', 'critical')
+          AND (
+              m.validation_status NOT IN ('source_verified', 'human_confirmed')
+              OR NOT EXISTS (
+                  SELECT 1 FROM bridgeai_memory.memory_sources AS s
+                  WHERE s.memory_revision_id = r.id
+                    AND s.organization_id = r.organization_id
+                    AND s.availability_status = 'active'
+                    AND s.source_type IN (
+                        'business_record', 'human_review', 'signed_report',
+                        'evaluation_report'
+                    )
+                    AND (
+                        s.source_type <> 'evaluation_report'
+                        OR s.source_locator ->> 'publication_status' = 'published'
+                    )
+              )
+          )
       )
       OR (r.index_status = 'ready' AND r.qdrant_collection NOT LIKE 'bridgeai_memory_%')
   );
