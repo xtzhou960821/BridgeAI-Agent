@@ -1001,15 +1001,618 @@ Worker 使用 outbox_id 作为幂等键。处理成功后记录 index_version、
 
 ## 7.12 检索、过滤、排序与去重
 
+### 7.12.1 查询输入
+
+Memory 查询不是一个只有自然语言 query 的向量检索请求。服务端必须同时获得调用者、组织、项目、任务、当前节点、用途、允许的记忆类型、时间点和结果预算。
+
+```python
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class MemorySearchInput(BaseModel):
+    organization_id: str
+    project_id: str | None = None
+    task_id: str | None = None
+    user_id: str
+    current_node: str
+    purpose: Literal[
+        "task_resume",
+        "project_context",
+        "report_generation",
+        "tool_routing",
+        "human_review",
+        "memory_management",
+    ]
+    query: str | None = Field(default=None, max_length=2000)
+    memory_types: list[MemoryType]
+    query_mode: Literal["exact", "structured", "semantic", "hybrid"] = "hybrid"
+    entity_refs: dict[str, str] = Field(default_factory=dict)
+    as_of: datetime
+    max_results: int = Field(default=20, ge=1, le=100)
+    max_content_chars: int = Field(default=24000, ge=1000, le=100000)
+    include_archived: bool = False
+    schema_version: str = "memory-search.v1"
+```
+
+allowed_roles、ACL 过滤表达式和敏感级别上限由服务端根据认证上下文生成，不能由 Agent 在 MemorySearchInput 中声明。
+
+### 7.12.2 过滤顺序
+
+检索必须按以下顺序执行：
+
+1. 认证用户和服务身份；
+2. 限定 organization_id；
+3. 校验 project_id、task_id 和 user_id 的访问关系；
+4. 限定 scope_type、scope_id 和 memory_type；
+5. 只允许 active，并检查 valid_from、valid_until 和 as_of；
+6. 检查 sensitivity、allowed_roles 和 ACL 版本；
+7. 排除 deletion_status 非 none、来源撤回和索引版本不一致的记录；
+8. 在授权集合内执行精确、结构化或语义召回。
+
+PostgreSQL RLS 和 Qdrant Payload Filter 是纵深防御。应用服务仍要构造授权过滤，且语义候选返回后再次查询权威状态。
+
+### 7.12.3 检索通道
+
+| 通道 | 适用场景 | 示例 |
+|---|---|---|
+| ID 精确读取 | 已知 memory_id、来源或 Context Manifest | 恢复历史上下文 |
+| 结构化过滤 | 已知构件、病害、模板、时间和状态 | 查询某项目有效术语 |
+| 关键词匹配 | 编码、缩写、模板名和固定术语 | HG-03、JTG 编号 |
+| 语义召回 | 表述不同但含义相近的修订或经验 | “逆光下漏检”与“强光背景召回下降” |
+| 邻接扩展 | 需要同一版本的来源、修订和冲突 | 读取 supersedes 和 corrects 关系 |
+
+第一阶段采用结构化过滤优先、语义召回补充的 hybrid 模式。明确 ID 和业务实体查询不得强制经过向量检索。
+
+### 7.12.4 检索结果
+
+```python
+class MemorySearchResult(BaseModel):
+    memory_id: str
+    memory_version: str
+    memory_type: MemoryType
+    scope: MemoryScope
+    summary: str
+    structured_facts: dict[str, Any]
+    source_refs: list[SourceRef]
+    relevance_score: float = Field(ge=0.0, le=1.0)
+    freshness_score: float = Field(ge=0.0, le=1.0)
+    authority_score: float = Field(ge=0.0, le=1.0)
+    scope_score: float = Field(ge=0.0, le=1.0)
+    final_rank_score: float
+    retrieved_by: list[Literal["exact", "structured", "keyword", "semantic"]]
+    conflicts_with: list[str] = Field(default_factory=list)
+    requires_review: bool = False
+    index_version: str | None = None
+```
+
+分数用于排序，不表示工程事实置信度。requires_review 由冲突、风险、来源和当前用途共同决定。
+
+### 7.12.5 排序
+
+第一阶段可使用可配置加权排序：
+
+```text
+rank_score =
+    0.35 × relevance
+  + 0.20 × scope_proximity
+  + 0.20 × source_authority
+  + 0.15 × freshness
+  + 0.10 × confirmation_strength
+  - conflict_penalty
+  - risk_mismatch_penalty
+```
+
+权重属于 retrieval_config_version。不同用途可以调整，例如 task_resume 提高任务作用域和新鲜度，human_review 提高来源权威和冲突覆盖。任何配置变化都必须进入回归评测。
+
+### 7.12.6 新鲜度
+
+新鲜度不是简单按创建时间排序：
+
+- 用户偏好以最新有效显式选择为主；
+- 项目规则以配置版本和有效期为主；
+- 人工修订以来源业务版本为主；
+- 运行经验以模型、设备、数据集和评测版本匹配为主；
+- 任务摘要以同一 task 的稳定阶段和序列号为主。
+
+旧记忆仍可能对历史复现有价值。as_of 查询按历史有效区间读取，不以当前 active 版本替换历史版本。
+
+### 7.12.7 去重与版本折叠
+
+1. 同一 memory_family_id 默认只返回 as_of 时点有效版本。
+2. 同一 source_id 和 structured_facts 的重复摘要保留权威性更高者。
+3. 任务摘要的增量版本按 stage_sequence 折叠。
+4. 不同来源支持同一事实时可合并来源，不拼接为新的无来源结论。
+5. conflicted 关系不能通过去重删除，必须保留双方并标记。
+
+### 7.12.8 无结果与冲突
+
+没有满足权限、状态和质量条件的记忆时，返回空结果而不是扩大项目范围。发生 high/critical 冲突时，Memory Search 返回冲突标识和来源，但 Context Builder 不把任一方写成确定性事实，并设置 requires_review。
+
 ## 7.13 Context Builder 与 Token 预算
+
+Context Builder 是 Agent 内部逻辑架构中的独立组件。它通过受控服务取得项目、任务和偏好上下文，不让 Agent 直接拼接数据库记录。
+
+### 7.13.1 输入
+
+Context Builder 至少接收：
+
+- 认证用户、组织、项目和任务；
+- Workflow current_node、status 和本节点输入 Schema；
+- 当前任务目标、用户本轮明确指令和 Tool 定义；
+- 模型上下文窗口和输出预留；
+- 节点级 Context Policy；
+- RAG Evidence Pack 标识和业务实体引用；
+- as_of 时间点和 retrieval_config_version。
+
+### 7.13.2 预算计算
+
+```text
+可用输入预算
+= 模型上下文窗口
+- 预留响应 Token
+- Tool Schema 与结构化输出 Schema
+- 系统规则、安全边界和权限上下文
+- 当前用户输入与不可裁剪 Workflow 字段
+```
+
+在可用输入预算中，至少保留整个上下文窗口的 15% 给当前 Tool 输出、异常信息和响应安全空间。剩余 Memory 预算可按节点配置：
+
+| Memory 类型 | 默认占 Memory 预算 | 调整条件 |
+|---|---:|---|
+| 任务记忆 | 40% | task_resume 可提高 |
+| 项目记忆 | 35% | 报告和复核节点可提高 |
+| 用户与组织偏好 | 10% | 只保留本节点相关偏好 |
+| 运行经验 | 15% | tool_routing 可提高 |
+
+该比例不是固定产品常量。每次使用的具体配置写入 context_policy_version 和 Context Manifest。
+
+### 7.13.3 保留优先级
+
+不可裁剪：
+
+1. 系统安全规则和 Policy 决策；
+2. 当前任务目标与用户本轮明确约束；
+3. 当前节点必需的结构化字段；
+4. high/critical 人工复核结论的来源引用；
+5. 冲突和 requires_review 标记。
+
+可按优先级裁剪：
+
+1. 重复任务日志；
+2. 已被新版本完整替代的摘要；
+3. 与当前节点无关的偏好；
+4. 低相关运行经验；
+5. 可以通过 memory_id 重新读取的长正文。
+
+### 7.13.4 Context Manifest
+
+```python
+class ContextManifest(BaseModel):
+    context_manifest_id: str
+    trace_id: str
+    task_id: str
+    thread_id: str
+    run_id: str
+    current_node: str
+    as_of: datetime
+    query_fingerprint: str
+    retrieval_config_version: str
+    context_policy_version: str
+    candidate_memory_ids: list[str]
+    used_memory_ids: list[str]
+    omitted_items: list[dict[str, str]]
+    compression_records: list[dict[str, Any]]
+    source_refs: list[SourceRef]
+    input_token_count: int
+    memory_token_count: int
+    reserved_token_count: int
+    context_hash: str
+    created_at: datetime
+    schema_version: str = "context-manifest.v1"
+```
+
+omitted_items 至少记录 memory_id 和 reason，例如 unauthorized、expired、duplicate、budget_exceeded、conflicted 或 source_unavailable。不得在普通审计日志中复制被拒绝的越权内容。
+
+### 7.13.5 Context Pack
+
+```python
+class ContextPack(BaseModel):
+    context_manifest_id: str
+    task_context: list[MemorySearchResult]
+    project_context: list[MemorySearchResult]
+    effective_preferences: dict[str, Any]
+    operational_warnings: list[MemorySearchResult]
+    business_fact_refs: list[str]
+    rag_evidence_refs: list[str]
+    conflict_notices: list[dict[str, Any]]
+    requires_review: bool
+    review_reasons: list[str] = Field(default_factory=list)
+    schema_version: str = "context-pack.v1"
+```
+
+Context Pack 不包含系统 Prompt 本身，也不允许 Memory 内容覆盖 Tool 定义、权限和安全策略。
+
+### 7.13.6 组装流程
+
+```text
+认证与 Policy
+      ↓
+当前节点必需字段
+      ↓
+精确业务引用
+      ↓
+任务记忆
+      ↓
+项目记忆
+      ↓
+有效偏好
+      ↓
+运行经验与冲突
+      ↓
+去重、预算、压缩
+      ↓
+Context Pack + Context Manifest
+```
+
+### 7.13.7 可复现性
+
+Context Manifest 记录具体 memory_id、版本、as_of、策略版本和哈希。历史调试使用 Manifest 恢复当时上下文，不重新运行“取最新记忆”的普通查询。若来源因删除无法恢复，系统返回不可复现原因和最小墓碑，而不是静默使用新版本。
+
+### 7.13.8 缓存边界
+
+可以缓存完整 Context Pack，但缓存键必须包含组织、项目、用户、角色集合哈希、ACL 版本、任务、节点、查询哈希、as_of 桶、Memory 版本集合和策略版本。权限变化、记忆撤销、来源失效或配置更新立即使相关缓存失效。
 
 ## 7.14 上下文压缩与摘要
 
+上下文压缩的目标是减少 Token 和重复内容，同时保持工程语义、来源和风险边界。压缩不是删除审计，也不是把多条冲突事实合成为一个看似确定的结论。
+
+### 7.14.1 压缩方法
+
+| 方法 | 适用对象 | 风险控制 |
+|---|---|---|
+| 规则裁剪 | 重复日志、无关字段、已知模板文本 | 使用字段白名单和节点策略 |
+| 滑动窗口 | 当前 thread 的近期交互 | 不作为长期项目记忆 |
+| 结构化事实保留 | ID、数值、单位、状态、时间 | 与来源字段逐项比对 |
+| 增量摘要 | 长任务阶段记录 | 记录覆盖事件范围和前一摘要 |
+| 分层摘要 | 多期任务和项目历史 | task → period → project 分层 |
+| 人工确认摘要 | 高风险修订、签发和复核 | 绑定 review_id 或 report_id |
+| 检索后压缩 | 当前查询的多个相关记忆 | 保留每个来源和冲突标记 |
+
+LangGraph 提供 trim、删除消息和摘要等 thread 内短期记忆管理方式。BridgeAI-Agent 可在 Checkpoint State 中采用这些方式控制对话长度，但跨任务项目摘要仍必须经过本章的来源、权限、版本和确认流程。
+
+### 7.14.2 摘要必须保留
+
+每个工程相关摘要至少保留：
+
+- 资产、构件、病害、任务和报告标识；
+- 数值、单位、坐标、时间和版本；
+- 否定关系，例如“未发现”“不得”“尚未确认”；
+- 不确定性、低置信度和人工复核要求；
+- 用户或复核者的明确更正；
+- 来源 ID、来源版本和覆盖事件范围；
+- 未决事项、异常、降级和失败原因；
+- 适用作用域、有效期和敏感级别。
+
+摘要不得把“建议复核”改写为“已确认”，不得把多个构件的结果合并成单一构件事实，也不得省略影响结论的单位和时间。
+
+### 7.14.3 结构化摘要
+
+推荐先生成结构化摘要，再渲染自然语言：
+
+```json
+{
+  "covered_event_ids": [
+    "evt_1001",
+    "evt_1002"
+  ],
+  "completed_steps": [
+    "image_preprocess",
+    "damage_detection"
+  ],
+  "business_fact_refs": [
+    "inspection_result_8821"
+  ],
+  "tool_result_refs": [
+    "tool_exec_7712"
+  ],
+  "human_review_refs": [],
+  "confirmed_corrections": [],
+  "open_items": [
+    "review_low_confidence_crack_14"
+  ],
+  "negations": [
+    "尚未完成裂缝宽度人工复核"
+  ],
+  "errors": [],
+  "source_hash": "sha256:..."
+}
+```
+
+自然语言摘要只能表达该结构化对象已有信息。结构化字段与文本不一致时，阻断长期写入。
+
+### 7.14.4 增量与分层摘要
+
+```text
+原始 Workflow 事件
+       ↓
+节点摘要
+       ↓
+任务阶段摘要
+       ↓
+任务完成摘要
+       ↓
+周期巡检摘要
+       ↓
+项目历史摘要
+```
+
+上层摘要保存下层摘要 ID 和覆盖范围，而不是删除下层权威来源。生成新上层摘要时只处理自上一版本后的增量事件，并校验覆盖区间连续、无重复、无缺口。
+
+### 7.14.5 摘要校验
+
+确定性校验至少包括：
+
+- ID、数值、单位、时间和布尔状态逐项比对；
+- 否定词和复核状态一致；
+- source_refs 覆盖每个关键事实；
+- structured_facts 与自然语言没有相反含义；
+- 没有出现来源中不存在的新构件、病害或处治动作；
+- 摘要作用域不大于来源作用域；
+- restricted 内容没有被降级为低敏感级别。
+
+high/critical 摘要还需人工确认或使用经验证的字段级抽取流程。模型评审可以辅助发现问题，但不能代替确定性比对和人工责任。
+
+### 7.14.6 压缩失败
+
+摘要模型超时、输出不符合 Schema、字段校验失败或来源冲突时：
+
+1. 不写入不完整摘要；
+2. Context Pack 可退回短原文片段和来源引用；
+3. 超预算时减少结果数量，而不是伪造更短结论；
+4. 记录 compression_failed 和原因；
+5. high/critical 节点按策略进入人工复核。
+
+### 7.14.7 压缩版本
+
+每次压缩记录 summarizer_model_version、prompt_template_version、compression_policy_version、tokenizer_version 和 source_hash。任一版本变化都必须触发摘要回归评测；发现系统性失真时可以批量隔离受影响摘要并从来源重建。
+
 ## 7.15 项目上下文设计
+
+项目上下文用于把同一桥梁、道路或巡检合同下的稳定工作约定组织成可复用 Profile。
+
+### 7.15.1 Project Context Profile
+
+```python
+class ProjectContextProfile(BaseModel):
+    profile_id: str
+    project_id: str
+    organization_id: str
+    asset_refs: list[str]
+    component_alias_memory_ids: list[str]
+    terminology_memory_ids: list[str]
+    report_policy_memory_ids: list[str]
+    review_policy_memory_ids: list[str]
+    operational_memory_ids: list[str]
+    recent_task_summary_ids: list[str]
+    archived: bool
+    profile_version: str
+    as_of: datetime
+    source_snapshot_hash: str
+    schema_version: str = "project-context-profile.v1"
+```
+
+Profile 只保存有效记忆 ID 和业务实体引用，不复制桥梁、构件、病害和检测表。profile_version 变化会使相关 Context Pack 缓存失效。
+
+### 7.15.2 项目上下文内容
+
+| 类别 | 示例 | 权威来源 |
+|---|---|---|
+| 资产范围 | 本项目包含的桥梁、路线和检测区段 ID | 项目业务配置 |
+| 构件映射 | HG-03 在报告中的显示名称 | 人工复核或项目配置 |
+| 项目术语 | “桥面系 A 区”的项目内含义 | 项目配置 |
+| 报告规则 | 模板、章节、附件、命名和单位 | 项目交付配置 |
+| 复核规则 | 低置信度阈值、审批角色和签发流程 | 项目 Workflow 配置 |
+| 历史摘要 | 最近任务的确认修订和未决风险 | 任务记忆与复核 |
+| 运行经验 | 已验证设备、环境和模型限制 | 发布评测 |
+
+### 7.15.3 Profile 构建
+
+1. 读取项目及资产权限；
+2. 查询各类 active 项目记忆；
+3. 排除来源失效、冲突、撤销和待删除记录；
+4. 按配置版本、作用域和确认强度折叠；
+5. 绑定最近已完成任务摘要；
+6. 计算 source_snapshot_hash；
+7. 发布 Profile 版本和缓存失效事件。
+
+Profile 可以按需构建或在项目配置变化后预计算，但最终 Context Builder 仍需检查每条记忆的当前状态。
+
+### 7.15.4 多期巡检
+
+多期巡检不得把历史病害摘要当成本期检测结果。推荐分开提供：
+
+- historical_context：历史任务、修订、设备和报告规则；
+- current_business_facts：本期业务数据；
+- current_tool_results：本期 Tool 输出；
+- comparison_requests：需要对比的历史业务记录 ID；
+- review_constraints：必须人工判断的差异。
+
+Agent 只能基于专业 Tool 和业务服务输出完成趋势计算，Memory 负责提供历史任务如何组织和解释的线索。
+
+### 7.15.5 归档项目
+
+项目归档后：
+
+- 普通新任务不自动继承其项目记忆；
+- 获授权的历史查询可以按 as_of 构建 Profile；
+- 运行经验若需跨项目复用，必须脱敏并重新发布到 organization；
+- 项目重新启用时重新验证权限、来源、有效期和配置版本；
+- 删除策略独立于归档，不因归档自动物理删除。
 
 ## 7.16 任务记忆设计
 
+任务记忆服务于一个业务 task 的解释、交接、复盘和跨 thread 连续性。
+
+### 7.16.1 任务记忆内容
+
+- 原始目标和经确认的目标变更；
+- 已完成稳定节点和结果标识；
+- ToolResult、Artifact、RAG Result 和业务记录引用；
+- 人工复核项、结论和等待状态；
+- 重试、降级、补偿和未恢复异常；
+- 未决事项、依赖和下一步；
+- 任务完成摘要和可推广的项目候选。
+
+原始影像、完整 ToolResult、完整 Evidence Pack 和完整 Checkpoint 不进入任务记忆正文。
+
+### 7.16.2 Task Memory Snapshot
+
+```python
+class TaskMemorySnapshot(BaseModel):
+    task_memory_id: str
+    task_id: str
+    project_id: str
+    covered_run_ids: list[str]
+    covered_thread_ids: list[str]
+    stage_sequence: int
+    goal_version: str
+    completed_nodes: list[str]
+    result_refs: list[str]
+    review_refs: list[str]
+    open_items: list[str]
+    error_refs: list[str]
+    summary: str
+    source_event_range: tuple[int, int]
+    source_hash: str
+    validation_status: Literal["rule_validated", "human_confirmed"]
+    created_at: datetime
+    schema_version: str = "task-memory-snapshot.v1"
+```
+
+### 7.16.3 与 Checkpoint 的边界
+
+| 问题 | Checkpoint | 任务记忆 |
+|---|---|---|
+| 从哪个图节点恢复 | 权威 | 只引用 |
+| 节点内部 Channel 值 | 保存 | 不复制 |
+| 向交接人员解释进度 | 可辅助 | 主要用途 |
+| 跨 thread 汇总 | 不默认支持 | 支持 |
+| 人工复核结论来源 | 保存执行状态 | 保存 review_id 和摘要 |
+| 长期保留 | 按 Checkpoint 策略 | 按任务和项目策略 |
+| 项目后续任务复用 | 不直接 | 经提炼后可用 |
+
+恢复时先加载 Checkpoint 和 Workflow 业务状态，再读取任务记忆用于解释。任务记忆与 Checkpoint 不一致时，停止自动续跑并执行一致性检查。
+
+### 7.16.4 生成时机
+
+- 稳定节点完成后生成轻量阶段候选；
+- Interrupt 前生成交接摘要；
+- 人工复核完成后生成修订增量；
+- 重试耗尽或降级后记录原因；
+- 任务完成后生成最终任务摘要；
+- 项目归档前生成任务索引和保留决策。
+
+### 7.16.5 跨 thread
+
+同一 task 可以因恢复、分支试验或人工操作存在多个 thread。Task Memory Snapshot 按 task_id 聚合，但必须保存 covered_thread_ids 和 run_id。出现分支时：
+
+- 正式业务 run 由 workflow_runs 标识；
+- 调试或试验 thread 不进入生产任务记忆；
+- 多个正式 run 冲突时不自动合并；
+- 最终摘要以业务完成状态和人工复核为准。
+
+### 7.16.6 任务结束后的提炼
+
+任务完成不意味着全部任务记忆进入项目作用域。系统先生成项目候选：
+
+- 可复用项目术语和构件映射；
+- 已确认报告规则和人工修订；
+- 重复出现且有评测支持的失败模式；
+- 仍影响后续任务的未决风险。
+
+临时日志、一次性错误、原始对话和仅对本次运行有意义的状态继续保留在 task，按策略到期。
+
 ## 7.17 用户与组织偏好设计
+
+### 7.17.1 偏好分类
+
+| 类别 | 示例 | 风险下限 |
+|---|---|---|
+| 显示偏好 | 语言、日期格式、列表密度 | low |
+| 输出偏好 | Word/PDF、图表布局、文件名 | low |
+| 单位与术语 | mm、m、中文构件名 | medium |
+| 报告模板 | 模板 ID、章节顺序 | medium |
+| 通知偏好 | 站内、邮件、任务完成提醒 | low |
+| 复核配置 | 阈值、角色、审批步骤 | high，通常属于项目配置 |
+
+权限、敏感级别、安全策略、签发责任和设备控制不是普通偏好。
+
+### 7.17.2 来源
+
+偏好只能来自：
+
+- 用户明确设置；
+- 项目管理员发布的项目配置；
+- 组织管理员发布的默认配置；
+- 系统发布的产品默认值。
+
+模型可以建议“是否保存为偏好”，但不能根据一次表达自动建立长期个人画像。敏感属性、非业务兴趣和推断性个人信息不进入第一阶段。
+
+### 7.17.3 生效顺序
+
+```text
+System Mandatory Policy
+        ↓
+Current Task Explicit Instruction
+        ↓
+Project Configuration
+        ↓
+User Preference
+        ↓
+Organization Default
+        ↓
+Product Default
+```
+
+每个最终生效值保存 selected_source、selected_version、overridden_candidates 和 resolution_reason，便于解释为何采用该配置。
+
+### 7.17.4 有效偏好对象
+
+```python
+class EffectivePreference(BaseModel):
+    key: str
+    value: Any
+    selected_scope: Literal[
+        "task", "project", "user", "organization", "product"
+    ]
+    selected_source_id: str
+    selected_version: str
+    resolution_reason: str
+    valid_until: datetime | None = None
+    requires_review: bool = False
+```
+
+### 7.17.5 更正与撤销
+
+用户修改偏好时创建新版本并撤销旧版本的默认生效资格。删除用户偏好后，系统重新解析项目、组织和产品默认值，不保留隐藏副本继续影响输出。
+
+项目配置更新使相关 Context Pack 缓存失效。已经签发的历史报告继续引用当时的模板和配置版本，不因偏好变化自动重写。
+
+### 7.17.6 安全限制
+
+- 不保存密码、访问令牌、私钥和数据库连接串；
+- 不允许偏好扩大项目、知识或 Tool 权限；
+- 不允许偏好关闭 high/critical 人工复核；
+- 不允许偏好修改审计、保留和删除策略；
+- 不在日志中记录 restricted 偏好正文；
+- 通知地址等个人信息按最小化原则独立保护。
+
+### 7.17.7 组织级发布
+
+组织默认值和运行经验由获授权角色发布。个人偏好不得自动晋升为组织默认值。项目经验需要跨项目推广时，应完成脱敏、适用范围说明、评测和审批，并创建新的 organization 作用域 MemoryRecord。
 
 ## 7.18 反馈、冲突、更正与负向记忆
 
