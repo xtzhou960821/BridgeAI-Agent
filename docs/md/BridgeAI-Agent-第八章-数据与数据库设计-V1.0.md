@@ -4923,11 +4923,1371 @@ WHERE d.status = 'complete'
 
 ## 8.18 报告、引用、复核与签发模型
 
+报告是可重建的工程记录，不是一个可反复覆盖的 PDF 文件。`reports` 保存稳定业务身份和当前指针，`report_revisions` 固定生成时的 Workflow run、模型运行、知识发布和 Context Manifest；`report_items`、`report_citations` 和 `report_artifacts` 分别固定病害/Memory 修订、RAG 证据和对象字节版本。这些关系共同组成报告修订的不可变快照，不依赖“当前版本”查询来回放历史。
+
+```sql
+CREATE TABLE bridgeai_report.reports (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    report_code TEXT NOT NULL,
+    report_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    current_revision_id UUID,
+    current_revision_no INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_reports_organization FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_reports_project_scope FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT uq_reports_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_reports_project_code UNIQUE (organization_id, project_id, report_code),
+    CONSTRAINT ck_reports_code_nonblank CHECK (btrim(report_code) <> ''),
+    CONSTRAINT ck_reports_type_nonblank CHECK (btrim(report_type) <> ''),
+    CONSTRAINT ck_reports_title_nonblank CHECK (btrim(title) <> ''),
+    CONSTRAINT ck_reports_status
+        CHECK (status IN ('draft', 'in_review', 'issued', 'withdrawn', 'superseded')),
+    CONSTRAINT ck_reports_current_pair CHECK (
+        (current_revision_id IS NULL AND current_revision_no IS NULL)
+        OR (current_revision_id IS NOT NULL AND current_revision_no > 0)
+    ),
+    CONSTRAINT ck_reports_issued_pointer CHECK (
+        status IN ('draft', 'in_review') OR current_revision_id IS NOT NULL
+    ),
+    CONSTRAINT ck_reports_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_report.report_revisions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    report_id UUID NOT NULL,
+    revision_no INTEGER NOT NULL,
+    predecessor_revision_id UUID,
+    predecessor_revision_no INTEGER,
+    revision_status TEXT NOT NULL DEFAULT 'draft',
+    workflow_task_id UUID NOT NULL,
+    workflow_run_id UUID NOT NULL,
+    model_inference_run_id UUID NOT NULL,
+    knowledge_release_id UUID NOT NULL,
+    context_manifest_id UUID NOT NULL,
+    template_code TEXT NOT NULL,
+    template_version TEXT NOT NULL,
+    snapshot_schema_version TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    snapshot_manifest JSONB NOT NULL,
+    snapshot_manifest_sha256 TEXT NOT NULL,
+    change_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_report_revisions_organization FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_report_revisions_project_scope FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_report_revisions_report_scope
+        FOREIGN KEY (report_id, organization_id, project_id)
+        REFERENCES bridgeai_report.reports (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_report_revisions_workflow_run
+        FOREIGN KEY (workflow_run_id, organization_id, project_id, workflow_task_id)
+        REFERENCES bridgeai_workflow.workflow_runs
+                   (id, organization_id, project_id, task_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_report_revisions_model_run
+        FOREIGN KEY (model_inference_run_id, organization_id, project_id)
+        REFERENCES bridgeai_inspection.model_inference_runs
+                   (id, organization_id, project_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_report_revisions_knowledge_release
+        FOREIGN KEY (knowledge_release_id, organization_id, project_id)
+        REFERENCES bridgeai_knowledge.knowledge_releases
+                   (id, organization_id, project_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_report_revisions_context_manifest
+        FOREIGN KEY (context_manifest_id, organization_id, project_id)
+        REFERENCES bridgeai_memory.context_manifests
+                   (id, organization_id, project_id) ON DELETE RESTRICT,
+    CONSTRAINT uq_report_revisions_id_scope_report_revision
+        UNIQUE (id, organization_id, project_id, report_id, revision_no),
+    CONSTRAINT uq_report_revisions_report_revision
+        UNIQUE (organization_id, project_id, report_id, revision_no),
+    CONSTRAINT fk_report_revisions_predecessor_same_report
+        FOREIGN KEY (
+            predecessor_revision_id, organization_id, project_id,
+            report_id, predecessor_revision_no
+        ) REFERENCES bridgeai_report.report_revisions
+          (id, organization_id, project_id, report_id, revision_no)
+        DEFERRABLE INITIALLY IMMEDIATE,
+    CONSTRAINT ck_report_revisions_number_positive CHECK (revision_no > 0),
+    CONSTRAINT ck_report_revisions_predecessor_shape CHECK (
+        (revision_no = 1 AND predecessor_revision_id IS NULL
+         AND predecessor_revision_no IS NULL)
+        OR (revision_no > 1 AND predecessor_revision_id IS NOT NULL
+            AND predecessor_revision_no = revision_no - 1
+            AND predecessor_revision_id <> id)
+    ),
+    CONSTRAINT ck_report_revisions_status
+        CHECK (revision_status IN ('draft', 'ready', 'abandoned')),
+    CONSTRAINT ck_report_revisions_template_nonblank
+        CHECK (btrim(template_code) <> '' AND btrim(template_version) <> ''),
+    CONSTRAINT ck_report_revisions_schema_nonblank
+        CHECK (btrim(snapshot_schema_version) <> ''),
+    CONSTRAINT ck_report_revisions_content_sha256
+        CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_report_revisions_manifest_object
+        CHECK (jsonb_typeof(snapshot_manifest) = 'object'),
+    CONSTRAINT ck_report_revisions_manifest_sha256
+        CHECK (snapshot_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_report_revisions_change_reason CHECK (
+        revision_no = 1 OR (change_reason IS NOT NULL AND btrim(change_reason) <> '')
+    )
+);
+
+ALTER TABLE bridgeai_report.reports
+    ADD CONSTRAINT fk_reports_current_revision
+    FOREIGN KEY (current_revision_id, organization_id, project_id, id, current_revision_no)
+    REFERENCES bridgeai_report.report_revisions
+               (id, organization_id, project_id, report_id, revision_no)
+    ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
+
+CREATE TABLE bridgeai_report.report_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    report_id UUID NOT NULL,
+    report_revision_id UUID NOT NULL,
+    report_revision_no INTEGER NOT NULL,
+    ordinal_no INTEGER NOT NULL,
+    item_kind TEXT NOT NULL,
+    damage_observation_id UUID,
+    damage_revision_id UUID,
+    damage_revision_no INTEGER,
+    memory_id UUID,
+    memory_revision_id UUID,
+    item_payload JSONB NOT NULL,
+    item_sha256 TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_report_items_revision FOREIGN KEY (
+        report_revision_id, organization_id, project_id, report_id, report_revision_no
+    ) REFERENCES bridgeai_report.report_revisions
+      (id, organization_id, project_id, report_id, revision_no) ON DELETE RESTRICT,
+    CONSTRAINT fk_report_items_damage_revision FOREIGN KEY (
+        damage_revision_id, organization_id, project_id,
+        damage_observation_id, damage_revision_no
+    ) REFERENCES bridgeai_inspection.damage_revisions
+      (id, organization_id, project_id, observation_id, revision_no)
+      ON DELETE RESTRICT,
+    CONSTRAINT fk_report_items_memory_revision
+        FOREIGN KEY (memory_revision_id, organization_id, memory_id)
+        REFERENCES bridgeai_memory.memory_revisions (id, organization_id, memory_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_report_items_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_report_items_id_revision_scope
+        UNIQUE (id, organization_id, project_id, report_revision_id),
+    CONSTRAINT uq_report_items_ordinal
+        UNIQUE (organization_id, project_id, report_revision_id, ordinal_no),
+    CONSTRAINT ck_report_items_ordinal_nonnegative CHECK (ordinal_no >= 0),
+    CONSTRAINT ck_report_items_kind
+        CHECK (item_kind IN ('damage_revision', 'memory_revision', 'summary', 'table', 'figure')),
+    CONSTRAINT ck_report_items_target_shape CHECK (
+        (item_kind = 'damage_revision'
+         AND damage_observation_id IS NOT NULL AND damage_revision_id IS NOT NULL
+         AND damage_revision_no IS NOT NULL
+         AND memory_id IS NULL AND memory_revision_id IS NULL)
+        OR (item_kind = 'memory_revision'
+            AND memory_id IS NOT NULL AND memory_revision_id IS NOT NULL
+            AND damage_observation_id IS NULL AND damage_revision_id IS NULL
+            AND damage_revision_no IS NULL)
+        OR (item_kind IN ('summary', 'table', 'figure')
+            AND damage_observation_id IS NULL AND damage_revision_id IS NULL
+            AND damage_revision_no IS NULL
+            AND memory_id IS NULL AND memory_revision_id IS NULL)
+    ),
+    CONSTRAINT ck_report_items_payload_object CHECK (jsonb_typeof(item_payload) = 'object'),
+    CONSTRAINT ck_report_items_sha256 CHECK (item_sha256 ~ '^[0-9a-f]{64}$')
+);
+
+CREATE TABLE bridgeai_report.report_citations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    report_id UUID NOT NULL,
+    report_revision_id UUID NOT NULL,
+    report_revision_no INTEGER NOT NULL,
+    report_item_id UUID,
+    knowledge_citation_id UUID NOT NULL,
+    ordinal_no INTEGER NOT NULL,
+    claim_code TEXT NOT NULL,
+    knowledge_excerpt_sha256 TEXT NOT NULL,
+    citation_snapshot JSONB NOT NULL,
+    citation_snapshot_sha256 TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_report_citations_revision FOREIGN KEY (
+        report_revision_id, organization_id, project_id, report_id, report_revision_no
+    ) REFERENCES bridgeai_report.report_revisions
+      (id, organization_id, project_id, report_id, revision_no) ON DELETE RESTRICT,
+    CONSTRAINT fk_report_citations_item_scope
+        FOREIGN KEY (
+            report_item_id, organization_id, project_id, report_revision_id
+        ) REFERENCES bridgeai_report.report_items
+          (id, organization_id, project_id, report_revision_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_report_citations_knowledge_scope
+        FOREIGN KEY (knowledge_citation_id, organization_id, project_id)
+        REFERENCES bridgeai_knowledge.citations (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_report_citations_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_report_citations_ordinal
+        UNIQUE (organization_id, project_id, report_revision_id, ordinal_no),
+    CONSTRAINT uq_report_citations_claim_evidence
+        UNIQUE (report_revision_id, claim_code, knowledge_citation_id),
+    CONSTRAINT ck_report_citations_ordinal_nonnegative CHECK (ordinal_no >= 0),
+    CONSTRAINT ck_report_citations_claim_nonblank CHECK (btrim(claim_code) <> ''),
+    CONSTRAINT ck_report_citations_excerpt_sha256
+        CHECK (knowledge_excerpt_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_report_citations_snapshot_object
+        CHECK (jsonb_typeof(citation_snapshot) = 'object'),
+    CONSTRAINT ck_report_citations_snapshot_sha256
+        CHECK (citation_snapshot_sha256 ~ '^[0-9a-f]{64}$')
+);
+
+CREATE TABLE bridgeai_report.report_artifacts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    report_id UUID NOT NULL,
+    report_revision_id UUID NOT NULL,
+    report_revision_no INTEGER NOT NULL,
+    artifact_id UUID NOT NULL,
+    artifact_version_id UUID NOT NULL,
+    artifact_role TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_report_artifacts_revision FOREIGN KEY (
+        report_revision_id, organization_id, project_id, report_id, report_revision_no
+    ) REFERENCES bridgeai_report.report_revisions
+      (id, organization_id, project_id, report_id, revision_no) ON DELETE RESTRICT,
+    CONSTRAINT fk_report_artifacts_artifact_scope
+        FOREIGN KEY (artifact_id, organization_id, project_id)
+        REFERENCES bridgeai_core.artifacts (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_report_artifacts_artifact_version FOREIGN KEY (
+        artifact_version_id, organization_id, project_id, artifact_id
+    ) REFERENCES bridgeai_core.artifact_versions
+      (id, organization_id, project_id, artifact_id) ON DELETE RESTRICT,
+    CONSTRAINT uq_report_artifacts_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_report_artifacts_revision_version_role
+        UNIQUE (report_revision_id, artifact_version_id, artifact_role),
+    CONSTRAINT ck_report_artifacts_role
+        CHECK (artifact_role IN ('rendered_report', 'source', 'attachment', 'preview'))
+);
+
+CREATE TABLE bridgeai_report.report_signatures (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    report_id UUID NOT NULL,
+    report_revision_id UUID NOT NULL,
+    report_revision_no INTEGER NOT NULL,
+    signature_action TEXT NOT NULL,
+    signature_status TEXT NOT NULL DEFAULT 'valid',
+    content_sha256 TEXT NOT NULL,
+    signed_by UUID NOT NULL,
+    signing_membership_id UUID NOT NULL,
+    signer_role_code TEXT NOT NULL,
+    signed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    reason TEXT,
+    prior_signature_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT fk_report_signatures_revision FOREIGN KEY (
+        report_revision_id, organization_id, project_id, report_id, report_revision_no
+    ) REFERENCES bridgeai_report.report_revisions
+      (id, organization_id, project_id, report_id, revision_no) ON DELETE RESTRICT,
+    CONSTRAINT fk_report_signatures_user_scope FOREIGN KEY (signed_by, organization_id)
+        REFERENCES bridgeai_identity.users (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_report_signatures_membership_scope FOREIGN KEY (
+        signing_membership_id, organization_id, project_id
+    ) REFERENCES bridgeai_core.project_memberships
+      (id, organization_id, project_id) ON DELETE RESTRICT,
+    CONSTRAINT uq_report_signatures_id_revision_scope
+        UNIQUE (id, organization_id, project_id, report_revision_id),
+    CONSTRAINT fk_report_signatures_prior_same_revision FOREIGN KEY (
+        prior_signature_id, organization_id, project_id, report_revision_id
+    ) REFERENCES bridgeai_report.report_signatures
+      (id, organization_id, project_id, report_revision_id) ON DELETE RESTRICT,
+    CONSTRAINT ck_report_signatures_action CHECK (signature_action IN ('issue', 'withdraw')),
+    CONSTRAINT ck_report_signatures_status CHECK (signature_status = 'valid'),
+    CONSTRAINT ck_report_signatures_hash CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_report_signatures_role_nonblank CHECK (btrim(signer_role_code) <> ''),
+    CONSTRAINT ck_report_signatures_time CHECK (created_at >= signed_at),
+    CONSTRAINT ck_report_signatures_action_shape CHECK (
+        (signature_action = 'issue' AND prior_signature_id IS NULL AND reason IS NULL)
+        OR (signature_action = 'withdraw' AND prior_signature_id IS NOT NULL
+            AND reason IS NOT NULL AND btrim(reason) <> '')
+    )
+);
+
+CREATE UNIQUE INDEX uq_report_signatures_one_issue
+    ON bridgeai_report.report_signatures (report_revision_id)
+    WHERE signature_action = 'issue';
+
+CREATE UNIQUE INDEX uq_report_signatures_one_withdrawal
+    ON bridgeai_report.report_signatures (prior_signature_id)
+    WHERE signature_action = 'withdraw';
+```
+
+`memory_revisions` 的上游物理唯一键是 `(id, organization_id, memory_id)`，且组织/`user` 作用域的 `project_id` 合法为空；因此 `report_items` 不伪造一个不存在的 Memory 项目复合键。精确 Memory 修订由上述强外键固定，项目相容性由下列门禁再校验：只允许 `memory_records.project_id IS NULL` 或与报告项目相同。知识 `citation` 强外键固定原文版本和 Artifact；引用所属文档版本还必须存在于报告固定的 `knowledge_release` 中。
+
+```sql
+CREATE OR REPLACE FUNCTION bridgeai_report.validate_report_memory_item()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_report, bridgeai_memory
+AS $$
+DECLARE
+    v_memory_project_id UUID;
+BEGIN
+    IF NEW.item_kind = 'memory_revision' THEN
+        SELECT mr.project_id INTO STRICT v_memory_project_id
+        FROM bridgeai_memory.memory_records AS mr
+        WHERE mr.id = NEW.memory_id AND mr.organization_id = NEW.organization_id;
+        IF v_memory_project_id IS NOT NULL AND v_memory_project_id <> NEW.project_id THEN
+            RAISE EXCEPTION 'memory revision belongs to another project';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_report_items_validate_member
+BEFORE INSERT OR UPDATE ON bridgeai_report.report_items
+FOR EACH ROW EXECUTE FUNCTION bridgeai_report.validate_report_memory_item();
+
+CREATE OR REPLACE FUNCTION bridgeai_report.validate_report_citation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_report, bridgeai_knowledge
+AS $$
+DECLARE
+    v_release_id UUID;
+    v_document_version_id UUID;
+    v_excerpt_sha256 TEXT;
+BEGIN
+    SELECT rr.knowledge_release_id, kc.document_version_id, kc.excerpt_sha256
+      INTO STRICT v_release_id, v_document_version_id, v_excerpt_sha256
+    FROM bridgeai_report.report_revisions AS rr
+    JOIN bridgeai_knowledge.citations AS kc
+      ON kc.id = NEW.knowledge_citation_id
+     AND kc.organization_id = NEW.organization_id
+     AND kc.project_id = NEW.project_id
+    WHERE rr.id = NEW.report_revision_id
+      AND rr.organization_id = NEW.organization_id
+      AND rr.project_id = NEW.project_id;
+    IF v_excerpt_sha256 <> NEW.knowledge_excerpt_sha256 THEN
+        RAISE EXCEPTION 'citation excerpt hash does not match frozen knowledge citation';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM bridgeai_knowledge.publication_items AS pi
+        WHERE pi.release_id = v_release_id
+          AND pi.organization_id = NEW.organization_id
+          AND pi.project_id = NEW.project_id
+          AND pi.document_version_id = v_document_version_id
+    ) THEN
+        RAISE EXCEPTION 'citation document version is outside frozen knowledge release';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_report_citations_validate_member
+BEFORE INSERT OR UPDATE ON bridgeai_report.report_citations
+FOR EACH ROW EXECUTE FUNCTION bridgeai_report.validate_report_citation();
+
+REVOKE ALL ON FUNCTION bridgeai_report.validate_report_memory_item() FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_report.validate_report_citation() FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION bridgeai_report.reject_issued_snapshot_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_revision_id UUID;
+BEGIN
+    IF TG_TABLE_NAME = 'report_revisions' THEN
+        v_revision_id := OLD.id;
+    ELSE
+        v_revision_id := COALESCE(
+            (to_jsonb(OLD) ->> 'report_revision_id')::uuid,
+            (to_jsonb(NEW) ->> 'report_revision_id')::uuid
+        );
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM bridgeai_report.report_signatures
+        WHERE report_revision_id = v_revision_id AND signature_action = 'issue'
+    ) THEN
+        RAISE EXCEPTION 'issued report snapshot % is immutable', v_revision_id;
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END;
+$$;
+
+CREATE TRIGGER trg_report_revisions_freeze
+BEFORE UPDATE OR DELETE ON bridgeai_report.report_revisions
+FOR EACH ROW EXECUTE FUNCTION bridgeai_report.reject_issued_snapshot_change();
+CREATE TRIGGER trg_report_items_freeze
+BEFORE INSERT OR UPDATE OR DELETE ON bridgeai_report.report_items
+FOR EACH ROW EXECUTE FUNCTION bridgeai_report.reject_issued_snapshot_change();
+CREATE TRIGGER trg_report_citations_freeze
+BEFORE INSERT OR UPDATE OR DELETE ON bridgeai_report.report_citations
+FOR EACH ROW EXECUTE FUNCTION bridgeai_report.reject_issued_snapshot_change();
+CREATE TRIGGER trg_report_artifacts_freeze
+BEFORE INSERT OR UPDATE OR DELETE ON bridgeai_report.report_artifacts
+FOR EACH ROW EXECUTE FUNCTION bridgeai_report.reject_issued_snapshot_change();
+
+CREATE OR REPLACE FUNCTION bridgeai_report.validate_report_signature()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_report, bridgeai_core
+AS $$
+DECLARE
+    v_revision bridgeai_report.report_revisions%ROWTYPE;
+    v_prior bridgeai_report.report_signatures%ROWTYPE;
+BEGIN
+    SELECT * INTO STRICT v_revision
+    FROM bridgeai_report.report_revisions
+    WHERE id = NEW.report_revision_id
+      AND organization_id = NEW.organization_id
+      AND project_id = NEW.project_id
+    FOR UPDATE;
+    PERFORM 1 FROM bridgeai_report.reports
+    WHERE id = NEW.report_id AND organization_id = NEW.organization_id
+      AND project_id = NEW.project_id FOR UPDATE;
+    IF v_revision.revision_status <> 'ready' OR v_revision.content_sha256 <> NEW.content_sha256 THEN
+        RAISE EXCEPTION 'signature must bind the ready revision content hash';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM bridgeai_core.project_memberships AS pm
+        WHERE pm.id = NEW.signing_membership_id
+          AND pm.organization_id = NEW.organization_id
+          AND pm.project_id = NEW.project_id
+          AND pm.principal_type = 'user' AND pm.user_id = NEW.signed_by
+          AND pm.role_code = NEW.signer_role_code AND pm.status = 'active'
+          AND pm.valid_from <= NEW.signed_at
+          AND (pm.valid_to IS NULL OR pm.valid_to > NEW.signed_at)
+    ) THEN
+        RAISE EXCEPTION 'signer is not an active project member in the asserted role';
+    END IF;
+    IF NEW.signature_action = 'issue' THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM bridgeai_report.report_artifacts AS ra
+            JOIN bridgeai_core.artifact_versions AS av
+              ON av.id = ra.artifact_version_id
+             AND av.organization_id = ra.organization_id
+             AND av.project_id = ra.project_id
+             AND av.artifact_id = ra.artifact_id
+            WHERE ra.report_revision_id = NEW.report_revision_id
+              AND ra.artifact_role = 'rendered_report'
+              AND av.sha256 = NEW.content_sha256
+              AND av.status IN ('active', 'archived')
+        ) THEN
+            RAISE EXCEPTION 'issued revision requires a verified rendered Artifact with matching hash';
+        END IF;
+    ELSE
+        SELECT * INTO STRICT v_prior
+        FROM bridgeai_report.report_signatures
+        WHERE id = NEW.prior_signature_id
+          AND organization_id = NEW.organization_id
+          AND project_id = NEW.project_id
+          AND report_revision_id = NEW.report_revision_id;
+        IF v_prior.signature_action <> 'issue'
+           OR v_prior.content_sha256 <> NEW.content_sha256 THEN
+            RAISE EXCEPTION 'withdrawal must append to the matching issue signature';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_report_signatures_validate
+BEFORE INSERT ON bridgeai_report.report_signatures
+FOR EACH ROW EXECUTE FUNCTION bridgeai_report.validate_report_signature();
+
+CREATE OR REPLACE FUNCTION bridgeai_report.apply_report_signature()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_report
+AS $$
+BEGIN
+    UPDATE bridgeai_report.reports
+       SET status = CASE WHEN NEW.signature_action = 'issue' THEN 'issued' ELSE 'withdrawn' END,
+           current_revision_id = NEW.report_revision_id,
+           current_revision_no = NEW.report_revision_no,
+           updated_at = clock_timestamp(), updated_by = NEW.signed_by,
+           version = version + 1
+     WHERE id = NEW.report_id AND organization_id = NEW.organization_id
+       AND project_id = NEW.project_id;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_report_signatures_apply
+AFTER INSERT ON bridgeai_report.report_signatures
+FOR EACH ROW EXECUTE FUNCTION bridgeai_report.apply_report_signature();
+
+CREATE OR REPLACE FUNCTION bridgeai_report.reject_signature_rewrite()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'report signatures are append-only; append a withdrawal instead';
+END;
+$$;
+
+CREATE TRIGGER trg_report_signatures_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_report.report_signatures
+FOR EACH ROW EXECUTE FUNCTION bridgeai_report.reject_signature_rewrite();
+
+REVOKE ALL ON FUNCTION bridgeai_report.validate_report_signature() FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_report.apply_report_signature() FROM PUBLIC;
+```
+
+签发服务必须在同一 PostgreSQL 事务内锁定报告/修订行、插入 `issue` 签名、更新当前指针、写入 8.19 审计事件和 8.20 Outbox，然后提交。撤签插入指向原 `issue` 的 `withdraw` 记录；不更新或删除历史签名。再次签发必须创建新修订。
+
 ## 8.19 审计、安全事件与数据血缘
+
+审计域只保存“谁/哪个服务在什么作用域对哪个版本做了什么，结果如何”。密码、令牌、私钥、连接串、完整 Prompt、受限原文和大体积正文不得进入事件；只记录稳定标识、版本、有界摘要和 SHA-256。`occurred_at` 是业务事件时间，`server_recorded_at` 由数据库服务器写入，是审计排序和分区键。PostgreSQL 分区表的主键/唯一约束必须包含分区键，因此事件引用使用 `(id, server_recorded_at)`，不宣称跨分区 `id` 单列唯一。
+
+```sql
+CREATE TABLE bridgeai_audit.audit_events (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID,
+    actor_user_id UUID,
+    service_principal_id UUID,
+    action TEXT NOT NULL,
+    object_schema TEXT NOT NULL,
+    object_table TEXT NOT NULL,
+    object_id TEXT NOT NULL,
+    object_version TEXT,
+    result TEXT NOT NULL,
+    before_sha256 TEXT,
+    after_sha256 TEXT,
+    request_id TEXT NOT NULL,
+    trace_id TEXT NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    server_recorded_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    policy_version TEXT NOT NULL,
+    reason_code TEXT,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (id, server_recorded_at),
+    CONSTRAINT fk_audit_events_organization FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_audit_events_project_scope FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_audit_events_actor_scope FOREIGN KEY (actor_user_id, organization_id)
+        REFERENCES bridgeai_identity.users (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_audit_events_service_scope
+        FOREIGN KEY (service_principal_id, organization_id)
+        REFERENCES bridgeai_identity.service_principals (id, organization_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT ck_audit_events_subject_shape CHECK (
+        (actor_user_id IS NOT NULL)::integer
+        + (service_principal_id IS NOT NULL)::integer = 1
+    ),
+    CONSTRAINT ck_audit_events_names_nonblank CHECK (
+        btrim(action) <> '' AND btrim(object_schema) <> ''
+        AND btrim(object_table) <> '' AND btrim(object_id) <> ''
+    ),
+    CONSTRAINT ck_audit_events_result CHECK (result IN ('succeeded', 'denied', 'failed')),
+    CONSTRAINT ck_audit_events_hashes CHECK (
+        (before_sha256 IS NULL OR before_sha256 ~ '^[0-9a-f]{64}$')
+        AND (after_sha256 IS NULL OR after_sha256 ~ '^[0-9a-f]{64}$')
+    ),
+    CONSTRAINT ck_audit_events_correlation_nonblank
+        CHECK (btrim(request_id) <> '' AND btrim(trace_id) <> ''),
+    CONSTRAINT ck_audit_events_policy_nonblank CHECK (btrim(policy_version) <> ''),
+    CONSTRAINT ck_audit_events_details_safe CHECK (
+        jsonb_typeof(details) = 'object'
+        AND octet_length(details::text) <= 8192
+        AND NOT details ?| ARRAY[
+            'password', 'token', 'access_token', 'refresh_token', 'private_key',
+            'connection_string', 'prompt', 'full_prompt', 'body', 'content'
+        ]
+    )
+) PARTITION BY RANGE (server_recorded_at);
+
+CREATE TABLE bridgeai_audit.audit_events_default
+    PARTITION OF bridgeai_audit.audit_events DEFAULT;
+
+CREATE TABLE bridgeai_audit.data_access_events (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID,
+    actor_user_id UUID,
+    service_principal_id UUID,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    access_action TEXT NOT NULL,
+    purpose_code TEXT NOT NULL,
+    result TEXT NOT NULL,
+    row_count BIGINT,
+    bytes_returned BIGINT,
+    request_id TEXT NOT NULL,
+    trace_id TEXT NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    server_recorded_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    policy_version TEXT NOT NULL,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (id, server_recorded_at),
+    CONSTRAINT fk_data_access_events_organization FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_data_access_events_project_scope FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_data_access_events_actor_scope FOREIGN KEY (actor_user_id, organization_id)
+        REFERENCES bridgeai_identity.users (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_data_access_events_service_scope
+        FOREIGN KEY (service_principal_id, organization_id)
+        REFERENCES bridgeai_identity.service_principals (id, organization_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT ck_data_access_events_subject_shape CHECK (
+        (actor_user_id IS NOT NULL)::integer
+        + (service_principal_id IS NOT NULL)::integer = 1
+    ),
+    CONSTRAINT ck_data_access_events_names_nonblank CHECK (
+        btrim(resource_type) <> '' AND btrim(resource_id) <> ''
+        AND btrim(access_action) <> '' AND btrim(purpose_code) <> ''
+    ),
+    CONSTRAINT ck_data_access_events_result CHECK (result IN ('allowed', 'denied', 'failed')),
+    CONSTRAINT ck_data_access_events_counts CHECK (
+        (row_count IS NULL OR row_count >= 0) AND (bytes_returned IS NULL OR bytes_returned >= 0)
+    ),
+    CONSTRAINT ck_data_access_events_correlation_nonblank
+        CHECK (btrim(request_id) <> '' AND btrim(trace_id) <> ''),
+    CONSTRAINT ck_data_access_events_policy_nonblank CHECK (btrim(policy_version) <> ''),
+    CONSTRAINT ck_data_access_events_details_safe CHECK (
+        jsonb_typeof(details) = 'object' AND octet_length(details::text) <= 4096
+        AND NOT details ?| ARRAY['password', 'token', 'prompt', 'body', 'content']
+    )
+) PARTITION BY RANGE (server_recorded_at);
+
+CREATE TABLE bridgeai_audit.data_access_events_default
+    PARTITION OF bridgeai_audit.data_access_events DEFAULT;
+
+CREATE TABLE bridgeai_audit.security_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID,
+    audit_event_id UUID,
+    audit_server_recorded_at TIMESTAMPTZ,
+    actor_user_id UUID,
+    service_principal_id UUID,
+    event_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    detection_source TEXT NOT NULL,
+    resource_type TEXT,
+    resource_id TEXT,
+    disposition TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    trace_id TEXT NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    server_recorded_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    evidence_sha256 TEXT,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT fk_security_events_organization FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_security_events_project_scope FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_security_events_audit_event
+        FOREIGN KEY (audit_event_id, audit_server_recorded_at)
+        REFERENCES bridgeai_audit.audit_events (id, server_recorded_at)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_security_events_actor_scope FOREIGN KEY (actor_user_id, organization_id)
+        REFERENCES bridgeai_identity.users (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_security_events_service_scope
+        FOREIGN KEY (service_principal_id, organization_id)
+        REFERENCES bridgeai_identity.service_principals (id, organization_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT ck_security_events_audit_pair CHECK (
+        (audit_event_id IS NULL) = (audit_server_recorded_at IS NULL)
+    ),
+    CONSTRAINT ck_security_events_subject_present CHECK (
+        actor_user_id IS NOT NULL OR service_principal_id IS NOT NULL
+    ),
+    CONSTRAINT ck_security_events_type_nonblank
+        CHECK (btrim(event_type) <> '' AND btrim(detection_source) <> ''),
+    CONSTRAINT ck_security_events_severity CHECK (severity IN ('info', 'low', 'medium', 'high', 'critical')),
+    CONSTRAINT ck_security_events_disposition
+        CHECK (disposition IN ('observed', 'blocked', 'quarantined', 'investigating', 'resolved')),
+    CONSTRAINT ck_security_events_correlation_nonblank
+        CHECK (btrim(request_id) <> '' AND btrim(trace_id) <> ''),
+    CONSTRAINT ck_security_events_evidence_sha256
+        CHECK (evidence_sha256 IS NULL OR evidence_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_security_events_details_safe CHECK (
+        jsonb_typeof(details) = 'object' AND octet_length(details::text) <= 8192
+        AND NOT details ?| ARRAY['password', 'token', 'prompt', 'body', 'content']
+    )
+);
+
+CREATE TABLE bridgeai_audit.retention_executions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID,
+    policy_code TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_version TEXT,
+    target_sha256 TEXT,
+    action TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    legal_hold_checked BOOLEAN NOT NULL DEFAULT false,
+    shared_reference_count INTEGER,
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    requested_by UUID NOT NULL,
+    executed_by_service_id UUID,
+    failure_code TEXT,
+    result_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_retention_executions_organization FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_retention_executions_project_scope FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_retention_executions_requester FOREIGN KEY (requested_by, organization_id)
+        REFERENCES bridgeai_identity.users (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_retention_executions_worker
+        FOREIGN KEY (executed_by_service_id, organization_id)
+        REFERENCES bridgeai_identity.service_principals (id, organization_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT ck_retention_executions_names_nonblank CHECK (
+        btrim(policy_code) <> '' AND btrim(policy_version) <> ''
+        AND btrim(target_type) <> '' AND btrim(target_id) <> ''
+    ),
+    CONSTRAINT ck_retention_executions_sha256
+        CHECK (target_sha256 IS NULL OR target_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_retention_executions_action
+        CHECK (action IN ('archive', 'revoke', 'delete_derived', 'delete_object', 'tombstone')),
+    CONSTRAINT ck_retention_executions_status
+        CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'blocked')),
+    CONSTRAINT ck_retention_executions_reference_count
+        CHECK (shared_reference_count IS NULL OR shared_reference_count >= 0),
+    CONSTRAINT ck_retention_executions_result_object
+        CHECK (jsonb_typeof(result_summary) = 'object' AND octet_length(result_summary::text) <= 8192),
+    CONSTRAINT ck_retention_executions_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_audit.lineage_edges (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    source_type TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    source_sha256 TEXT,
+    source_artifact_id UUID,
+    source_artifact_version_id UUID,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_version TEXT NOT NULL,
+    target_sha256 TEXT,
+    target_artifact_id UUID,
+    target_artifact_version_id UUID,
+    relation_type TEXT NOT NULL,
+    transformation_code TEXT,
+    transformation_version TEXT,
+    workflow_run_id UUID,
+    workflow_task_id UUID,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    server_recorded_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    created_by_service_id UUID NOT NULL,
+    CONSTRAINT fk_lineage_edges_organization FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_lineage_edges_project_scope FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_lineage_edges_source_artifact FOREIGN KEY (
+        source_artifact_version_id, organization_id, project_id, source_artifact_id
+    ) REFERENCES bridgeai_core.artifact_versions
+      (id, organization_id, project_id, artifact_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_lineage_edges_target_artifact FOREIGN KEY (
+        target_artifact_version_id, organization_id, project_id, target_artifact_id
+    ) REFERENCES bridgeai_core.artifact_versions
+      (id, organization_id, project_id, artifact_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_lineage_edges_workflow_run FOREIGN KEY (
+        workflow_run_id, organization_id, project_id, workflow_task_id
+    ) REFERENCES bridgeai_workflow.workflow_runs
+      (id, organization_id, project_id, task_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_lineage_edges_service_scope
+        FOREIGN KEY (created_by_service_id, organization_id)
+        REFERENCES bridgeai_identity.service_principals (id, organization_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_lineage_edges_identity UNIQUE (
+        organization_id, project_id, source_type, source_id, source_version,
+        target_type, target_id, target_version, relation_type
+    ),
+    CONSTRAINT ck_lineage_edges_names_nonblank CHECK (
+        btrim(source_type) <> '' AND btrim(source_id) <> '' AND btrim(source_version) <> ''
+        AND btrim(target_type) <> '' AND btrim(target_id) <> '' AND btrim(target_version) <> ''
+    ),
+    CONSTRAINT ck_lineage_edges_hashes CHECK (
+        (source_sha256 IS NULL OR source_sha256 ~ '^[0-9a-f]{64}$')
+        AND (target_sha256 IS NULL OR target_sha256 ~ '^[0-9a-f]{64}$')
+    ),
+    CONSTRAINT ck_lineage_edges_artifact_shape CHECK (
+        ((source_type = 'artifact_version')
+         = (source_artifact_id IS NOT NULL AND source_artifact_version_id IS NOT NULL))
+        AND ((target_type = 'artifact_version')
+         = (target_artifact_id IS NOT NULL AND target_artifact_version_id IS NOT NULL))
+    ),
+    CONSTRAINT ck_lineage_edges_workflow_pair
+        CHECK ((workflow_run_id IS NULL) = (workflow_task_id IS NULL)),
+    CONSTRAINT ck_lineage_edges_relation
+        CHECK (relation_type IN ('derived_from', 'rendered_from', 'cites', 'transformed_from', 'supersedes')),
+    CONSTRAINT ck_lineage_edges_transform_pair CHECK (
+        (transformation_code IS NULL) = (transformation_version IS NULL)
+    )
+);
+
+CREATE OR REPLACE FUNCTION bridgeai_audit.reject_event_rewrite()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION '% is append-only', TG_TABLE_NAME;
+END;
+$$;
+
+CREATE TRIGGER trg_audit_events_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_audit.audit_events
+FOR EACH ROW EXECUTE FUNCTION bridgeai_audit.reject_event_rewrite();
+CREATE TRIGGER trg_data_access_events_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_audit.data_access_events
+FOR EACH ROW EXECUTE FUNCTION bridgeai_audit.reject_event_rewrite();
+CREATE TRIGGER trg_security_events_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_audit.security_events
+FOR EACH ROW EXECUTE FUNCTION bridgeai_audit.reject_event_rewrite();
+CREATE TRIGGER trg_lineage_edges_append_only
+BEFORE UPDATE OR DELETE ON bridgeai_audit.lineage_edges
+FOR EACH ROW EXECUTE FUNCTION bridgeai_audit.reject_event_rewrite();
+```
+
+`lineage_edges` 的两端可以是多种领域对象，不可用单个多态 UUID 伪造强外键。Artifact 端有稳定键形时使用强组合外键；其余 `type/id/version/hash` 由领域写入器在同一事务内校验，并由血缘核对任务周期解析。无法解析的边记为完整性异常，不得对外声称已由数据库证明。
 
 ## 8.20 事务、并发、幂等与 Outbox
 
+普通 CRUD 使用 PostgreSQL `READ COMMITTED`；修改带 `version` 的可变聚合时使用 `UPDATE ... WHERE id = $1 AND version = $2`，影响行数为零即返回乐观冲突。报告签发、知识发布和当前修订切换必须先 `SELECT ... FOR UPDATE` 锁定聚合；只有在跨多聚合不变式确实无法用行锁表达时，才在受控入口使用 `SERIALIZABLE` 并对 `40001` 限次、全抖动重试。
+
+```sql
+CREATE TABLE bridgeai_core.idempotency_requests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    operation_code TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'in_progress',
+    response_code TEXT,
+    response_sha256 TEXT,
+    result_artifact_id UUID,
+    result_artifact_version_id UUID,
+    failure_code TEXT,
+    locked_by TEXT,
+    locked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    completed_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT fk_idempotency_requests_organization FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_idempotency_requests_project_scope FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_idempotency_requests_result_artifact FOREIGN KEY (
+        result_artifact_version_id, organization_id, project_id, result_artifact_id
+    ) REFERENCES bridgeai_core.artifact_versions
+      (id, organization_id, project_id, artifact_id) ON DELETE RESTRICT,
+    CONSTRAINT uq_idempotency_requests_scope_key
+        UNIQUE (organization_id, project_id, operation_code, idempotency_key),
+    CONSTRAINT ck_idempotency_requests_names_nonblank
+        CHECK (btrim(operation_code) <> '' AND btrim(idempotency_key) <> ''),
+    CONSTRAINT ck_idempotency_requests_request_sha256
+        CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_idempotency_requests_status CHECK (
+        status IN ('in_progress', 'succeeded', 'failed_retryable', 'failed_terminal')
+    ),
+    CONSTRAINT ck_idempotency_requests_response_sha256
+        CHECK (response_sha256 IS NULL OR response_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_idempotency_requests_artifact_pair
+        CHECK ((result_artifact_id IS NULL) = (result_artifact_version_id IS NULL)),
+    CONSTRAINT ck_idempotency_requests_terminal_shape CHECK (
+        (status = 'in_progress' AND completed_at IS NULL)
+        OR (status <> 'in_progress' AND completed_at IS NOT NULL)
+    ),
+    CONSTRAINT ck_idempotency_requests_failure_shape CHECK (
+        (status LIKE 'failed_%' AND failure_code IS NOT NULL AND btrim(failure_code) <> '')
+        OR (status NOT LIKE 'failed_%' AND failure_code IS NULL)
+    ),
+    CONSTRAINT ck_idempotency_requests_expiry CHECK (expires_at > created_at)
+);
+
+CREATE OR REPLACE FUNCTION bridgeai_core.register_idempotency_request(
+    p_organization_id UUID,
+    p_project_id UUID,
+    p_operation_code TEXT,
+    p_idempotency_key TEXT,
+    p_request_sha256 TEXT,
+    p_expires_at TIMESTAMPTZ
+) RETURNS bridgeai_core.idempotency_requests
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core
+AS $$
+DECLARE
+    v_request bridgeai_core.idempotency_requests%ROWTYPE;
+BEGIN
+    IF p_organization_id IS DISTINCT FROM
+       NULLIF(current_setting('app.organization_id', true), '')::uuid
+       OR p_project_id IS DISTINCT FROM
+       NULLIF(current_setting('app.project_id', true), '')::uuid THEN
+        RAISE EXCEPTION 'idempotency scope differs from trusted transaction context';
+    END IF;
+    IF p_request_sha256 !~ '^[0-9a-f]{64}$' THEN
+        RAISE EXCEPTION 'request hash must be lowercase SHA-256';
+    END IF;
+    INSERT INTO bridgeai_core.idempotency_requests (
+        organization_id, project_id, operation_code, idempotency_key,
+        request_sha256, expires_at
+    ) VALUES (
+        p_organization_id, p_project_id, p_operation_code, p_idempotency_key,
+        p_request_sha256, p_expires_at
+    ) ON CONFLICT (organization_id, project_id, operation_code, idempotency_key)
+      DO NOTHING
+    RETURNING * INTO v_request;
+
+    IF FOUND THEN
+        RETURN v_request;
+    END IF;
+    SELECT * INTO STRICT v_request
+      FROM bridgeai_core.idempotency_requests
+     WHERE organization_id = p_organization_id AND project_id = p_project_id
+       AND operation_code = p_operation_code AND idempotency_key = p_idempotency_key
+     FOR UPDATE;
+    IF v_request.request_sha256 <> p_request_sha256 THEN
+        RAISE EXCEPTION 'idempotency key reused with a different request hash'
+            USING ERRCODE = '22000';
+    END IF;
+    RETURN v_request;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION bridgeai_core.protect_idempotency_identity()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF ROW(NEW.organization_id, NEW.project_id, NEW.operation_code,
+           NEW.idempotency_key, NEW.request_sha256)
+       IS DISTINCT FROM
+       ROW(OLD.organization_id, OLD.project_id, OLD.operation_code,
+           OLD.idempotency_key, OLD.request_sha256) THEN
+        RAISE EXCEPTION 'idempotency request identity and hash are immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_idempotency_requests_identity
+BEFORE UPDATE ON bridgeai_core.idempotency_requests
+FOR EACH ROW EXECUTE FUNCTION bridgeai_core.protect_idempotency_identity();
+
+REVOKE ALL ON FUNCTION bridgeai_core.register_idempotency_request(
+    UUID, UUID, TEXT, TEXT, TEXT, TIMESTAMPTZ
+) FROM PUBLIC;
+
+CREATE TABLE bridgeai_core.outbox_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    aggregate_type TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL,
+    aggregate_version TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_schema_version TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 8,
+    available_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    locked_by TEXT,
+    locked_at TIMESTAMPTZ,
+    last_error_code TEXT,
+    last_error_summary TEXT,
+    published_at TIMESTAMPTZ,
+    dead_lettered_at TIMESTAMPTZ,
+    replay_of_event_id UUID,
+    replay_requested_by UUID,
+    replay_requested_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT fk_outbox_events_organization FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_outbox_events_project_scope FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_outbox_events_replay_source FOREIGN KEY (
+        replay_of_event_id, organization_id, project_id
+    ) REFERENCES bridgeai_core.outbox_events (id, organization_id, project_id)
+      ON DELETE RESTRICT,
+    CONSTRAINT fk_outbox_events_replay_actor FOREIGN KEY (replay_requested_by, organization_id)
+        REFERENCES bridgeai_identity.users (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT uq_outbox_events_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_outbox_events_idempotency
+        UNIQUE (organization_id, project_id, idempotency_key),
+    CONSTRAINT ck_outbox_events_names_nonblank CHECK (
+        btrim(aggregate_type) <> '' AND btrim(aggregate_id) <> ''
+        AND btrim(aggregate_version) <> '' AND btrim(event_type) <> ''
+        AND btrim(event_schema_version) <> '' AND btrim(idempotency_key) <> ''
+    ),
+    CONSTRAINT ck_outbox_events_payload_object CHECK (jsonb_typeof(payload) = 'object'),
+    CONSTRAINT ck_outbox_events_status
+        CHECK (status IN ('pending', 'processing', 'retry', 'published', 'dead_letter')),
+    CONSTRAINT ck_outbox_events_attempts
+        CHECK (attempt_count >= 0 AND max_attempts > 0 AND attempt_count <= max_attempts),
+    CONSTRAINT ck_outbox_events_lock_shape CHECK (
+        (status = 'processing' AND locked_by IS NOT NULL AND btrim(locked_by) <> ''
+         AND locked_at IS NOT NULL)
+        OR (status <> 'processing' AND locked_by IS NULL AND locked_at IS NULL)
+    ),
+    CONSTRAINT ck_outbox_events_terminal_shape CHECK (
+        (status = 'published' AND published_at IS NOT NULL AND dead_lettered_at IS NULL)
+        OR (status = 'dead_letter' AND dead_lettered_at IS NOT NULL AND published_at IS NULL)
+        OR (status NOT IN ('published', 'dead_letter')
+            AND published_at IS NULL AND dead_lettered_at IS NULL)
+    ),
+    CONSTRAINT ck_outbox_events_error_shape CHECK (
+        status NOT IN ('retry', 'dead_letter')
+        OR (last_error_code IS NOT NULL AND btrim(last_error_code) <> ''
+            AND last_error_summary IS NOT NULL AND btrim(last_error_summary) <> '')
+    ),
+    CONSTRAINT ck_outbox_events_replay_shape CHECK (
+        (replay_of_event_id IS NULL AND replay_requested_by IS NULL
+         AND replay_requested_at IS NULL)
+        OR (replay_of_event_id IS NOT NULL AND replay_requested_by IS NOT NULL
+            AND replay_requested_at IS NOT NULL AND replay_of_event_id <> id)
+    )
+);
+
+CREATE INDEX ix_outbox_events_claim
+    ON bridgeai_core.outbox_events (available_at, created_at, id)
+    WHERE status IN ('pending', 'retry');
+
+CREATE OR REPLACE FUNCTION bridgeai_core.enforce_outbox_transition()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF ROW(NEW.organization_id, NEW.project_id, NEW.aggregate_type, NEW.aggregate_id,
+           NEW.aggregate_version, NEW.event_type, NEW.event_schema_version,
+           NEW.payload, NEW.idempotency_key, NEW.max_attempts,
+           NEW.replay_of_event_id, NEW.replay_requested_by,
+           NEW.replay_requested_at, NEW.created_at)
+       IS DISTINCT FROM
+       ROW(OLD.organization_id, OLD.project_id, OLD.aggregate_type, OLD.aggregate_id,
+           OLD.aggregate_version, OLD.event_type, OLD.event_schema_version,
+           OLD.payload, OLD.idempotency_key, OLD.max_attempts,
+           OLD.replay_of_event_id, OLD.replay_requested_by,
+           OLD.replay_requested_at, OLD.created_at) THEN
+        RAISE EXCEPTION 'outbox event identity and payload are immutable';
+    END IF;
+    IF OLD.status <> NEW.status AND NOT (
+        (OLD.status IN ('pending', 'retry') AND NEW.status = 'processing')
+        OR (OLD.status = 'processing' AND NEW.status IN ('retry', 'published', 'dead_letter'))
+    ) THEN
+        RAISE EXCEPTION 'invalid outbox transition: % -> %', OLD.status, NEW.status;
+    END IF;
+    IF NEW.attempt_count < OLD.attempt_count
+       OR NEW.attempt_count > OLD.attempt_count + 1 THEN
+        RAISE EXCEPTION 'invalid outbox attempt change';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_outbox_events_transition
+BEFORE UPDATE ON bridgeai_core.outbox_events
+FOR EACH ROW EXECUTE FUNCTION bridgeai_core.enforce_outbox_transition();
+```
+
+Worker 每次 Claim 在一个短事务内执行下列语句，提交后才调用 Qdrant、MinIO、Redis 或模型。`SKIP LOCKED` 使多 Worker 不会领取同一行；`attempt_count` 在领取时递增，不允许无界重试。
+
+```sql
+WITH candidates AS (
+    SELECT id
+    FROM bridgeai_core.outbox_events
+    WHERE organization_id = $1 AND project_id = $2
+      AND status IN ('pending', 'retry')
+      AND available_at <= clock_timestamp()
+      AND attempt_count < max_attempts
+    ORDER BY available_at, created_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT $3
+)
+UPDATE bridgeai_core.outbox_events AS e
+   SET status = 'processing',
+       attempt_count = e.attempt_count + 1,
+       locked_by = $4,
+       locked_at = clock_timestamp()
+  FROM candidates AS c
+ WHERE e.id = c.id
+RETURNING e.*;
+
+-- 可重试失败：使用有界指数退避，达到上限即死信。
+UPDATE bridgeai_core.outbox_events
+   SET status = CASE WHEN attempt_count >= max_attempts
+                     THEN 'dead_letter' ELSE 'retry' END,
+       available_at = clock_timestamp()
+           + LEAST(INTERVAL '1 hour', INTERVAL '5 seconds' * power(2, attempt_count - 1)),
+       locked_by = NULL, locked_at = NULL,
+       last_error_code = $2, last_error_summary = left($3, 1000),
+       dead_lettered_at = CASE WHEN attempt_count >= max_attempts
+                              THEN clock_timestamp() ELSE NULL END
+ WHERE id = $1 AND status = 'processing';
+```
+
+重放不将死信行改回 `pending`，而是经授权后新建 Outbox 行，设置 `replay_of_event_id`、新幂等键和重放人/时间，从而保留原失败证据。Lease Reaper 只把超时 `processing` 转为 `retry/dead_letter`，不执行业务补偿。核对任务按 `aggregate_type/id/version + event_type` 比较 PostgreSQL 权威状态、Outbox 终态和外部派生版本。
+
+### 8.20.1 跨存储创建与激活
+
+```text
+1. 客户端向受控临时键写入 staged object
+2. Artifact Worker 读回字节并校验 sha256/size/media_type；不匹配即隔离
+3. PostgreSQL 事务：登记 verified Artifact version + 业务引用 + Outbox
+4. 提交后 Worker 按 outbox_id 幂等执行对象激活/向量索引/缓存失效
+5. PostgreSQL 短事务回写派生资源 ID、版本、哈希和 Outbox published
+6. 核对通过后，只将权威记录切换为 active/ready
+```
+
+对象写成功而第 3 步失败时，临时键仍不可读，由 orphan 清理任务按哈希和宽限期删除；第 3 步成功而第 4/5 步失败时，保留权威记录与 Outbox 重试，不伪称索引已就绪。索引已写而回写失败时，Worker 用 outbox_id/派生版本查询并收敛，不再生成第二个 Point。
+
+### 8.20.2 撤销、删除与墓碑
+
+```text
+1. PostgreSQL 事务：先 revoke/deleting，令新读取失败，写审计 + Outbox
+2. Worker 删除 Qdrant Point/派生索引和 Redis 缓存
+3. 核对法定保留、legal hold 和全部强/受控引用
+4. 只在共享 Artifact 的合法引用计数为 0 时删除指定对象版本
+5. PostgreSQL 保留无正文的 tombstone：对象 ID、原哈希、依据、执行人、时间和受影响引用
+```
+
+任意外部步骤失败都保持权威记录不可读，进入有界重试/死信并告警，不得因补偿失败自动恢复 `active`。数据库事务内禁止同步调用 Qdrant、MinIO、Redis 或模型；PostgreSQL 与这些系统是最终一致，不是分布式强一致事务。
+
 ## 8.21 RLS、数据库角色与权限隔离
+
+数据库角色按职责分离，业务连接不使用表所有者、超级用户或 `BYPASSRLS` 角色。所有角色都是无登录组角色；具体 LOGIN 角色由部署层按环境授予，凭据不进入迁移文件。
+
+| 角色 | 职责 | 明确边界 |
+|---|---|---|
+| `bridgeai_migration_owner` | 执行审核后的 DDL、持有 Schema/表 | `NOLOGIN`，不用于应用流量 |
+| `bridgeai_app_rw` | 项目业务读写 | `NOBYPASSRLS`，不得 DDL，不得改审计/签名历史 |
+| `bridgeai_readonly` | 受权项目查询/报表 | `NOBYPASSRLS`，不读安全证据原始字段 |
+| `bridgeai_index_worker` | Claim Outbox，维护派生索引状态 | 无报告签发、用户或审计管理权 |
+| `bridgeai_audit_writer` | 追加审计/访问/安全/血缘事件 | 只 `INSERT`，不 `UPDATE/DELETE` |
+| `bridgeai_backup_restore` | 受控备份和恢复演练 | 无常驻 LOGIN，作业结束即撤销成员资格 |
+| `bridgeai_break_glass` | 紧急运维 | 可 `BYPASSRLS` 但 `NOLOGIN`，双人授权、限时、全程审计 |
+
+```sql
+DO $$
+DECLARE
+    v_role TEXT;
+    v_bypass BOOLEAN;
+BEGIN
+    FOREACH v_role IN ARRAY ARRAY[
+        'bridgeai_migration_owner', 'bridgeai_app_rw', 'bridgeai_readonly',
+        'bridgeai_index_worker', 'bridgeai_audit_writer', 'bridgeai_backup_restore',
+        'bridgeai_break_glass'
+    ] LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
+            v_bypass := v_role IN ('bridgeai_backup_restore', 'bridgeai_break_glass');
+            EXECUTE format(
+                'CREATE ROLE %I NOLOGIN NOINHERIT %s',
+                v_role, CASE WHEN v_bypass THEN 'BYPASSRLS' ELSE 'NOBYPASSRLS' END
+            );
+        END IF;
+    END LOOP;
+END;
+$$;
+
+ALTER TABLE bridgeai_report.reports OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_report.report_revisions OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_report.report_items OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_report.report_citations OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_report.report_artifacts OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_report.report_signatures OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_audit.audit_events OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_audit.audit_events_default OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_audit.data_access_events OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_audit.data_access_events_default OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_audit.security_events OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_audit.retention_executions OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_audit.lineage_edges OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_core.idempotency_requests OWNER TO bridgeai_migration_owner;
+ALTER TABLE bridgeai_core.outbox_events OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_report.validate_report_signature()
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_report.apply_report_signature()
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_report.validate_report_memory_item()
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_report.validate_report_citation()
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.register_idempotency_request(
+    UUID, UUID, TEXT, TEXT, TEXT, TIMESTAMPTZ
+) OWNER TO bridgeai_migration_owner;
+
+REVOKE ALL ON SCHEMA bridgeai_identity, bridgeai_core, bridgeai_asset,
+    bridgeai_inspection, bridgeai_workflow, bridgeai_knowledge,
+    bridgeai_memory, bridgeai_report, bridgeai_audit FROM PUBLIC;
+REVOKE ALL ON ALL TABLES IN SCHEMA bridgeai_report, bridgeai_audit FROM PUBLIC;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA bridgeai_report, bridgeai_audit FROM PUBLIC;
+
+GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core, bridgeai_inspection,
+    bridgeai_workflow, bridgeai_knowledge, bridgeai_memory, bridgeai_report,
+    bridgeai_audit TO bridgeai_migration_owner;
+GRANT SELECT ON bridgeai_core.project_memberships,
+    bridgeai_core.artifact_versions, bridgeai_memory.memory_records,
+    bridgeai_knowledge.citations, bridgeai_knowledge.publication_items
+    TO bridgeai_migration_owner;
+GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core, bridgeai_inspection,
+    bridgeai_workflow, bridgeai_knowledge, bridgeai_memory, bridgeai_report
+    TO bridgeai_app_rw, bridgeai_readonly;
+GRANT USAGE ON SCHEMA bridgeai_core, bridgeai_report
+    TO bridgeai_index_worker;
+GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core, bridgeai_audit
+    TO bridgeai_audit_writer;
+
+GRANT SELECT, INSERT, UPDATE ON bridgeai_report.reports,
+    bridgeai_report.report_revisions, bridgeai_report.report_items,
+    bridgeai_report.report_citations, bridgeai_report.report_artifacts
+    TO bridgeai_app_rw;
+GRANT SELECT, INSERT ON bridgeai_report.report_signatures TO bridgeai_app_rw;
+GRANT SELECT ON ALL TABLES IN SCHEMA bridgeai_report TO bridgeai_readonly;
+GRANT SELECT ON bridgeai_core.outbox_events TO bridgeai_index_worker;
+GRANT UPDATE (
+    status, attempt_count, available_at, locked_by, locked_at,
+    last_error_code, last_error_summary, published_at, dead_lettered_at
+) ON bridgeai_core.outbox_events TO bridgeai_index_worker;
+GRANT INSERT ON bridgeai_audit.audit_events, bridgeai_audit.data_access_events,
+    bridgeai_audit.security_events, bridgeai_audit.lineage_edges
+    TO bridgeai_audit_writer;
+
+GRANT EXECUTE ON FUNCTION bridgeai_core.register_idempotency_request(
+    UUID, UUID, TEXT, TEXT, TEXT, TIMESTAMPTZ
+) TO bridgeai_app_rw;
+```
+
+认证网关在开始业务事务后使用 `set_config(..., true)`（等价于 `SET LOCAL`）写入组织、项目、actor 类型和 actor ID；值来自已验证会话/服务身份，绝不直接采信 API 请求字段。每次归还连接前必须 `ROLLBACK`，连接池 checkout 再执行 `RESET ALL`；缺少任一上下文时 Policy 默认拒绝。
+
+```sql
+BEGIN;
+SELECT set_config('app.organization_id', $1, true);
+SELECT set_config('app.project_id',      $2, true);
+SELECT set_config('app.actor_type',      $3, true); -- user | service_principal
+SELECT set_config('app.actor_id',        $4, true);
+-- 业务 SQL
+COMMIT;
+```
+
+```sql
+CREATE OR REPLACE FUNCTION bridgeai_core.has_project_access(
+    p_organization_id UUID,
+    p_project_id UUID,
+    p_write BOOLEAN DEFAULT false
+) RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core
+AS $$
+    SELECT
+        p_organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+        AND p_project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+        AND EXISTS (
+            SELECT 1
+            FROM bridgeai_core.project_memberships AS pm
+            WHERE pm.organization_id = p_organization_id
+              AND pm.project_id = p_project_id
+              AND pm.status = 'active'
+              AND pm.valid_from <= statement_timestamp()
+              AND (pm.valid_to IS NULL OR pm.valid_to > statement_timestamp())
+              AND (
+                  (NULLIF(current_setting('app.actor_type', true), '') = 'user'
+                   AND pm.principal_type = 'user'
+                   AND pm.user_id = NULLIF(current_setting('app.actor_id', true), '')::uuid)
+                  OR
+                  (NULLIF(current_setting('app.actor_type', true), '') = 'service_principal'
+                   AND pm.principal_type = 'service_principal'
+                   AND pm.service_principal_id =
+                       NULLIF(current_setting('app.actor_id', true), '')::uuid)
+              )
+              AND (NOT p_write OR pm.role_code IN (
+                  'project_admin', 'inspector', 'reviewer', 'report_issuer', 'service_writer'
+              ))
+        );
+$$;
+
+ALTER FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN)
+    OWNER TO bridgeai_migration_owner;
+REVOKE ALL ON FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN)
+    TO bridgeai_app_rw, bridgeai_readonly, bridgeai_index_worker, bridgeai_audit_writer;
+
+ALTER TABLE bridgeai_core.projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_core.projects FORCE ROW LEVEL SECURITY;
+CREATE POLICY projects_org_isolation ON bridgeai_core.projects
+    USING (
+        organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+        AND bridgeai_core.has_project_access(organization_id, id, false)
+    )
+    WITH CHECK (
+        organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+        AND bridgeai_core.has_project_access(organization_id, id, true)
+    );
+
+ALTER TABLE bridgeai_report.reports ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_report.reports FORCE ROW LEVEL SECURITY;
+CREATE POLICY reports_project_isolation ON bridgeai_report.reports
+    USING (bridgeai_core.has_project_access(organization_id, project_id, false))
+    WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true));
+
+ALTER TABLE bridgeai_report.report_revisions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_report.report_revisions FORCE ROW LEVEL SECURITY;
+CREATE POLICY report_revisions_project_isolation ON bridgeai_report.report_revisions
+    USING (bridgeai_core.has_project_access(organization_id, project_id, false))
+    WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true));
+
+ALTER TABLE bridgeai_core.idempotency_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_core.idempotency_requests FORCE ROW LEVEL SECURITY;
+CREATE POLICY idempotency_requests_project_isolation
+    ON bridgeai_core.idempotency_requests
+    USING (bridgeai_core.has_project_access(organization_id, project_id, false))
+    WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true));
+
+ALTER TABLE bridgeai_core.outbox_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_core.outbox_events FORCE ROW LEVEL SECURITY;
+CREATE POLICY outbox_events_project_worker ON bridgeai_core.outbox_events
+    USING (bridgeai_core.has_project_access(organization_id, project_id, true))
+    WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true));
+
+ALTER TABLE bridgeai_audit.audit_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_audit.audit_events FORCE ROW LEVEL SECURITY;
+CREATE POLICY audit_events_append_scope ON bridgeai_audit.audit_events
+    FOR INSERT WITH CHECK (
+        organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+        AND (project_id IS NULL
+             OR bridgeai_core.has_project_access(organization_id, project_id, false))
+    );
+```
+
+生产应对其余含 `organization_id/project_id` 的表按同一模板同时 `ENABLE` 和 `FORCE ROW LEVEL SECURITY`；本节给出组织根表、报告、幂等、Outbox 和追加审计的代表性 Policy。RLS 是纵深防御，不替代服务层的操作、状态、敏感级别、用途和签发角色检查。迁移验收必须查询 `pg_class.relrowsecurity/relforcerowsecurity`、`pg_policy`、`pg_roles.rolbypassrls` 和 `information_schema.role_table_grants`，不能仅检查 SQL 文本。
+
+任何 `SECURITY DEFINER` 函数都必须由不登录所有者持有，固定只含 `pg_catalog` 和所需 Schema 的 `search_path`，所有对象使用 Schema 限定名，并在授予指定角色前先 `REVOKE ... FROM PUBLIC`。不得在函数中拼接请求提供的 SQL、表名或 `search_path`。
 
 ## 8.22 索引、查询与空间检索优化
 
