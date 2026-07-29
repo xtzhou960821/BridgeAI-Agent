@@ -4926,6 +4926,11 @@ WHERE d.status = 'complete'
 报告是可重建的工程记录，不是一个可反复覆盖的 PDF 文件。`reports` 保存稳定业务身份和当前指针，`report_revisions` 固定生成时的 Workflow run、模型运行、知识发布和 Context Manifest；`report_items`、`report_citations` 和 `report_artifacts` 分别固定病害/Memory 修订、RAG 证据和对象字节版本。这些关系共同组成报告修订的不可变快照，不依赖“当前版本”查询来回放历史。
 
 ```sql
+-- Context Manifest 必须以同一 Task/Run 身份被报告修订引用，不允许只按项目误绑。
+ALTER TABLE bridgeai_memory.context_manifests
+    ADD CONSTRAINT uq_context_manifests_report_binding
+    UNIQUE (id, organization_id, project_id, task_id, run_id);
+
 CREATE TABLE bridgeai_report.reports (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     organization_id UUID NOT NULL,
@@ -5006,9 +5011,13 @@ CREATE TABLE bridgeai_report.report_revisions (
         REFERENCES bridgeai_knowledge.knowledge_releases
                    (id, organization_id, project_id) ON DELETE RESTRICT,
     CONSTRAINT fk_report_revisions_context_manifest
-        FOREIGN KEY (context_manifest_id, organization_id, project_id)
+        FOREIGN KEY (
+            context_manifest_id, organization_id, project_id,
+            workflow_task_id, workflow_run_id
+        )
         REFERENCES bridgeai_memory.context_manifests
-                   (id, organization_id, project_id) ON DELETE RESTRICT,
+                   (id, organization_id, project_id, task_id, run_id)
+        ON DELETE RESTRICT,
     CONSTRAINT uq_report_revisions_id_scope_report_revision
         UNIQUE (id, organization_id, project_id, report_id, revision_no),
     CONSTRAINT uq_report_revisions_report_revision
@@ -5320,13 +5329,15 @@ DECLARE
     v_revision_id UUID;
 BEGIN
     IF TG_TABLE_NAME = 'report_revisions' THEN
-        v_revision_id := OLD.id;
+        v_revision_id := COALESCE(OLD.id, NEW.id);
     ELSE
         v_revision_id := COALESCE(
             (to_jsonb(OLD) ->> 'report_revision_id')::uuid,
             (to_jsonb(NEW) ->> 'report_revision_id')::uuid
         );
     END IF;
+    -- 修订、子项和签发共用同一事务级锁；先到者决定快照边界。
+    PERFORM pg_advisory_xact_lock(hashtextextended(v_revision_id::text, 0));
     IF EXISTS (
         SELECT 1 FROM bridgeai_report.report_signatures
         WHERE report_revision_id = v_revision_id AND signature_action = 'issue'
@@ -5338,7 +5349,7 @@ END;
 $$;
 
 CREATE TRIGGER trg_report_revisions_freeze
-BEFORE UPDATE OR DELETE ON bridgeai_report.report_revisions
+BEFORE INSERT OR UPDATE OR DELETE ON bridgeai_report.report_revisions
 FOR EACH ROW EXECUTE FUNCTION bridgeai_report.reject_issued_snapshot_change();
 CREATE TRIGGER trg_report_items_freeze
 BEFORE INSERT OR UPDATE OR DELETE ON bridgeai_report.report_items
@@ -5350,16 +5361,75 @@ CREATE TRIGGER trg_report_artifacts_freeze
 BEFORE INSERT OR UPDATE OR DELETE ON bridgeai_report.report_artifacts
 FOR EACH ROW EXECUTE FUNCTION bridgeai_report.reject_issued_snapshot_change();
 
+CREATE OR REPLACE FUNCTION bridgeai_report.compute_snapshot_manifest(p_revision_id UUID)
+RETURNS JSONB
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_report, bridgeai_core
+AS $$
+    SELECT jsonb_build_object(
+        'items', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+                'id', ri.id, 'ordinal_no', ri.ordinal_no,
+                'item_kind', ri.item_kind, 'item_sha256', ri.item_sha256
+            ) ORDER BY ri.ordinal_no, ri.id)
+            FROM bridgeai_report.report_items AS ri
+            WHERE ri.report_revision_id = p_revision_id
+        ), '[]'::jsonb),
+        'citations', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+                'id', rc.id, 'ordinal_no', rc.ordinal_no,
+                'claim_code', rc.claim_code,
+                'knowledge_citation_id', rc.knowledge_citation_id,
+                'knowledge_excerpt_sha256', rc.knowledge_excerpt_sha256,
+                'citation_snapshot_sha256', rc.citation_snapshot_sha256
+            ) ORDER BY rc.ordinal_no, rc.id)
+            FROM bridgeai_report.report_citations AS rc
+            WHERE rc.report_revision_id = p_revision_id
+        ), '[]'::jsonb),
+        'artifacts', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+                'id', ra.id, 'artifact_role', ra.artifact_role,
+                'artifact_id', ra.artifact_id,
+                'artifact_version_id', ra.artifact_version_id,
+                'sha256', av.sha256
+            ) ORDER BY ra.artifact_role, ra.id)
+            FROM bridgeai_report.report_artifacts AS ra
+            JOIN bridgeai_core.artifact_versions AS av
+              ON av.id = ra.artifact_version_id
+             AND av.organization_id = ra.organization_id
+             AND av.project_id = ra.project_id
+             AND av.artifact_id = ra.artifact_id
+            WHERE ra.report_revision_id = p_revision_id
+        ), '[]'::jsonb)
+    );
+$$;
+
 CREATE OR REPLACE FUNCTION bridgeai_report.validate_report_signature()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, bridgeai_report, bridgeai_core
+SET search_path = pg_catalog, bridgeai_report, bridgeai_core, bridgeai_identity
 AS $$
 DECLARE
     v_revision bridgeai_report.report_revisions%ROWTYPE;
     v_prior bridgeai_report.report_signatures%ROWTYPE;
+    v_actor_id UUID;
+    v_manifest JSONB;
 BEGIN
+    IF current_user <> 'bridgeai_migration_owner' THEN
+        RAISE EXCEPTION 'direct report signature insert is forbidden';
+    END IF;
+    IF current_setting('app.actor_type', true) IS DISTINCT FROM 'user' THEN
+        RAISE EXCEPTION 'only a trusted user context may sign reports';
+    END IF;
+    v_actor_id := NULLIF(current_setting('app.actor_id', true), '')::uuid;
+    IF v_actor_id IS NULL OR v_actor_id <> NEW.signed_by THEN
+        RAISE EXCEPTION 'signature actor must be derived from trusted session context';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended(NEW.report_revision_id::text, 0));
     SELECT * INTO STRICT v_revision
     FROM bridgeai_report.report_revisions
     WHERE id = NEW.report_revision_id
@@ -5369,16 +5439,31 @@ BEGIN
     PERFORM 1 FROM bridgeai_report.reports
     WHERE id = NEW.report_id AND organization_id = NEW.organization_id
       AND project_id = NEW.project_id FOR UPDATE;
-    IF v_revision.revision_status <> 'ready' OR v_revision.content_sha256 <> NEW.content_sha256 THEN
+    v_manifest := bridgeai_report.compute_snapshot_manifest(NEW.report_revision_id);
+    IF v_revision.revision_status <> 'ready'
+       OR v_revision.content_sha256 <> NEW.content_sha256
+       OR v_revision.snapshot_manifest <> v_manifest
+       OR v_revision.snapshot_manifest_sha256 <>
+          encode(public.digest(convert_to(v_manifest::text, 'UTF8'), 'sha256'), 'hex') THEN
         RAISE EXCEPTION 'signature must bind the ready revision content hash';
     END IF;
+    NEW.signed_at := clock_timestamp();
+    NEW.created_at := NEW.signed_at;
     IF NOT EXISTS (
         SELECT 1 FROM bridgeai_core.project_memberships AS pm
+        JOIN bridgeai_identity.users AS u
+          ON u.id = pm.user_id AND u.organization_id = pm.organization_id
+        JOIN bridgeai_identity.organization_memberships AS om
+          ON om.organization_id = pm.organization_id AND om.user_id = pm.user_id
         WHERE pm.id = NEW.signing_membership_id
           AND pm.organization_id = NEW.organization_id
           AND pm.project_id = NEW.project_id
           AND pm.principal_type = 'user' AND pm.user_id = NEW.signed_by
-          AND pm.role_code = NEW.signer_role_code AND pm.status = 'active'
+          AND pm.role_code = NEW.signer_role_code
+          AND pm.role_code IN ('report_issuer', 'project_admin')
+          AND pm.status = 'active' AND u.status = 'active' AND om.status = 'active'
+          AND om.valid_from <= NEW.signed_at
+          AND (om.valid_to IS NULL OR om.valid_to > NEW.signed_at)
           AND pm.valid_from <= NEW.signed_at
           AND (pm.valid_to IS NULL OR pm.valid_to > NEW.signed_at)
     ) THEN
@@ -5419,28 +5504,212 @@ CREATE TRIGGER trg_report_signatures_validate
 BEFORE INSERT ON bridgeai_report.report_signatures
 FOR EACH ROW EXECUTE FUNCTION bridgeai_report.validate_report_signature();
 
-CREATE OR REPLACE FUNCTION bridgeai_report.apply_report_signature()
-RETURNS TRIGGER
+CREATE OR REPLACE FUNCTION bridgeai_report.issue_report_revision(p_revision_id UUID)
+RETURNS UUID
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, bridgeai_report
+SET search_path = pg_catalog, bridgeai_report, bridgeai_core, bridgeai_identity
 AS $$
+DECLARE
+    v_revision bridgeai_report.report_revisions%ROWTYPE;
+    v_actor_id UUID;
+    v_membership bridgeai_core.project_memberships%ROWTYPE;
+    v_signature_id UUID;
+    v_manifest JSONB;
 BEGIN
+    IF current_setting('app.actor_type', true) IS DISTINCT FROM 'user' THEN
+        RAISE EXCEPTION 'only a user may issue a report';
+    END IF;
+    v_actor_id := NULLIF(current_setting('app.actor_id', true), '')::uuid;
+    IF v_actor_id IS NULL THEN RAISE EXCEPTION 'missing trusted actor context'; END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended(p_revision_id::text, 0));
+    SELECT * INTO STRICT v_revision
+      FROM bridgeai_report.report_revisions
+     WHERE id = p_revision_id FOR UPDATE;
+    PERFORM 1 FROM bridgeai_report.reports
+     WHERE id = v_revision.report_id
+       AND organization_id = v_revision.organization_id
+       AND project_id = v_revision.project_id FOR UPDATE;
+
+    IF v_revision.organization_id::text <> current_setting('app.organization_id', true)
+       OR v_revision.project_id::text <> current_setting('app.project_id', true) THEN
+        RAISE EXCEPTION 'report revision is outside trusted tenant context';
+    END IF;
+    SELECT pm.* INTO STRICT v_membership
+      FROM bridgeai_core.project_memberships AS pm
+      JOIN bridgeai_identity.users AS u
+        ON u.id = pm.user_id AND u.organization_id = pm.organization_id
+      JOIN bridgeai_identity.organization_memberships AS om
+        ON om.organization_id = pm.organization_id AND om.user_id = pm.user_id
+     WHERE pm.organization_id = v_revision.organization_id
+       AND pm.project_id = v_revision.project_id
+       AND pm.principal_type = 'user' AND pm.user_id = v_actor_id
+       AND pm.status = 'active' AND pm.role_code IN ('report_issuer', 'project_admin')
+       AND u.status = 'active' AND om.status = 'active'
+       AND om.valid_from <= clock_timestamp()
+       AND (om.valid_to IS NULL OR om.valid_to > clock_timestamp())
+       AND pm.valid_from <= clock_timestamp()
+       AND (pm.valid_to IS NULL OR pm.valid_to > clock_timestamp());
+
+    SELECT id INTO v_signature_id
+      FROM bridgeai_report.report_signatures
+     WHERE report_revision_id = p_revision_id AND signature_action = 'issue';
+    IF v_signature_id IS NOT NULL THEN RETURN v_signature_id; END IF;
+
+    v_manifest := bridgeai_report.compute_snapshot_manifest(p_revision_id);
+    IF v_revision.revision_status <> 'ready'
+       OR v_revision.snapshot_manifest <> v_manifest
+       OR v_revision.snapshot_manifest_sha256 <>
+          encode(public.digest(convert_to(v_manifest::text, 'UTF8'), 'sha256'), 'hex') THEN
+        RAISE EXCEPTION 'stored report snapshot no longer matches all frozen children';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM bridgeai_report.report_artifacts AS ra
+        JOIN bridgeai_core.artifact_versions AS av
+          ON av.id = ra.artifact_version_id
+         AND av.organization_id = ra.organization_id
+         AND av.project_id = ra.project_id AND av.artifact_id = ra.artifact_id
+        WHERE ra.report_revision_id = p_revision_id
+          AND ra.artifact_role = 'rendered_report'
+          AND av.sha256 = v_revision.content_sha256
+          AND av.status IN ('active', 'archived')
+    ) THEN
+        RAISE EXCEPTION 'verified rendered artifact does not match report content hash';
+    END IF;
+
+    INSERT INTO bridgeai_report.report_signatures (
+        organization_id, project_id, report_id, report_revision_id,
+        report_revision_no, signature_action, content_sha256, signed_by,
+        signing_membership_id, signer_role_code
+    ) VALUES (
+        v_revision.organization_id, v_revision.project_id, v_revision.report_id,
+        v_revision.id, v_revision.revision_no, 'issue', v_revision.content_sha256,
+        v_actor_id, v_membership.id, v_membership.role_code
+    ) RETURNING id INTO v_signature_id;
+
     UPDATE bridgeai_report.reports
-       SET status = CASE WHEN NEW.signature_action = 'issue' THEN 'issued' ELSE 'withdrawn' END,
-           current_revision_id = NEW.report_revision_id,
-           current_revision_no = NEW.report_revision_no,
-           updated_at = clock_timestamp(), updated_by = NEW.signed_by,
-           version = version + 1
-     WHERE id = NEW.report_id AND organization_id = NEW.organization_id
-       AND project_id = NEW.project_id;
-    RETURN NEW;
+       SET status = 'issued', current_revision_id = v_revision.id,
+           current_revision_no = v_revision.revision_no,
+           updated_at = clock_timestamp(), updated_by = v_actor_id, version = version + 1
+     WHERE id = v_revision.report_id;
+    INSERT INTO bridgeai_audit.audit_events (
+        organization_id, project_id, actor_user_id, action, object_schema,
+        object_table, object_id, object_version, result, request_id, trace_id,
+        occurred_at, policy_version, after_sha256, details
+    ) VALUES (
+        v_revision.organization_id, v_revision.project_id, v_actor_id,
+        'report.issue', 'bridgeai_report', 'reports', v_revision.report_id::text,
+        v_revision.revision_no::text, 'succeeded',
+        COALESCE(NULLIF(current_setting('app.request_id', true), ''),
+                 'report-issue:' || v_signature_id::text),
+        COALESCE(NULLIF(current_setting('app.trace_id', true), ''),
+                 'report-issue:' || v_signature_id::text),
+        clock_timestamp(), 'report-signature-v1', v_revision.content_sha256,
+        jsonb_build_object('revision_id', v_revision.id,
+                           'signature_id', v_signature_id)
+    );
+    PERFORM bridgeai_core.enqueue_outbox_event(
+        v_revision.organization_id, v_revision.project_id, 'report',
+        v_revision.report_id::text, v_revision.revision_no::text, 'report.issued', '1',
+        jsonb_build_object('report_id', v_revision.report_id,
+                           'revision_id', v_revision.id,
+                           'signature_id', v_signature_id),
+        'report.issue:' || v_revision.id::text, 8
+    );
+    RETURN v_signature_id;
 END;
 $$;
 
-CREATE TRIGGER trg_report_signatures_apply
-AFTER INSERT ON bridgeai_report.report_signatures
-FOR EACH ROW EXECUTE FUNCTION bridgeai_report.apply_report_signature();
+CREATE OR REPLACE FUNCTION bridgeai_report.withdraw_report_revision(
+    p_issue_signature_id UUID, p_reason TEXT
+) RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_report, bridgeai_core, bridgeai_identity
+AS $$
+DECLARE
+    v_issue bridgeai_report.report_signatures%ROWTYPE;
+    v_actor_id UUID;
+    v_membership bridgeai_core.project_memberships%ROWTYPE;
+    v_signature_id UUID;
+BEGIN
+    IF current_setting('app.actor_type', true) IS DISTINCT FROM 'user'
+       OR p_reason IS NULL OR btrim(p_reason) = '' THEN
+        RAISE EXCEPTION 'withdrawal requires a trusted user and nonblank reason';
+    END IF;
+    v_actor_id := NULLIF(current_setting('app.actor_id', true), '')::uuid;
+    SELECT * INTO STRICT v_issue FROM bridgeai_report.report_signatures
+     WHERE id = p_issue_signature_id AND signature_action = 'issue';
+    PERFORM pg_advisory_xact_lock(hashtextextended(v_issue.report_revision_id::text, 0));
+    PERFORM 1 FROM bridgeai_report.reports WHERE id = v_issue.report_id FOR UPDATE;
+    IF v_issue.organization_id::text <> current_setting('app.organization_id', true)
+       OR v_issue.project_id::text <> current_setting('app.project_id', true) THEN
+        RAISE EXCEPTION 'signature is outside trusted tenant context';
+    END IF;
+    SELECT pm.* INTO STRICT v_membership
+      FROM bridgeai_core.project_memberships AS pm
+      JOIN bridgeai_identity.users AS u
+        ON u.id = pm.user_id AND u.organization_id = pm.organization_id
+      JOIN bridgeai_identity.organization_memberships AS om
+        ON om.organization_id = pm.organization_id AND om.user_id = pm.user_id
+     WHERE pm.organization_id = v_issue.organization_id
+       AND pm.project_id = v_issue.project_id
+       AND pm.principal_type = 'user' AND pm.user_id = v_actor_id
+       AND pm.status = 'active' AND pm.role_code IN ('report_issuer', 'project_admin')
+       AND u.status = 'active' AND om.status = 'active'
+       AND om.valid_from <= clock_timestamp()
+       AND (om.valid_to IS NULL OR om.valid_to > clock_timestamp())
+       AND pm.valid_from <= clock_timestamp()
+       AND (pm.valid_to IS NULL OR pm.valid_to > clock_timestamp());
+    IF EXISTS (SELECT 1 FROM bridgeai_report.report_signatures
+               WHERE prior_signature_id = p_issue_signature_id) THEN
+        RAISE EXCEPTION 'issue signature is already withdrawn';
+    END IF;
+    INSERT INTO bridgeai_report.report_signatures (
+        organization_id, project_id, report_id, report_revision_id,
+        report_revision_no, signature_action, content_sha256, signed_by,
+        signing_membership_id, signer_role_code, reason, prior_signature_id
+    ) VALUES (
+        v_issue.organization_id, v_issue.project_id, v_issue.report_id,
+        v_issue.report_revision_id, v_issue.report_revision_no, 'withdraw',
+        v_issue.content_sha256, v_actor_id, v_membership.id,
+        v_membership.role_code, p_reason, v_issue.id
+    ) RETURNING id INTO v_signature_id;
+    UPDATE bridgeai_report.reports
+       SET status = 'withdrawn', current_revision_id = v_issue.report_revision_id,
+           current_revision_no = v_issue.report_revision_no,
+           updated_at = clock_timestamp(), updated_by = v_actor_id, version = version + 1
+     WHERE id = v_issue.report_id;
+    INSERT INTO bridgeai_audit.audit_events (
+        organization_id, project_id, actor_user_id, action, object_schema,
+        object_table, object_id, object_version, result, request_id, trace_id,
+        occurred_at, policy_version, before_sha256, details
+    ) VALUES (
+        v_issue.organization_id, v_issue.project_id, v_actor_id,
+        'report.withdraw', 'bridgeai_report', 'reports', v_issue.report_id::text,
+        v_issue.report_revision_no::text, 'succeeded',
+        COALESCE(NULLIF(current_setting('app.request_id', true), ''),
+                 'report-withdraw:' || v_signature_id::text),
+        COALESCE(NULLIF(current_setting('app.trace_id', true), ''),
+                 'report-withdraw:' || v_signature_id::text),
+        clock_timestamp(), 'report-signature-v1', v_issue.content_sha256,
+        jsonb_build_object('revision_id', v_issue.report_revision_id,
+                           'signature_id', v_signature_id,
+                           'prior_signature_id', v_issue.id)
+    );
+    PERFORM bridgeai_core.enqueue_outbox_event(
+        v_issue.organization_id, v_issue.project_id, 'report', v_issue.report_id,
+        v_issue.report_revision_no::text, 'report.withdrawn', '1',
+        jsonb_build_object('report_id', v_issue.report_id,
+                           'revision_id', v_issue.report_revision_id,
+                           'signature_id', v_signature_id,
+                           'prior_signature_id', v_issue.id),
+        'report.withdraw:' || v_issue.id::text, 8
+    );
+    RETURN v_signature_id;
+END;
+$$;
 
 CREATE OR REPLACE FUNCTION bridgeai_report.reject_signature_rewrite()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -5453,17 +5722,112 @@ CREATE TRIGGER trg_report_signatures_append_only
 BEFORE UPDATE OR DELETE ON bridgeai_report.report_signatures
 FOR EACH ROW EXECUTE FUNCTION bridgeai_report.reject_signature_rewrite();
 
+CREATE OR REPLACE FUNCTION bridgeai_report.assert_report_signature_state()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_report
+AS $$
+DECLARE
+    v_report bridgeai_report.reports%ROWTYPE;
+    v_latest bridgeai_report.report_signatures%ROWTYPE;
+    v_report_id UUID;
+BEGIN
+    IF TG_TABLE_NAME = 'reports' THEN
+        v_report_id := NEW.id;
+    ELSE
+        v_report_id := NEW.report_id;
+    END IF;
+    SELECT * INTO STRICT v_report FROM bridgeai_report.reports WHERE id = v_report_id;
+    SELECT * INTO v_latest FROM bridgeai_report.report_signatures
+     WHERE report_id = v_report_id
+     ORDER BY signed_at DESC, id DESC LIMIT 1;
+    IF v_report.status IN ('draft', 'in_review') THEN
+        IF v_latest.id IS NOT NULL THEN
+            RAISE EXCEPTION 'unsigned report state cannot have a signature history';
+        END IF;
+    ELSIF v_report.status = 'issued' THEN
+        IF v_latest.id IS NULL OR v_latest.signature_action <> 'issue'
+           OR v_report.current_revision_id <> v_latest.report_revision_id
+           OR v_report.current_revision_no <> v_latest.report_revision_no THEN
+            RAISE EXCEPTION 'issued report pointer must match its latest issue signature';
+        END IF;
+    ELSIF v_report.status IN ('withdrawn', 'superseded') THEN
+        IF v_latest.id IS NULL OR v_latest.signature_action <> 'withdraw'
+           OR v_report.current_revision_id <> v_latest.report_revision_id
+           OR v_report.current_revision_no <> v_latest.report_revision_no THEN
+            RAISE EXCEPTION 'withdrawn report pointer must match its latest withdrawal';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER trg_reports_signature_state
+AFTER INSERT OR UPDATE ON bridgeai_report.reports
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION bridgeai_report.assert_report_signature_state();
+CREATE CONSTRAINT TRIGGER trg_signatures_report_state
+AFTER INSERT ON bridgeai_report.report_signatures
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION bridgeai_report.assert_report_signature_state();
+
 REVOKE ALL ON FUNCTION bridgeai_report.validate_report_signature() FROM PUBLIC;
-REVOKE ALL ON FUNCTION bridgeai_report.apply_report_signature() FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_report.compute_snapshot_manifest(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_report.issue_report_revision(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_report.withdraw_report_revision(UUID, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_report.assert_report_signature_state() FROM PUBLIC;
 ```
 
-签发服务必须在同一 PostgreSQL 事务内锁定报告/修订行、插入 `issue` 签名、更新当前指针、写入 8.19 审计事件和 8.20 Outbox，然后提交。撤签插入指向原 `issue` 的 `withdraw` 记录；不更新或删除历史签名。再次签发必须创建新修订。
+应用不直接写签名或报告状态/当前指针；只调用 `issue_report_revision` 或 `withdraw_report_revision`。函数从受信会话上下文取用户，校验账号、组织和项目成员有效性及白名单角色，以服务器时间签发。共享 advisory lock 将子项变更与签发串行化；签发在锁内重算完整 Manifest/哈希并校验渲染 Artifact，再原子推进指针与 Outbox。撤签只追加 `withdraw`；再次签发必须新建修订。
 
 ## 8.19 审计、安全事件与数据血缘
 
 审计域只保存“谁/哪个服务在什么作用域对哪个版本做了什么，结果如何”。密码、令牌、私钥、连接串、完整 Prompt、受限原文和大体积正文不得进入事件；只记录稳定标识、版本、有界摘要和 SHA-256。`occurred_at` 是业务事件时间，`server_recorded_at` 由数据库服务器写入，是审计排序和分区键。PostgreSQL 分区表的主键/唯一约束必须包含分区键，因此事件引用使用 `(id, server_recorded_at)`，不宣称跨分区 `id` 单列唯一。
 
 ```sql
+CREATE OR REPLACE FUNCTION bridgeai_audit.event_details_are_safe(p_details JSONB)
+RETURNS BOOLEAN
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    WITH RECURSIVE nodes(value) AS (
+        SELECT p_details
+        UNION ALL
+        SELECT child.value
+        FROM nodes AS n
+        CROSS JOIN LATERAL (
+            SELECT e.value FROM jsonb_each(
+                CASE WHEN jsonb_typeof(n.value) = 'object' THEN n.value ELSE '{}'::jsonb END
+            ) AS e(key, value)
+            WHERE regexp_replace(lower(e.key), '[^a-z0-9]', '', 'g') = ANY (ARRAY[
+                'password', 'secret', 'token', 'accesstoken', 'refreshtoken',
+                'privatekey', 'connectionstring', 'authorization', 'cookie',
+                'prompt', 'fullprompt', 'body', 'content'
+            ]) IS FALSE
+            UNION ALL
+            SELECT a.value FROM jsonb_array_elements(
+                CASE WHEN jsonb_typeof(n.value) = 'array' THEN n.value ELSE '[]'::jsonb END
+            ) AS a(value)
+        ) AS child
+    ), unsafe AS (
+        SELECT 1
+        FROM nodes AS n
+        CROSS JOIN LATERAL jsonb_object_keys(
+            CASE WHEN jsonb_typeof(n.value) = 'object' THEN n.value ELSE '{}'::jsonb END
+        ) AS k(key)
+        WHERE regexp_replace(lower(k.key), '[^a-z0-9]', '', 'g') = ANY (ARRAY[
+            'password', 'secret', 'token', 'accesstoken', 'refreshtoken',
+            'privatekey', 'connectionstring', 'authorization', 'cookie',
+            'prompt', 'fullprompt', 'body', 'content'
+        ])
+    )
+    SELECT p_details IS NOT NULL
+       AND jsonb_typeof(p_details) = 'object'
+       AND NOT EXISTS (SELECT 1 FROM unsafe);
+$$;
+
 CREATE TABLE bridgeai_audit.audit_events (
     id UUID NOT NULL DEFAULT gen_random_uuid(),
     organization_id UUID NOT NULL,
@@ -5515,10 +5879,7 @@ CREATE TABLE bridgeai_audit.audit_events (
     CONSTRAINT ck_audit_events_details_safe CHECK (
         jsonb_typeof(details) = 'object'
         AND octet_length(details::text) <= 8192
-        AND NOT details ?| ARRAY[
-            'password', 'token', 'access_token', 'refresh_token', 'private_key',
-            'connection_string', 'prompt', 'full_prompt', 'body', 'content'
-        ]
+        AND bridgeai_audit.event_details_are_safe(details)
     )
 ) PARTITION BY RANGE (server_recorded_at);
 
@@ -5572,7 +5933,7 @@ CREATE TABLE bridgeai_audit.data_access_events (
     CONSTRAINT ck_data_access_events_policy_nonblank CHECK (btrim(policy_version) <> ''),
     CONSTRAINT ck_data_access_events_details_safe CHECK (
         jsonb_typeof(details) = 'object' AND octet_length(details::text) <= 4096
-        AND NOT details ?| ARRAY['password', 'token', 'prompt', 'body', 'content']
+        AND bridgeai_audit.event_details_are_safe(details)
     )
 ) PARTITION BY RANGE (server_recorded_at);
 
@@ -5630,7 +5991,7 @@ CREATE TABLE bridgeai_audit.security_events (
         CHECK (evidence_sha256 IS NULL OR evidence_sha256 ~ '^[0-9a-f]{64}$'),
     CONSTRAINT ck_security_events_details_safe CHECK (
         jsonb_typeof(details) = 'object' AND octet_length(details::text) <= 8192
-        AND NOT details ?| ARRAY['password', 'token', 'prompt', 'body', 'content']
+        AND bridgeai_audit.event_details_are_safe(details)
     )
 );
 
@@ -5760,6 +6121,29 @@ BEGIN
     RAISE EXCEPTION '% is append-only', TG_TABLE_NAME;
 END;
 $$;
+
+CREATE OR REPLACE FUNCTION bridgeai_audit.force_server_recorded_at()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    NEW.server_recorded_at := clock_timestamp();
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_audit_events_server_time
+BEFORE INSERT ON bridgeai_audit.audit_events
+FOR EACH ROW EXECUTE FUNCTION bridgeai_audit.force_server_recorded_at();
+CREATE TRIGGER trg_data_access_events_server_time
+BEFORE INSERT ON bridgeai_audit.data_access_events
+FOR EACH ROW EXECUTE FUNCTION bridgeai_audit.force_server_recorded_at();
+CREATE TRIGGER trg_security_events_server_time
+BEFORE INSERT ON bridgeai_audit.security_events
+FOR EACH ROW EXECUTE FUNCTION bridgeai_audit.force_server_recorded_at();
+CREATE TRIGGER trg_lineage_edges_server_time
+BEFORE INSERT ON bridgeai_audit.lineage_edges
+FOR EACH ROW EXECUTE FUNCTION bridgeai_audit.force_server_recorded_at();
 
 CREATE TRIGGER trg_audit_events_append_only
 BEFORE UPDATE OR DELETE ON bridgeai_audit.audit_events
@@ -5904,6 +6288,65 @@ REVOKE ALL ON FUNCTION bridgeai_core.register_idempotency_request(
     UUID, UUID, TEXT, TEXT, TEXT, TIMESTAMPTZ
 ) FROM PUBLIC;
 
+CREATE OR REPLACE FUNCTION bridgeai_core.complete_idempotency_request(
+    p_request_id UUID, p_response_code TEXT, p_response_sha256 TEXT,
+    p_result_artifact_id UUID DEFAULT NULL,
+    p_result_artifact_version_id UUID DEFAULT NULL
+) RETURNS bridgeai_core.idempotency_requests
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core
+AS $$
+DECLARE v_request bridgeai_core.idempotency_requests%ROWTYPE;
+BEGIN
+    SELECT * INTO STRICT v_request FROM bridgeai_core.idempotency_requests
+     WHERE id = p_request_id FOR UPDATE;
+    IF v_request.organization_id::text <> current_setting('app.organization_id', true)
+       OR v_request.project_id::text <> current_setting('app.project_id', true)
+       OR v_request.status <> 'in_progress' THEN
+        RAISE EXCEPTION 'idempotency request is not completable in this context';
+    END IF;
+    UPDATE bridgeai_core.idempotency_requests
+       SET status = 'succeeded', response_code = p_response_code,
+           response_sha256 = p_response_sha256,
+           result_artifact_id = p_result_artifact_id,
+           result_artifact_version_id = p_result_artifact_version_id,
+           failure_code = NULL, completed_at = clock_timestamp()
+     WHERE id = p_request_id RETURNING * INTO v_request;
+    RETURN v_request;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION bridgeai_core.fail_idempotency_request(
+    p_request_id UUID, p_failure_code TEXT, p_retryable BOOLEAN
+) RETURNS bridgeai_core.idempotency_requests
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core
+AS $$
+DECLARE v_request bridgeai_core.idempotency_requests%ROWTYPE;
+BEGIN
+    SELECT * INTO STRICT v_request FROM bridgeai_core.idempotency_requests
+     WHERE id = p_request_id FOR UPDATE;
+    IF v_request.organization_id::text <> current_setting('app.organization_id', true)
+       OR v_request.project_id::text <> current_setting('app.project_id', true)
+       OR v_request.status <> 'in_progress' OR btrim(p_failure_code) = '' THEN
+        RAISE EXCEPTION 'idempotency request is not fail-able in this context';
+    END IF;
+    UPDATE bridgeai_core.idempotency_requests
+       SET status = CASE WHEN p_retryable THEN 'failed_retryable' ELSE 'failed_terminal' END,
+           failure_code = p_failure_code, completed_at = clock_timestamp()
+     WHERE id = p_request_id RETURNING * INTO v_request;
+    RETURN v_request;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION bridgeai_core.complete_idempotency_request(
+    UUID, TEXT, TEXT, UUID, UUID
+) FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_core.fail_idempotency_request(UUID, TEXT, BOOLEAN)
+    FROM PUBLIC;
+
 CREATE TABLE bridgeai_core.outbox_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     organization_id UUID NOT NULL,
@@ -5921,6 +6364,8 @@ CREATE TABLE bridgeai_core.outbox_events (
     available_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     locked_by TEXT,
     locked_at TIMESTAMPTZ,
+    claim_token UUID,
+    lease_expires_at TIMESTAMPTZ,
     last_error_code TEXT,
     last_error_summary TEXT,
     published_at TIMESTAMPTZ,
@@ -5954,8 +6399,10 @@ CREATE TABLE bridgeai_core.outbox_events (
         CHECK (attempt_count >= 0 AND max_attempts > 0 AND attempt_count <= max_attempts),
     CONSTRAINT ck_outbox_events_lock_shape CHECK (
         (status = 'processing' AND locked_by IS NOT NULL AND btrim(locked_by) <> ''
-         AND locked_at IS NOT NULL)
-        OR (status <> 'processing' AND locked_by IS NULL AND locked_at IS NULL)
+         AND locked_at IS NOT NULL AND claim_token IS NOT NULL
+         AND lease_expires_at > locked_at)
+        OR (status <> 'processing' AND locked_by IS NULL AND locked_at IS NULL
+            AND claim_token IS NULL AND lease_expires_at IS NULL)
     ),
     CONSTRAINT ck_outbox_events_terminal_shape CHECK (
         (status = 'published' AND published_at IS NOT NULL AND dead_lettered_at IS NULL)
@@ -5983,6 +6430,9 @@ CREATE INDEX ix_outbox_events_claim
 CREATE OR REPLACE FUNCTION bridgeai_core.enforce_outbox_transition()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
+    IF current_user <> 'bridgeai_migration_owner' THEN
+        RAISE EXCEPTION 'outbox rows may only be changed through controlled functions';
+    END IF;
     IF ROW(NEW.organization_id, NEW.project_id, NEW.aggregate_type, NEW.aggregate_id,
            NEW.aggregate_version, NEW.event_type, NEW.event_schema_version,
            NEW.payload, NEW.idempotency_key, NEW.max_attempts,
@@ -6015,43 +6465,314 @@ BEFORE UPDATE ON bridgeai_core.outbox_events
 FOR EACH ROW EXECUTE FUNCTION bridgeai_core.enforce_outbox_transition();
 ```
 
-Worker 每次 Claim 在一个短事务内执行下列语句，提交后才调用 Qdrant、MinIO、Redis 或模型。`SKIP LOCKED` 使多 Worker 不会领取同一行；`attempt_count` 在领取时递增，不允许无界重试。
+Outbox 表不向运行时角色授予直接 `INSERT/UPDATE`。应用和 Worker 只能使用下列受控函数；Claim 同时产生不可猜的 token 和有限 lease，Ack/Fail 必须匹配事件、owner、token 且 lease 未过期。
 
 ```sql
-WITH candidates AS (
-    SELECT id
-    FROM bridgeai_core.outbox_events
-    WHERE organization_id = $1 AND project_id = $2
-      AND status IN ('pending', 'retry')
-      AND available_at <= clock_timestamp()
-      AND attempt_count < max_attempts
-    ORDER BY available_at, created_at, id
-    FOR UPDATE SKIP LOCKED
-    LIMIT $3
-)
-UPDATE bridgeai_core.outbox_events AS e
-   SET status = 'processing',
-       attempt_count = e.attempt_count + 1,
-       locked_by = $4,
-       locked_at = clock_timestamp()
-  FROM candidates AS c
- WHERE e.id = c.id
-RETURNING e.*;
+CREATE OR REPLACE FUNCTION bridgeai_core.enqueue_outbox_event(
+    p_organization_id UUID, p_project_id UUID, p_aggregate_type TEXT,
+    p_aggregate_id TEXT, p_aggregate_version TEXT,
+    p_event_type TEXT, p_event_schema_version TEXT, p_payload JSONB,
+    p_idempotency_key TEXT, p_max_attempts INTEGER DEFAULT 8
+) RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core
+AS $$
+DECLARE v_id UUID;
+BEGIN
+    IF p_organization_id::text <> current_setting('app.organization_id', true)
+       OR p_project_id::text <> current_setting('app.project_id', true) THEN
+        RAISE EXCEPTION 'outbox scope differs from trusted transaction context';
+    END IF;
+    INSERT INTO bridgeai_core.outbox_events (
+        organization_id, project_id, aggregate_type, aggregate_id,
+        aggregate_version, event_type, event_schema_version, payload,
+        idempotency_key, max_attempts
+    ) VALUES (
+        p_organization_id, p_project_id, p_aggregate_type, p_aggregate_id,
+        p_aggregate_version, p_event_type, p_event_schema_version, p_payload,
+        p_idempotency_key, p_max_attempts
+    ) ON CONFLICT (organization_id, project_id, idempotency_key)
+      DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key
+    RETURNING id INTO v_id;
+    RETURN v_id;
+END;
+$$;
 
--- 可重试失败：使用有界指数退避，达到上限即死信。
-UPDATE bridgeai_core.outbox_events
-   SET status = CASE WHEN attempt_count >= max_attempts
-                     THEN 'dead_letter' ELSE 'retry' END,
-       available_at = clock_timestamp()
-           + LEAST(INTERVAL '1 hour', INTERVAL '5 seconds' * power(2, attempt_count - 1)),
-       locked_by = NULL, locked_at = NULL,
-       last_error_code = $2, last_error_summary = left($3, 1000),
-       dead_lettered_at = CASE WHEN attempt_count >= max_attempts
-                              THEN clock_timestamp() ELSE NULL END
- WHERE id = $1 AND status = 'processing';
+CREATE OR REPLACE FUNCTION bridgeai_core.claim_outbox_events(
+    p_organization_id UUID, p_project_id UUID, p_worker TEXT,
+    p_limit INTEGER, p_lease INTERVAL
+) RETURNS SETOF bridgeai_core.outbox_events
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core
+AS $$
+BEGIN
+    IF p_organization_id::text <> current_setting('app.organization_id', true)
+       OR p_project_id::text <> current_setting('app.project_id', true)
+       OR btrim(p_worker) = '' OR p_limit < 1
+       OR p_lease <= INTERVAL '0 seconds' OR p_lease > INTERVAL '15 minutes' THEN
+        RAISE EXCEPTION 'invalid outbox claim context or lease';
+    END IF;
+    RETURN QUERY
+    WITH candidates AS (
+        SELECT id FROM bridgeai_core.outbox_events
+        WHERE organization_id = p_organization_id AND project_id = p_project_id
+          AND status IN ('pending', 'retry') AND available_at <= clock_timestamp()
+          AND attempt_count < max_attempts
+        ORDER BY available_at, created_at, id
+        FOR UPDATE SKIP LOCKED LIMIT p_limit
+    )
+    UPDATE bridgeai_core.outbox_events AS e
+       SET status = 'processing', attempt_count = e.attempt_count + 1,
+           locked_by = p_worker, locked_at = clock_timestamp(),
+           claim_token = gen_random_uuid(), lease_expires_at = clock_timestamp() + p_lease
+      FROM candidates AS c WHERE e.id = c.id RETURNING e.*;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION bridgeai_core.ack_outbox_event(
+    p_event_id UUID, p_worker TEXT, p_claim_token UUID
+) RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core
+AS $$
+BEGIN
+    UPDATE bridgeai_core.outbox_events
+       SET status = 'published', published_at = clock_timestamp(),
+           locked_by = NULL, locked_at = NULL, claim_token = NULL, lease_expires_at = NULL
+     WHERE id = p_event_id AND status = 'processing' AND locked_by = p_worker
+       AND claim_token = p_claim_token AND lease_expires_at > clock_timestamp()
+       AND organization_id::text = current_setting('app.organization_id', true)
+       AND project_id::text = current_setting('app.project_id', true);
+    IF NOT FOUND THEN RAISE EXCEPTION 'outbox acknowledgement lease mismatch'; END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION bridgeai_core.fail_outbox_event(
+    p_event_id UUID, p_worker TEXT, p_claim_token UUID,
+    p_error_code TEXT, p_error_summary TEXT, p_retryable BOOLEAN
+) RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core
+AS $$
+BEGIN
+    UPDATE bridgeai_core.outbox_events
+       SET status = CASE WHEN NOT p_retryable OR attempt_count >= max_attempts
+                         THEN 'dead_letter' ELSE 'retry' END,
+           available_at = clock_timestamp()
+             + LEAST(INTERVAL '1 hour', INTERVAL '5 seconds' * power(2, attempt_count - 1)),
+           locked_by = NULL, locked_at = NULL, claim_token = NULL, lease_expires_at = NULL,
+           last_error_code = p_error_code, last_error_summary = left(p_error_summary, 1000),
+           dead_lettered_at = CASE WHEN NOT p_retryable OR attempt_count >= max_attempts
+                                  THEN clock_timestamp() END
+     WHERE id = p_event_id AND status = 'processing' AND locked_by = p_worker
+       AND claim_token = p_claim_token AND lease_expires_at > clock_timestamp()
+       AND organization_id::text = current_setting('app.organization_id', true)
+       AND project_id::text = current_setting('app.project_id', true);
+    IF NOT FOUND THEN RAISE EXCEPTION 'outbox failure lease mismatch'; END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION bridgeai_core.reap_expired_outbox_events(
+    p_organization_id UUID, p_project_id UUID, p_limit INTEGER
+) RETURNS SETOF UUID
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core
+AS $$
+BEGIN
+    IF p_organization_id::text <> current_setting('app.organization_id', true)
+       OR p_project_id::text <> current_setting('app.project_id', true) THEN
+        RAISE EXCEPTION 'reaper scope differs from trusted context';
+    END IF;
+    RETURN QUERY
+    WITH expired AS (
+        SELECT id FROM bridgeai_core.outbox_events
+        WHERE organization_id = p_organization_id AND project_id = p_project_id
+          AND status = 'processing' AND lease_expires_at <= clock_timestamp()
+        ORDER BY lease_expires_at, id FOR UPDATE SKIP LOCKED LIMIT p_limit
+    )
+    UPDATE bridgeai_core.outbox_events AS e
+       SET status = CASE WHEN attempt_count >= max_attempts THEN 'dead_letter' ELSE 'retry' END,
+           available_at = clock_timestamp(), locked_by = NULL, locked_at = NULL,
+           claim_token = NULL, lease_expires_at = NULL,
+           last_error_code = 'lease_expired', last_error_summary = 'worker lease expired',
+           dead_lettered_at = CASE WHEN attempt_count >= max_attempts THEN clock_timestamp() END
+      FROM expired AS x WHERE e.id = x.id RETURNING e.id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION bridgeai_core.replay_dead_letter_event(
+    p_source_event_id UUID, p_new_idempotency_key TEXT
+) RETURNS UUID
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core, bridgeai_identity
+AS $$
+DECLARE v_source bridgeai_core.outbox_events%ROWTYPE; v_actor UUID; v_new_id UUID;
+BEGIN
+    IF current_setting('app.actor_type', true) IS DISTINCT FROM 'user' THEN
+        RAISE EXCEPTION 'only a user may request dead-letter replay';
+    END IF;
+    v_actor := NULLIF(current_setting('app.actor_id', true), '')::uuid;
+    SELECT * INTO STRICT v_source FROM bridgeai_core.outbox_events
+     WHERE id = p_source_event_id FOR UPDATE;
+    IF v_source.status <> 'dead_letter'
+       OR v_source.organization_id::text <> current_setting('app.organization_id', true)
+       OR v_source.project_id::text <> current_setting('app.project_id', true)
+       OR NOT EXISTS (
+           SELECT 1 FROM bridgeai_identity.users AS u
+           JOIN bridgeai_identity.organization_memberships AS om
+             ON om.organization_id = u.organization_id AND om.user_id = u.id
+           JOIN bridgeai_core.project_memberships AS pm
+             ON pm.organization_id = u.organization_id AND pm.user_id = u.id
+            AND pm.principal_type = 'user'
+           WHERE u.id = v_actor AND u.organization_id = v_source.organization_id
+             AND u.status = 'active' AND om.status = 'active' AND pm.status = 'active'
+             AND pm.project_id = v_source.project_id
+             AND pm.role_code IN ('project_admin', 'outbox_replayer')
+             AND om.valid_from <= clock_timestamp()
+             AND (om.valid_to IS NULL OR om.valid_to > clock_timestamp())
+             AND pm.valid_from <= clock_timestamp()
+             AND (pm.valid_to IS NULL OR pm.valid_to > clock_timestamp())
+       ) THEN
+        RAISE EXCEPTION 'only an authorized dead-letter event may be replayed';
+    END IF;
+    INSERT INTO bridgeai_core.outbox_events (
+        organization_id, project_id, aggregate_type, aggregate_id, aggregate_version,
+        event_type, event_schema_version, payload, idempotency_key, max_attempts,
+        replay_of_event_id, replay_requested_by, replay_requested_at
+    ) VALUES (
+        v_source.organization_id, v_source.project_id, v_source.aggregate_type,
+        v_source.aggregate_id, v_source.aggregate_version, v_source.event_type,
+        v_source.event_schema_version, v_source.payload, p_new_idempotency_key,
+        v_source.max_attempts, v_source.id, v_actor, clock_timestamp()
+    ) RETURNING id INTO v_new_id;
+    RETURN v_new_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION bridgeai_core.enqueue_outbox_event(
+    UUID, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, TEXT, INTEGER
+) FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_core.claim_outbox_events(UUID, UUID, TEXT, INTEGER, INTERVAL)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_core.ack_outbox_event(UUID, TEXT, UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_core.fail_outbox_event(UUID, TEXT, UUID, TEXT, TEXT, BOOLEAN)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_core.reap_expired_outbox_events(UUID, UUID, INTEGER)
+    FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_core.replay_dead_letter_event(UUID, TEXT) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION bridgeai_core.request_artifact_version_deletion(
+    p_artifact_version_id UUID, p_retention_execution_id UUID,
+    p_reason TEXT, p_idempotency_key TEXT
+) RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core, bridgeai_audit, bridgeai_report,
+                  bridgeai_inspection, bridgeai_knowledge, bridgeai_identity
+AS $$
+DECLARE
+    v_artifact bridgeai_core.artifact_versions%ROWTYPE;
+    v_retention bridgeai_audit.retention_executions%ROWTYPE;
+    v_actor UUID;
+    v_reference_count INTEGER;
+    v_outbox_id UUID;
+BEGIN
+    IF current_setting('app.actor_type', true) IS DISTINCT FROM 'user'
+       OR p_reason IS NULL OR btrim(p_reason) = '' THEN
+        RAISE EXCEPTION 'deletion request requires a trusted user and reason';
+    END IF;
+    v_actor := NULLIF(current_setting('app.actor_id', true), '')::uuid;
+    SELECT * INTO STRICT v_artifact FROM bridgeai_core.artifact_versions
+     WHERE id = p_artifact_version_id FOR UPDATE;
+    SELECT * INTO STRICT v_retention FROM bridgeai_audit.retention_executions
+     WHERE id = p_retention_execution_id FOR UPDATE;
+    IF v_artifact.organization_id::text <> current_setting('app.organization_id', true)
+       OR v_artifact.project_id::text <> current_setting('app.project_id', true)
+       OR v_retention.organization_id <> v_artifact.organization_id
+       OR v_retention.project_id IS DISTINCT FROM v_artifact.project_id
+       OR v_retention.target_type <> 'artifact_version'
+       OR v_retention.target_id <> v_artifact.id::text
+       OR v_retention.action <> 'delete_object'
+       OR v_retention.status NOT IN ('pending', 'running')
+       OR NOT v_retention.legal_hold_checked
+       OR v_retention.shared_reference_count IS DISTINCT FROM 0
+       OR v_retention.requested_by <> v_actor
+       OR v_artifact.legal_hold
+       OR (v_artifact.retention_until IS NOT NULL
+           AND v_artifact.retention_until > clock_timestamp())
+       OR v_artifact.status NOT IN ('archived', 'revoked') THEN
+        RAISE EXCEPTION 'retention execution does not authorize this artifact deletion';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM bridgeai_identity.users AS u
+        JOIN bridgeai_identity.organization_memberships AS om
+          ON om.organization_id = u.organization_id AND om.user_id = u.id
+        JOIN bridgeai_core.project_memberships AS pm
+          ON pm.organization_id = u.organization_id AND pm.user_id = u.id
+         AND pm.principal_type = 'user'
+        WHERE u.id = v_actor AND u.organization_id = v_artifact.organization_id
+          AND u.status = 'active' AND om.status = 'active' AND pm.status = 'active'
+          AND pm.project_id = v_artifact.project_id
+          AND pm.role_code IN ('project_admin', 'retention_operator')
+          AND om.valid_from <= clock_timestamp()
+          AND (om.valid_to IS NULL OR om.valid_to > clock_timestamp())
+          AND pm.valid_from <= clock_timestamp()
+          AND (pm.valid_to IS NULL OR pm.valid_to > clock_timestamp())
+    ) THEN
+        RAISE EXCEPTION 'actor is not authorized to request deletion';
+    END IF;
+
+    SELECT count(*) INTO v_reference_count FROM (
+        SELECT 1 FROM bridgeai_inspection.dataset_artifacts
+         WHERE artifact_version_id = v_artifact.id
+        UNION ALL SELECT 1 FROM bridgeai_inspection.damage_evidence
+         WHERE artifact_version_id = v_artifact.id
+        UNION ALL SELECT 1 FROM bridgeai_knowledge.knowledge_sources
+         WHERE source_artifact_version_id = v_artifact.id
+        UNION ALL SELECT 1 FROM bridgeai_knowledge.document_versions
+         WHERE source_artifact_version_id = v_artifact.id
+        UNION ALL SELECT 1 FROM bridgeai_knowledge.citations
+         WHERE source_artifact_version_id = v_artifact.id
+        UNION ALL SELECT 1 FROM bridgeai_report.report_artifacts
+         WHERE artifact_version_id = v_artifact.id
+        UNION ALL SELECT 1 FROM bridgeai_audit.lineage_edges
+         WHERE source_artifact_version_id = v_artifact.id
+            OR target_artifact_version_id = v_artifact.id
+        UNION ALL SELECT 1 FROM bridgeai_core.idempotency_requests
+         WHERE result_artifact_version_id = v_artifact.id
+    ) AS strong_references;
+    IF v_reference_count <> 0 THEN
+        RAISE EXCEPTION 'artifact version still has % strong references', v_reference_count;
+    END IF;
+
+    UPDATE bridgeai_core.artifact_versions
+       SET status = 'deleting', deletion_requested_at = clock_timestamp(),
+           updated_at = clock_timestamp(), updated_by = v_actor, version = version + 1
+     WHERE id = v_artifact.id;
+    UPDATE bridgeai_audit.retention_executions
+       SET status = 'running', started_at = COALESCE(started_at, clock_timestamp()),
+           version = version + 1 WHERE id = v_retention.id;
+    v_outbox_id := bridgeai_core.enqueue_outbox_event(
+        v_artifact.organization_id, v_artifact.project_id, 'artifact_version',
+        v_artifact.id::text, v_artifact.revision_no::text, 'artifact.deletion_requested',
+        '1', jsonb_build_object('artifact_id', v_artifact.artifact_id,
+                                'artifact_version_id', v_artifact.id,
+                                'retention_execution_id', v_retention.id,
+                                'reason_code', left(p_reason, 200)),
+        p_idempotency_key, 8
+    );
+    RETURN v_outbox_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION bridgeai_core.request_artifact_version_deletion(
+    UUID, UUID, TEXT, TEXT
+) FROM PUBLIC;
 ```
 
-重放不将死信行改回 `pending`，而是经授权后新建 Outbox 行，设置 `replay_of_event_id`、新幂等键和重放人/时间，从而保留原失败证据。Lease Reaper 只把超时 `processing` 转为 `retry/dead_letter`，不执行业务补偿。核对任务按 `aggregate_type/id/version + event_type` 比较 PostgreSQL 权威状态、Outbox 终态和外部派生版本。
+`SKIP LOCKED` 使并发 Worker 不会领取同一行；`attempt_count` 在 Claim 时递增，达到上限必然死信。重放函数只接受死信源行，完整复制聚合身份、事件类型/版本和 payload，只产生新 ID、新幂等键与服务器记录的重放人/时间。Lease Reaper 只把过期 `processing` 转为 `retry/dead_letter`，不执行业务补偿。核对任务按 `aggregate_type/id/version + event_type` 比较 PostgreSQL 权威状态、Outbox 终态和外部派生版本。
 
 ### 8.20.1 跨存储创建与激活
 
@@ -6096,7 +6817,6 @@ UPDATE bridgeai_core.outbox_events
 DO $$
 DECLARE
     v_role TEXT;
-    v_bypass BOOLEAN;
 BEGIN
     FOREACH v_role IN ARRAY ARRAY[
         'bridgeai_migration_owner', 'bridgeai_app_rw', 'bridgeai_readonly',
@@ -6104,15 +6824,20 @@ BEGIN
         'bridgeai_break_glass'
     ] LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
-            v_bypass := v_role IN ('bridgeai_backup_restore', 'bridgeai_break_glass');
-            EXECUTE format(
-                'CREATE ROLE %I NOLOGIN NOINHERIT %s',
-                v_role, CASE WHEN v_bypass THEN 'BYPASSRLS' ELSE 'NOBYPASSRLS' END
-            );
+            EXECUTE format('CREATE ROLE %I', v_role);
         END IF;
     END LOOP;
 END;
 $$;
+
+-- 每次迁移都纠正已存在角色，不把“仅首次创建”当作安全基线。
+ALTER ROLE bridgeai_migration_owner NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE bridgeai_app_rw NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE bridgeai_readonly NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE bridgeai_index_worker NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE bridgeai_audit_writer NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE bridgeai_backup_restore NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS;
+ALTER ROLE bridgeai_break_glass NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS;
 
 ALTER TABLE bridgeai_report.reports OWNER TO bridgeai_migration_owner;
 ALTER TABLE bridgeai_report.report_revisions OWNER TO bridgeai_migration_owner;
@@ -6131,8 +6856,6 @@ ALTER TABLE bridgeai_core.idempotency_requests OWNER TO bridgeai_migration_owner
 ALTER TABLE bridgeai_core.outbox_events OWNER TO bridgeai_migration_owner;
 ALTER FUNCTION bridgeai_report.validate_report_signature()
     OWNER TO bridgeai_migration_owner;
-ALTER FUNCTION bridgeai_report.apply_report_signature()
-    OWNER TO bridgeai_migration_owner;
 ALTER FUNCTION bridgeai_report.validate_report_memory_item()
     OWNER TO bridgeai_migration_owner;
 ALTER FUNCTION bridgeai_report.validate_report_citation()
@@ -6140,46 +6863,66 @@ ALTER FUNCTION bridgeai_report.validate_report_citation()
 ALTER FUNCTION bridgeai_core.register_idempotency_request(
     UUID, UUID, TEXT, TEXT, TEXT, TIMESTAMPTZ
 ) OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_report.compute_snapshot_manifest(UUID) OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_report.issue_report_revision(UUID) OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_report.withdraw_report_revision(UUID, TEXT) OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_report.assert_report_signature_state() OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.complete_idempotency_request(UUID, TEXT, TEXT, UUID, UUID)
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.fail_idempotency_request(UUID, TEXT, BOOLEAN)
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.enqueue_outbox_event(
+    UUID, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, TEXT, INTEGER
+) OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.claim_outbox_events(UUID, UUID, TEXT, INTEGER, INTERVAL)
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.ack_outbox_event(UUID, TEXT, UUID)
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.fail_outbox_event(UUID, TEXT, UUID, TEXT, TEXT, BOOLEAN)
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.reap_expired_outbox_events(UUID, UUID, INTEGER)
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.replay_dead_letter_event(UUID, TEXT)
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.request_artifact_version_deletion(UUID, UUID, TEXT, TEXT)
+    OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_audit.event_details_are_safe(JSONB)
+    OWNER TO bridgeai_migration_owner;
 
 REVOKE ALL ON SCHEMA bridgeai_identity, bridgeai_core, bridgeai_asset,
     bridgeai_inspection, bridgeai_workflow, bridgeai_knowledge,
     bridgeai_memory, bridgeai_report, bridgeai_audit FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA bridgeai_report, bridgeai_audit FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA bridgeai_report, bridgeai_audit FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_core.register_idempotency_request(
+    UUID, UUID, TEXT, TEXT, TEXT, TIMESTAMPTZ
+), bridgeai_core.complete_idempotency_request(UUID, TEXT, TEXT, UUID, UUID),
+   bridgeai_core.fail_idempotency_request(UUID, TEXT, BOOLEAN),
+   bridgeai_core.enqueue_outbox_event(
+       UUID, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, TEXT, INTEGER
+   ), bridgeai_core.claim_outbox_events(UUID, UUID, TEXT, INTEGER, INTERVAL),
+   bridgeai_core.ack_outbox_event(UUID, TEXT, UUID),
+   bridgeai_core.fail_outbox_event(UUID, TEXT, UUID, TEXT, TEXT, BOOLEAN),
+   bridgeai_core.reap_expired_outbox_events(UUID, UUID, INTEGER),
+   bridgeai_core.replay_dead_letter_event(UUID, TEXT),
+   bridgeai_core.request_artifact_version_deletion(UUID, UUID, TEXT, TEXT)
+FROM PUBLIC;
 
 GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core, bridgeai_inspection,
     bridgeai_workflow, bridgeai_knowledge, bridgeai_memory, bridgeai_report,
     bridgeai_audit TO bridgeai_migration_owner;
 GRANT SELECT ON bridgeai_core.project_memberships,
-    bridgeai_core.artifact_versions, bridgeai_memory.memory_records,
+    bridgeai_core.artifact_versions, bridgeai_identity.users,
+    bridgeai_identity.service_principals,
+    bridgeai_identity.organization_memberships, bridgeai_identity.organizations,
+    bridgeai_inspection.dataset_artifacts, bridgeai_inspection.damage_evidence,
+    bridgeai_knowledge.knowledge_sources, bridgeai_knowledge.document_versions,
+    bridgeai_memory.memory_records,
     bridgeai_knowledge.citations, bridgeai_knowledge.publication_items
     TO bridgeai_migration_owner;
-GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core, bridgeai_inspection,
-    bridgeai_workflow, bridgeai_knowledge, bridgeai_memory, bridgeai_report
-    TO bridgeai_app_rw, bridgeai_readonly;
-GRANT USAGE ON SCHEMA bridgeai_core, bridgeai_report
-    TO bridgeai_index_worker;
-GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core, bridgeai_audit
-    TO bridgeai_audit_writer;
-
-GRANT SELECT, INSERT, UPDATE ON bridgeai_report.reports,
-    bridgeai_report.report_revisions, bridgeai_report.report_items,
-    bridgeai_report.report_citations, bridgeai_report.report_artifacts
-    TO bridgeai_app_rw;
-GRANT SELECT, INSERT ON bridgeai_report.report_signatures TO bridgeai_app_rw;
-GRANT SELECT ON ALL TABLES IN SCHEMA bridgeai_report TO bridgeai_readonly;
-GRANT SELECT ON bridgeai_core.outbox_events TO bridgeai_index_worker;
-GRANT UPDATE (
-    status, attempt_count, available_at, locked_by, locked_at,
-    last_error_code, last_error_summary, published_at, dead_lettered_at
-) ON bridgeai_core.outbox_events TO bridgeai_index_worker;
-GRANT INSERT ON bridgeai_audit.audit_events, bridgeai_audit.data_access_events,
-    bridgeai_audit.security_events, bridgeai_audit.lineage_edges
-    TO bridgeai_audit_writer;
-
-GRANT EXECUTE ON FUNCTION bridgeai_core.register_idempotency_request(
-    UUID, UUID, TEXT, TEXT, TEXT, TIMESTAMPTZ
-) TO bridgeai_app_rw;
+GRANT UPDATE (status, deletion_requested_at, updated_at, updated_by, version)
+    ON bridgeai_core.artifact_versions TO bridgeai_migration_owner;
+-- 在下文所有 RLS Policy 完成后才授予运行时权限。
 ```
 
 认证网关在开始业务事务后使用 `set_config(..., true)`（等价于 `SET LOCAL`）写入组织、项目、actor 类型和 actor ID；值来自已验证会话/服务身份，绝不直接采信 API 请求字段。每次归还连接前必须 `ROLLBACK`，连接池 checkout 再执行 `RESET ALL`；缺少任一上下文时 Policy 默认拒绝。
@@ -6195,6 +6938,41 @@ COMMIT;
 ```
 
 ```sql
+CREATE OR REPLACE FUNCTION bridgeai_core.has_organization_access(
+    p_organization_id UUID
+) RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core, bridgeai_identity
+AS $$
+    SELECT p_organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+       AND EXISTS (
+           SELECT 1 FROM bridgeai_identity.organizations AS o
+           WHERE o.id = p_organization_id AND o.status = 'active'
+       )
+       AND (
+           (current_setting('app.actor_type', true) = 'user' AND EXISTS (
+               SELECT 1 FROM bridgeai_identity.users AS u
+               JOIN bridgeai_identity.organization_memberships AS om
+                 ON om.organization_id = u.organization_id AND om.user_id = u.id
+               WHERE u.id = NULLIF(current_setting('app.actor_id', true), '')::uuid
+                 AND u.organization_id = p_organization_id
+                 AND u.status = 'active' AND om.status = 'active'
+                 AND om.valid_from <= statement_timestamp()
+                 AND (om.valid_to IS NULL OR om.valid_to > statement_timestamp())
+           ))
+           OR
+           (current_setting('app.actor_type', true) = 'service_principal' AND EXISTS (
+               SELECT 1 FROM bridgeai_identity.service_principals AS sp
+               WHERE sp.id = NULLIF(current_setting('app.actor_id', true), '')::uuid
+                 AND sp.organization_id = p_organization_id AND sp.status = 'active'
+                 AND (sp.credential_expires_at IS NULL
+                      OR sp.credential_expires_at > statement_timestamp())
+           ))
+       );
+$$;
+
 CREATE OR REPLACE FUNCTION bridgeai_core.has_project_access(
     p_organization_id UUID,
     p_project_id UUID,
@@ -6203,10 +6981,9 @@ CREATE OR REPLACE FUNCTION bridgeai_core.has_project_access(
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = pg_catalog, bridgeai_core
+SET search_path = pg_catalog, bridgeai_core, bridgeai_identity
 AS $$
-    SELECT
-        p_organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+    SELECT bridgeai_core.has_organization_access(p_organization_id)
         AND p_project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
         AND EXISTS (
             SELECT 1
@@ -6234,10 +7011,10 @@ $$;
 
 ALTER FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN)
     OWNER TO bridgeai_migration_owner;
+ALTER FUNCTION bridgeai_core.has_organization_access(UUID)
+    OWNER TO bridgeai_migration_owner;
 REVOKE ALL ON FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN)
-    TO bridgeai_app_rw, bridgeai_readonly, bridgeai_index_worker, bridgeai_audit_writer;
-
+REVOKE ALL ON FUNCTION bridgeai_core.has_organization_access(UUID) FROM PUBLIC;
 ALTER TABLE bridgeai_core.projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bridgeai_core.projects FORCE ROW LEVEL SECURITY;
 CREATE POLICY projects_org_isolation ON bridgeai_core.projects
@@ -6262,6 +7039,30 @@ CREATE POLICY report_revisions_project_isolation ON bridgeai_report.report_revis
     USING (bridgeai_core.has_project_access(organization_id, project_id, false))
     WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true));
 
+ALTER TABLE bridgeai_report.report_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_report.report_items FORCE ROW LEVEL SECURITY;
+CREATE POLICY report_items_project_isolation ON bridgeai_report.report_items
+    USING (bridgeai_core.has_project_access(organization_id, project_id, false))
+    WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true));
+
+ALTER TABLE bridgeai_report.report_citations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_report.report_citations FORCE ROW LEVEL SECURITY;
+CREATE POLICY report_citations_project_isolation ON bridgeai_report.report_citations
+    USING (bridgeai_core.has_project_access(organization_id, project_id, false))
+    WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true));
+
+ALTER TABLE bridgeai_report.report_artifacts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_report.report_artifacts FORCE ROW LEVEL SECURITY;
+CREATE POLICY report_artifacts_project_isolation ON bridgeai_report.report_artifacts
+    USING (bridgeai_core.has_project_access(organization_id, project_id, false))
+    WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true));
+
+ALTER TABLE bridgeai_report.report_signatures ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_report.report_signatures FORCE ROW LEVEL SECURITY;
+CREATE POLICY report_signatures_project_isolation ON bridgeai_report.report_signatures
+    USING (bridgeai_core.has_project_access(organization_id, project_id, false))
+    WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true));
+
 ALTER TABLE bridgeai_core.idempotency_requests ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bridgeai_core.idempotency_requests FORCE ROW LEVEL SECURITY;
 CREATE POLICY idempotency_requests_project_isolation
@@ -6278,14 +7079,149 @@ CREATE POLICY outbox_events_project_worker ON bridgeai_core.outbox_events
 ALTER TABLE bridgeai_audit.audit_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bridgeai_audit.audit_events FORCE ROW LEVEL SECURITY;
 CREATE POLICY audit_events_append_scope ON bridgeai_audit.audit_events
-    FOR INSERT WITH CHECK (
-        organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
-        AND (project_id IS NULL
-             OR bridgeai_core.has_project_access(organization_id, project_id, false))
-    );
+    USING (CASE WHEN project_id IS NULL
+                THEN bridgeai_core.has_organization_access(organization_id)
+                ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END)
+    WITH CHECK (CASE WHEN project_id IS NULL
+                     THEN bridgeai_core.has_organization_access(organization_id)
+                     ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END);
+
+ALTER TABLE bridgeai_audit.audit_events_default ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_audit.audit_events_default FORCE ROW LEVEL SECURITY;
+CREATE POLICY audit_events_default_scope ON bridgeai_audit.audit_events_default
+    USING (CASE WHEN project_id IS NULL
+                THEN bridgeai_core.has_organization_access(organization_id)
+                ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END)
+    WITH CHECK (CASE WHEN project_id IS NULL
+                     THEN bridgeai_core.has_organization_access(organization_id)
+                     ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END);
+
+ALTER TABLE bridgeai_audit.data_access_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_audit.data_access_events FORCE ROW LEVEL SECURITY;
+CREATE POLICY data_access_events_scope ON bridgeai_audit.data_access_events
+    USING (CASE WHEN project_id IS NULL
+                THEN bridgeai_core.has_organization_access(organization_id)
+                ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END)
+    WITH CHECK (CASE WHEN project_id IS NULL
+                     THEN bridgeai_core.has_organization_access(organization_id)
+                     ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END);
+
+ALTER TABLE bridgeai_audit.data_access_events_default ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_audit.data_access_events_default FORCE ROW LEVEL SECURITY;
+CREATE POLICY data_access_events_default_scope ON bridgeai_audit.data_access_events_default
+    USING (CASE WHEN project_id IS NULL
+                THEN bridgeai_core.has_organization_access(organization_id)
+                ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END)
+    WITH CHECK (CASE WHEN project_id IS NULL
+                     THEN bridgeai_core.has_organization_access(organization_id)
+                     ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END);
+
+ALTER TABLE bridgeai_audit.security_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_audit.security_events FORCE ROW LEVEL SECURITY;
+CREATE POLICY security_events_scope ON bridgeai_audit.security_events
+    USING (CASE WHEN project_id IS NULL
+                THEN bridgeai_core.has_organization_access(organization_id)
+                ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END)
+    WITH CHECK (CASE WHEN project_id IS NULL
+                     THEN bridgeai_core.has_organization_access(organization_id)
+                     ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END);
+
+ALTER TABLE bridgeai_audit.retention_executions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_audit.retention_executions FORCE ROW LEVEL SECURITY;
+CREATE POLICY retention_executions_scope ON bridgeai_audit.retention_executions
+    USING (CASE WHEN project_id IS NULL
+                THEN bridgeai_core.has_organization_access(organization_id)
+                ELSE bridgeai_core.has_project_access(organization_id, project_id, false) END)
+    WITH CHECK (CASE WHEN project_id IS NULL
+                     THEN bridgeai_core.has_organization_access(organization_id)
+                     ELSE bridgeai_core.has_project_access(organization_id, project_id, true) END);
+
+ALTER TABLE bridgeai_audit.lineage_edges ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bridgeai_audit.lineage_edges FORCE ROW LEVEL SECURITY;
+CREATE POLICY lineage_edges_scope ON bridgeai_audit.lineage_edges
+    USING (bridgeai_core.has_project_access(organization_id, project_id, false))
+    WITH CHECK (bridgeai_core.has_project_access(organization_id, project_id, true));
+
+-- Policy 已全部存在；此后才授予表和受控函数权限。
+GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core, bridgeai_inspection,
+    bridgeai_workflow, bridgeai_knowledge, bridgeai_memory, bridgeai_report
+    TO bridgeai_app_rw, bridgeai_readonly;
+GRANT USAGE ON SCHEMA bridgeai_core, bridgeai_report
+    TO bridgeai_index_worker;
+GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core, bridgeai_audit
+    TO bridgeai_audit_writer;
+GRANT EXECUTE ON FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN),
+    bridgeai_core.has_organization_access(UUID)
+    TO bridgeai_app_rw, bridgeai_readonly, bridgeai_index_worker, bridgeai_audit_writer;
+
+GRANT SELECT, INSERT ON bridgeai_report.reports TO bridgeai_app_rw;
+GRANT UPDATE (report_type, title, updated_at, updated_by, version)
+    ON bridgeai_report.reports TO bridgeai_app_rw;
+GRANT SELECT, INSERT, UPDATE ON bridgeai_report.report_revisions,
+    bridgeai_report.report_items, bridgeai_report.report_citations,
+    bridgeai_report.report_artifacts TO bridgeai_app_rw;
+GRANT SELECT ON bridgeai_report.report_signatures TO bridgeai_app_rw;
+GRANT SELECT ON ALL TABLES IN SCHEMA bridgeai_report TO bridgeai_readonly;
+
+REVOKE INSERT, UPDATE, DELETE ON bridgeai_report.report_signatures
+    FROM bridgeai_app_rw, bridgeai_index_worker, bridgeai_audit_writer;
+REVOKE UPDATE (status, current_revision_id, current_revision_no)
+    ON bridgeai_report.reports FROM bridgeai_app_rw;
+REVOKE UPDATE (
+    status, legal_hold, retention_until, deletion_requested_at, deleted_at
+) ON bridgeai_core.artifact_versions
+    FROM bridgeai_app_rw, bridgeai_index_worker, bridgeai_audit_writer;
+REVOKE ALL ON bridgeai_core.idempotency_requests, bridgeai_core.outbox_events
+    FROM bridgeai_app_rw, bridgeai_index_worker, bridgeai_audit_writer;
+
+GRANT INSERT (
+    id, organization_id, project_id, actor_user_id, service_principal_id,
+    action, object_schema, object_table, object_id, object_version, result,
+    before_sha256, after_sha256, request_id, trace_id, occurred_at,
+    policy_version, reason_code, details
+) ON bridgeai_audit.audit_events TO bridgeai_audit_writer;
+GRANT INSERT (
+    id, organization_id, project_id, actor_user_id, service_principal_id,
+    resource_type, resource_id, access_action, purpose_code, result,
+    row_count, bytes_returned, request_id, trace_id, occurred_at,
+    policy_version, details
+) ON bridgeai_audit.data_access_events TO bridgeai_audit_writer;
+GRANT INSERT (
+    id, organization_id, project_id, audit_event_id, audit_server_recorded_at,
+    actor_user_id, service_principal_id, event_type, severity, detection_source,
+    resource_type, resource_id, disposition, request_id, trace_id, occurred_at,
+    evidence_sha256, details
+) ON bridgeai_audit.security_events TO bridgeai_audit_writer;
+GRANT INSERT (
+    id, organization_id, project_id, source_type, source_id, source_version,
+    source_sha256, source_artifact_id, source_artifact_version_id,
+    target_type, target_id, target_version, target_sha256,
+    target_artifact_id, target_artifact_version_id, relation_type,
+    transformation_code, transformation_version, workflow_run_id,
+    workflow_task_id, occurred_at, created_by_service_id
+) ON bridgeai_audit.lineage_edges TO bridgeai_audit_writer;
+
+GRANT EXECUTE ON FUNCTION bridgeai_report.issue_report_revision(UUID),
+    bridgeai_report.withdraw_report_revision(UUID, TEXT),
+    bridgeai_core.register_idempotency_request(UUID, UUID, TEXT, TEXT, TEXT, TIMESTAMPTZ),
+    bridgeai_core.complete_idempotency_request(UUID, TEXT, TEXT, UUID, UUID),
+    bridgeai_core.fail_idempotency_request(UUID, TEXT, BOOLEAN),
+    bridgeai_core.enqueue_outbox_event(
+        UUID, UUID, TEXT, TEXT, TEXT, TEXT, TEXT, JSONB, TEXT, INTEGER
+    ), bridgeai_core.replay_dead_letter_event(UUID, TEXT),
+    bridgeai_core.request_artifact_version_deletion(UUID, UUID, TEXT, TEXT)
+    TO bridgeai_app_rw;
+GRANT EXECUTE ON FUNCTION
+    bridgeai_core.claim_outbox_events(UUID, UUID, TEXT, INTEGER, INTERVAL),
+    bridgeai_core.ack_outbox_event(UUID, TEXT, UUID),
+    bridgeai_core.fail_outbox_event(UUID, TEXT, UUID, TEXT, TEXT, BOOLEAN),
+    bridgeai_core.reap_expired_outbox_events(UUID, UUID, INTEGER)
+    TO bridgeai_index_worker;
+GRANT EXECUTE ON FUNCTION bridgeai_audit.event_details_are_safe(JSONB)
+    TO bridgeai_audit_writer;
 ```
 
-生产应对其余含 `organization_id/project_id` 的表按同一模板同时 `ENABLE` 和 `FORCE ROW LEVEL SECURITY`；本节给出组织根表、报告、幂等、Outbox 和追加审计的代表性 Policy。RLS 是纵深防御，不替代服务层的操作、状态、敏感级别、用途和签发角色检查。迁移验收必须查询 `pg_class.relrowsecurity/relforcerowsecurity`、`pg_policy`、`pg_roles.rolbypassrls` 和 `information_schema.role_table_grants`，不能仅检查 SQL 文本。
+本节新增 13 个逻辑租户表（含两个分区父表），物理目录中为 15 个关系（另含两个 default partition）；全部在授权前 `ENABLE` + `FORCE ROW LEVEL SECURITY` 并有可执行 Policy。应以 `pg_class.relrowsecurity/relforcerowsecurity`、`pg_policy`、`pg_roles` 和 `information_schema.role_table_grants` 验收，不以 SQL 文本或逻辑/物理数量混报代替目录证据。
 
 任何 `SECURITY DEFINER` 函数都必须由不登录所有者持有，固定只含 `pg_catalog` 和所需 Schema 的 `search_path`，所有对象使用 Schema 限定名，并在授予指定角色前先 `REVOKE ... FROM PUBLIC`。不得在函数中拼接请求提供的 SQL、表名或 `search_path`。
 
