@@ -2574,7 +2574,151 @@ ALTER TABLE bridgeai_workflow.workflow_runs
     ALTER COLUMN idempotency_key SET NOT NULL;
 ```
 
-五张表完成异常清零和约束验证后才启用 RLS。项目级策略基线如下；迁移/表所有者不得授予应用角色 `BYPASSRLS`，并使用 `FORCE ROW LEVEL SECURITY` 防止表所有者误走普通服务连接。审计主体的角色、成员关系和操作授权仍由服务层验证，RLS 只承担组织/项目的数据库纵深隔离。
+五张表完成异常清零和约束验证后才启用 RLS。**所有调用 helper 的 Policy 之前**必须先创建受限 helper owner 和 helper 函数；8.21 只说明其运行时上下文、授权边界和全表覆盖基线，不得再次定义同名函数。项目级策略基线如下；迁移/表所有者不得授予应用角色 `BYPASSRLS`，并使用 `FORCE ROW LEVEL SECURITY` 防止表所有者误走普通服务连接。审计主体的角色、成员关系和操作授权仍由服务层验证，RLS 只承担组织/项目的数据库纵深隔离。
+
+```sql
+DO $rls_helper_owner$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeai_rls_helper_owner') THEN
+        CREATE ROLE bridgeai_rls_helper_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS;
+    END IF;
+END
+$rls_helper_owner$;
+
+ALTER ROLE bridgeai_rls_helper_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT BYPASSRLS;
+
+CREATE OR REPLACE FUNCTION bridgeai_core.has_organization_access(
+    p_organization_id UUID
+) RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core, bridgeai_identity
+AS $$
+    SELECT p_organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
+       AND EXISTS (
+           SELECT 1 FROM bridgeai_identity.organizations AS o
+           WHERE o.id = p_organization_id AND o.status = 'active'
+       )
+       AND (
+           (current_setting('app.actor_type', true) = 'user' AND EXISTS (
+               SELECT 1 FROM bridgeai_identity.users AS u
+               JOIN bridgeai_identity.organization_memberships AS om
+                 ON om.organization_id = u.organization_id AND om.user_id = u.id
+               WHERE u.id = NULLIF(current_setting('app.actor_id', true), '')::uuid
+                 AND u.organization_id = p_organization_id
+                 AND u.status = 'active' AND om.status = 'active'
+                 AND om.valid_from <= statement_timestamp()
+                 AND (om.valid_to IS NULL OR om.valid_to > statement_timestamp())
+           ))
+           OR
+           (current_setting('app.actor_type', true) = 'service_principal' AND EXISTS (
+               SELECT 1 FROM bridgeai_identity.service_principals AS sp
+               WHERE sp.id = NULLIF(current_setting('app.actor_id', true), '')::uuid
+                 AND sp.organization_id = p_organization_id AND sp.status = 'active'
+                 AND (sp.credential_expires_at IS NULL
+                      OR sp.credential_expires_at > statement_timestamp())
+           ))
+       );
+$$;
+
+CREATE OR REPLACE FUNCTION bridgeai_core.has_project_access(
+    p_organization_id UUID,
+    p_project_id UUID,
+    p_write BOOLEAN DEFAULT false
+) RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core, bridgeai_identity
+AS $$
+    SELECT bridgeai_core.has_organization_access(p_organization_id)
+        AND p_project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
+        AND EXISTS (
+            SELECT 1
+            FROM bridgeai_core.project_memberships AS pm
+            WHERE pm.organization_id = p_organization_id
+              AND pm.project_id = p_project_id
+              AND pm.status = 'active'
+              AND pm.valid_from <= statement_timestamp()
+              AND (pm.valid_to IS NULL OR pm.valid_to > statement_timestamp())
+              AND (
+                  (NULLIF(current_setting('app.actor_type', true), '') = 'user'
+                   AND pm.principal_type = 'user'
+                   AND pm.user_id = NULLIF(current_setting('app.actor_id', true), '')::uuid)
+                  OR
+                  (NULLIF(current_setting('app.actor_type', true), '') = 'service_principal'
+                   AND pm.principal_type = 'service_principal'
+                   AND pm.service_principal_id =
+                       NULLIF(current_setting('app.actor_id', true), '')::uuid)
+              )
+              AND (NOT p_write OR pm.role_code IN (
+                  'project_admin', 'inspector', 'reviewer', 'report_issuer', 'service_writer',
+                  'memory_admin', 'memory_service'
+              ))
+        );
+$$;
+
+CREATE OR REPLACE FUNCTION bridgeai_core.has_memory_admin_access(
+    p_organization_id UUID,
+    p_project_id UUID
+) RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, bridgeai_core, bridgeai_identity
+AS $$
+    SELECT bridgeai_core.has_organization_access(p_organization_id)
+       AND (
+           (current_setting('app.actor_type', true) = 'user' AND EXISTS (
+               SELECT 1
+               FROM bridgeai_identity.organization_memberships AS om
+               WHERE om.organization_id = p_organization_id
+                 AND om.user_id = NULLIF(current_setting('app.actor_id', true), '')::uuid
+                 AND om.status = 'active'
+                 AND om.role_code IN ('organization_admin', 'memory_admin')
+                 AND om.valid_from <= statement_timestamp()
+                 AND (om.valid_to IS NULL OR om.valid_to > statement_timestamp())
+           ))
+           OR
+           (p_project_id IS NOT NULL AND EXISTS (
+               SELECT 1
+               FROM bridgeai_core.project_memberships AS pm
+               WHERE pm.organization_id = p_organization_id
+                 AND pm.project_id = p_project_id
+                 AND pm.status = 'active'
+                 AND pm.role_code IN ('project_admin', 'memory_admin', 'memory_service')
+                 AND pm.valid_from <= statement_timestamp()
+                 AND (pm.valid_to IS NULL OR pm.valid_to > statement_timestamp())
+                 AND (
+                     (current_setting('app.actor_type', true) = 'user'
+                      AND pm.principal_type = 'user'
+                      AND pm.user_id = NULLIF(current_setting('app.actor_id', true), '')::uuid)
+                     OR
+                     (current_setting('app.actor_type', true) = 'service_principal'
+                      AND pm.principal_type = 'service_principal'
+                      AND pm.service_principal_id =
+                          NULLIF(current_setting('app.actor_id', true), '')::uuid)
+                 )
+           ))
+       );
+$$;
+
+ALTER FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN)
+    OWNER TO bridgeai_rls_helper_owner;
+ALTER FUNCTION bridgeai_core.has_organization_access(UUID)
+    OWNER TO bridgeai_rls_helper_owner;
+ALTER FUNCTION bridgeai_core.has_memory_admin_access(UUID, UUID)
+    OWNER TO bridgeai_rls_helper_owner;
+REVOKE ALL ON FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN) FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_core.has_organization_access(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION bridgeai_core.has_memory_admin_access(UUID, UUID) FROM PUBLIC;
+GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core TO bridgeai_rls_helper_owner;
+GRANT SELECT ON bridgeai_identity.organizations, bridgeai_identity.users,
+    bridgeai_identity.service_principals, bridgeai_identity.organization_memberships,
+    bridgeai_core.projects, bridgeai_core.project_memberships
+    TO bridgeai_rls_helper_owner;
+```
 
 ```sql
 DO $workflow_rls$
@@ -7056,138 +7200,7 @@ SELECT set_config('app.actor_id',        $4, true);
 COMMIT;
 ```
 
-```sql
-CREATE OR REPLACE FUNCTION bridgeai_core.has_organization_access(
-    p_organization_id UUID
-) RETURNS BOOLEAN
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = pg_catalog, bridgeai_core, bridgeai_identity
-AS $$
-    SELECT p_organization_id = NULLIF(current_setting('app.organization_id', true), '')::uuid
-       AND EXISTS (
-           SELECT 1 FROM bridgeai_identity.organizations AS o
-           WHERE o.id = p_organization_id AND o.status = 'active'
-       )
-       AND (
-           (current_setting('app.actor_type', true) = 'user' AND EXISTS (
-               SELECT 1 FROM bridgeai_identity.users AS u
-               JOIN bridgeai_identity.organization_memberships AS om
-                 ON om.organization_id = u.organization_id AND om.user_id = u.id
-               WHERE u.id = NULLIF(current_setting('app.actor_id', true), '')::uuid
-                 AND u.organization_id = p_organization_id
-                 AND u.status = 'active' AND om.status = 'active'
-                 AND om.valid_from <= statement_timestamp()
-                 AND (om.valid_to IS NULL OR om.valid_to > statement_timestamp())
-           ))
-           OR
-           (current_setting('app.actor_type', true) = 'service_principal' AND EXISTS (
-               SELECT 1 FROM bridgeai_identity.service_principals AS sp
-               WHERE sp.id = NULLIF(current_setting('app.actor_id', true), '')::uuid
-                 AND sp.organization_id = p_organization_id AND sp.status = 'active'
-                 AND (sp.credential_expires_at IS NULL
-                      OR sp.credential_expires_at > statement_timestamp())
-           ))
-       );
-$$;
-
-CREATE OR REPLACE FUNCTION bridgeai_core.has_project_access(
-    p_organization_id UUID,
-    p_project_id UUID,
-    p_write BOOLEAN DEFAULT false
-) RETURNS BOOLEAN
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = pg_catalog, bridgeai_core, bridgeai_identity
-AS $$
-    SELECT bridgeai_core.has_organization_access(p_organization_id)
-        AND p_project_id = NULLIF(current_setting('app.project_id', true), '')::uuid
-        AND EXISTS (
-            SELECT 1
-            FROM bridgeai_core.project_memberships AS pm
-            WHERE pm.organization_id = p_organization_id
-              AND pm.project_id = p_project_id
-              AND pm.status = 'active'
-              AND pm.valid_from <= statement_timestamp()
-              AND (pm.valid_to IS NULL OR pm.valid_to > statement_timestamp())
-              AND (
-                  (NULLIF(current_setting('app.actor_type', true), '') = 'user'
-                   AND pm.principal_type = 'user'
-                   AND pm.user_id = NULLIF(current_setting('app.actor_id', true), '')::uuid)
-                  OR
-                  (NULLIF(current_setting('app.actor_type', true), '') = 'service_principal'
-                   AND pm.principal_type = 'service_principal'
-                   AND pm.service_principal_id =
-                       NULLIF(current_setting('app.actor_id', true), '')::uuid)
-              )
-              AND (NOT p_write OR pm.role_code IN (
-                  'project_admin', 'inspector', 'reviewer', 'report_issuer', 'service_writer',
-                  'memory_admin', 'memory_service'
-              ))
-        );
-$$;
-
-CREATE OR REPLACE FUNCTION bridgeai_core.has_memory_admin_access(
-    p_organization_id UUID,
-    p_project_id UUID
-) RETURNS BOOLEAN
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path = pg_catalog, bridgeai_core, bridgeai_identity
-AS $$
-    SELECT bridgeai_core.has_organization_access(p_organization_id)
-       AND (
-           (current_setting('app.actor_type', true) = 'user' AND EXISTS (
-               SELECT 1
-               FROM bridgeai_identity.organization_memberships AS om
-               WHERE om.organization_id = p_organization_id
-                 AND om.user_id = NULLIF(current_setting('app.actor_id', true), '')::uuid
-                 AND om.status = 'active'
-                 AND om.role_code IN ('organization_admin', 'memory_admin')
-                 AND om.valid_from <= statement_timestamp()
-                 AND (om.valid_to IS NULL OR om.valid_to > statement_timestamp())
-           ))
-           OR
-           (p_project_id IS NOT NULL AND EXISTS (
-               SELECT 1
-               FROM bridgeai_core.project_memberships AS pm
-               WHERE pm.organization_id = p_organization_id
-                 AND pm.project_id = p_project_id
-                 AND pm.status = 'active'
-                 AND pm.role_code IN ('project_admin', 'memory_admin', 'memory_service')
-                 AND pm.valid_from <= statement_timestamp()
-                 AND (pm.valid_to IS NULL OR pm.valid_to > statement_timestamp())
-                 AND (
-                     (current_setting('app.actor_type', true) = 'user'
-                      AND pm.principal_type = 'user'
-                      AND pm.user_id = NULLIF(current_setting('app.actor_id', true), '')::uuid)
-                     OR
-                     (current_setting('app.actor_type', true) = 'service_principal'
-                      AND pm.principal_type = 'service_principal'
-                      AND pm.service_principal_id =
-                          NULLIF(current_setting('app.actor_id', true), '')::uuid)
-                 )
-           ))
-       );
-$$;
-
-ALTER FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN)
-    OWNER TO bridgeai_rls_helper_owner;
-ALTER FUNCTION bridgeai_core.has_organization_access(UUID)
-    OWNER TO bridgeai_rls_helper_owner;
-ALTER FUNCTION bridgeai_core.has_memory_admin_access(UUID, UUID)
-    OWNER TO bridgeai_rls_helper_owner;
-REVOKE ALL ON FUNCTION bridgeai_core.has_project_access(UUID, UUID, BOOLEAN) FROM PUBLIC;
-REVOKE ALL ON FUNCTION bridgeai_core.has_organization_access(UUID) FROM PUBLIC;
-REVOKE ALL ON FUNCTION bridgeai_core.has_memory_admin_access(UUID, UUID) FROM PUBLIC;
-GRANT USAGE ON SCHEMA bridgeai_identity, bridgeai_core TO bridgeai_rls_helper_owner;
-GRANT SELECT ON bridgeai_identity.organizations, bridgeai_identity.users,
-    bridgeai_identity.service_principals, bridgeai_identity.organization_memberships,
-    bridgeai_core.projects, bridgeai_core.project_memberships
-    TO bridgeai_rls_helper_owner;
+8.15 已在首个依赖 helper 的 Policy 前完成 `bridgeai_rls_helper_owner` bootstrap、三个 `has_*` 函数的定义、所有权切换和最小化读取授权。这里不重定义函数，避免迁移顺序或函数实现分叉；其调用方只使用该唯一实现。
 
 ### 8.21.1 RLS tenant table inventory 与完整覆盖基线
 
