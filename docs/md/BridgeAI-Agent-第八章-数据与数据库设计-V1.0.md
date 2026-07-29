@@ -2301,7 +2301,7 @@ CREATE TABLE bridgeai_workflow.workflow_events (
         FOREIGN KEY (run_id, organization_id, project_id, task_id)
         REFERENCES bridgeai_workflow.workflow_runs (id, organization_id, project_id, task_id)
         ON DELETE RESTRICT,
-    CONSTRAINT uq_workflow_events_producer_key
+    CONSTRAINT uq_workflow_events_producer_key_partition_local
         UNIQUE (organization_id, project_id, producer_event_key, occurred_at),
     CONSTRAINT ck_workflow_events_trace_nonblank CHECK (btrim(trace_id) <> ''),
     CONSTRAINT ck_workflow_events_key_nonblank CHECK (btrim(producer_event_key) <> ''),
@@ -2314,6 +2314,47 @@ CREATE TABLE bridgeai_workflow.workflow_events (
 
 CREATE TABLE bridgeai_workflow.workflow_events_default
     PARTITION OF bridgeai_workflow.workflow_events DEFAULT;
+
+CREATE INDEX ix_workflow_events_global_producer_key
+    ON bridgeai_workflow.workflow_events
+       (organization_id, project_id, producer_event_key);
+
+CREATE OR REPLACE FUNCTION bridgeai_workflow.reject_duplicate_producer_event_key()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(
+            NEW.organization_id::text || E'\\x1f'
+            || NEW.project_id::text || E'\\x1f'
+            || NEW.producer_event_key,
+            0
+        )
+    );
+
+    IF EXISTS (
+        SELECT 1
+        FROM bridgeai_workflow.workflow_events AS existing
+        WHERE existing.organization_id = NEW.organization_id
+          AND existing.project_id = NEW.project_id
+          AND existing.producer_event_key = NEW.producer_event_key
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23505',
+            CONSTRAINT = 'uq_workflow_events_producer_key_global',
+            MESSAGE = format(
+                'duplicate producer_event_key %s in organization/project scope',
+                NEW.producer_event_key
+            );
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_workflow_events_global_producer_key
+BEFORE INSERT ON bridgeai_workflow.workflow_events
+FOR EACH ROW EXECUTE FUNCTION bridgeai_workflow.reject_duplicate_producer_event_key();
 
 CREATE TABLE bridgeai_workflow.workflow_node_executions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2485,7 +2526,7 @@ CREATE INDEX ix_workflow_reviews_pending
     WHERE status IN ('pending', 'claimed');
 ```
 
-`created_by`、`updated_by`、`triggered_by`、`actor_subject_id` 和 `reviewer_subject_id` 都是稳定审计主体 UUID，可能指人员或服务主体，因此不伪造指向 `users` 的单表外键；其身份类型和当时权限快照由 8.19 审计域解释。事件以 `occurred_at` 为范围分区键；生产迁移应预建月分区并保留 DEFAULT 分区作为短时故障护栏，监控不得容忍 DEFAULT 分区长期积压。
+`created_by`、`updated_by`、`triggered_by`、`actor_subject_id` 和 `reviewer_subject_id` 都是稳定审计主体 UUID，可能指人员或服务主体，因此不伪造指向 `users` 的单表外键；其身份类型和当时权限快照由 8.19 审计域解释。事件以 `occurred_at` 为范围分区键；生产迁移应预建月分区并保留 DEFAULT 分区作为短时故障护栏，监控不得容忍 DEFAULT 分区长期积压。`producer_event_key` 是生产者对同一逻辑事件跨重试、跨进程和跨时间保持不变的稳定键；分区内唯一约束只作局部护栏，BEFORE INSERT 触发器以事务级 advisory lock 串行化同组织/项目/键的并发写入，再通过父表索引跨所有分区查重，因此不同 `occurred_at` 也不能重复。
 
 ### 8.15.2 第五章兼容迁移矩阵
 
@@ -2685,6 +2726,8 @@ CREATE TABLE bridgeai_knowledge.document_versions (
     parser_name TEXT,
     parser_version TEXT,
     chunking_policy_version TEXT,
+    embedding_contract_version TEXT,
+    processing_contract_locked_at TIMESTAMPTZ,
     effective_from DATE,
     effective_to DATE,
     published_at TIMESTAMPTZ,
@@ -2718,6 +2761,10 @@ CREATE TABLE bridgeai_knowledge.document_versions (
     CONSTRAINT uq_document_versions_id_scope UNIQUE (id, organization_id, project_id),
     CONSTRAINT uq_document_versions_id_scope_document
         UNIQUE (id, organization_id, project_id, document_id),
+    CONSTRAINT uq_document_versions_evidence_identity UNIQUE (
+        id, organization_id, project_id, document_id,
+        source_artifact_id, source_artifact_version_id
+    ),
     CONSTRAINT uq_document_versions_number
         UNIQUE (organization_id, project_id, document_id, version_no),
     CONSTRAINT fk_document_versions_supersedes_same_document
@@ -2740,6 +2787,17 @@ CREATE TABLE bridgeai_knowledge.document_versions (
         (status <> 'published' OR published_at IS NOT NULL)
         AND (status <> 'superseded' OR (published_at IS NOT NULL AND superseded_at IS NOT NULL))
         AND (status <> 'archived' OR archived_at IS NOT NULL)
+    ),
+    CONSTRAINT ck_document_versions_processing_lock CHECK (
+        status NOT IN ('indexing', 'review_pending', 'published', 'superseded', 'archived')
+        OR (
+            processing_contract_locked_at IS NOT NULL
+            AND parser_name IS NOT NULL AND btrim(parser_name) <> ''
+            AND parser_version IS NOT NULL AND btrim(parser_version) <> ''
+            AND chunking_policy_version IS NOT NULL AND btrim(chunking_policy_version) <> ''
+            AND embedding_contract_version IS NOT NULL
+            AND btrim(embedding_contract_version) <> ''
+        )
     ),
     CONSTRAINT ck_document_versions_no_self_supersede CHECK (supersedes_version_id IS DISTINCT FROM id),
     CONSTRAINT ck_document_versions_version_positive CHECK (version > 0)
@@ -2935,6 +2993,13 @@ CREATE TABLE bridgeai_knowledge.citations (
         REFERENCES bridgeai_knowledge.document_versions
                    (id, organization_id, project_id, document_id)
         ON DELETE RESTRICT,
+    CONSTRAINT fk_citations_exact_version_artifact FOREIGN KEY (
+        document_version_id, organization_id, project_id, document_id,
+        source_artifact_id, source_artifact_version_id
+    ) REFERENCES bridgeai_knowledge.document_versions (
+        id, organization_id, project_id, document_id,
+        source_artifact_id, source_artifact_version_id
+    ) ON DELETE RESTRICT,
     CONSTRAINT fk_citations_artifact_scope
         FOREIGN KEY (source_artifact_id, organization_id, project_id)
         REFERENCES bridgeai_core.artifacts (id, organization_id, project_id)
@@ -2967,12 +3032,126 @@ CREATE TABLE bridgeai_knowledge.citations (
     CONSTRAINT ck_citations_reason_nonblank CHECK (btrim(applicability_reason) <> '')
 );
 
+CREATE TABLE bridgeai_knowledge.knowledge_releases (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    release_code TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    item_count INTEGER NOT NULL DEFAULT 0,
+    production_collection TEXT,
+    qdrant_index_version TEXT,
+    acl_snapshot JSONB,
+    acl_snapshot_sha256 TEXT,
+    release_manifest JSONB,
+    release_manifest_sha256 TEXT,
+    published_at TIMESTAMPTZ,
+    published_by UUID,
+    withdrawn_at TIMESTAMPTZ,
+    withdrawal_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by UUID NOT NULL,
+    version BIGINT NOT NULL DEFAULT 1,
+    CONSTRAINT fk_knowledge_releases_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_knowledge_releases_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT uq_knowledge_releases_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_knowledge_releases_project_code
+        UNIQUE (organization_id, project_id, release_code),
+    CONSTRAINT ck_knowledge_releases_code_nonblank CHECK (btrim(release_code) <> ''),
+    CONSTRAINT ck_knowledge_releases_status
+        CHECK (status IN ('draft', 'published', 'withdrawn')),
+    CONSTRAINT ck_knowledge_releases_item_count CHECK (item_count >= 0),
+    CONSTRAINT ck_knowledge_releases_published_shape CHECK (
+        status = 'draft'
+        OR (
+            item_count > 0
+            AND production_collection LIKE 'bridgeai_knowledge_prod_%'
+            AND qdrant_index_version IS NOT NULL AND btrim(qdrant_index_version) <> ''
+            AND acl_snapshot IS NOT NULL AND jsonb_typeof(acl_snapshot) = 'object'
+            AND acl_snapshot_sha256 ~ '^[0-9a-f]{64}$'
+            AND release_manifest IS NOT NULL AND jsonb_typeof(release_manifest) = 'array'
+            AND release_manifest_sha256 ~ '^[0-9a-f]{64}$'
+            AND published_at IS NOT NULL AND published_by IS NOT NULL
+        )
+    ),
+    CONSTRAINT ck_knowledge_releases_withdrawn_shape CHECK (
+        status <> 'withdrawn'
+        OR (withdrawn_at IS NOT NULL AND withdrawal_reason IS NOT NULL
+            AND btrim(withdrawal_reason) <> '')
+    ),
+    CONSTRAINT ck_knowledge_releases_version_positive CHECK (version > 0)
+);
+
+CREATE TABLE bridgeai_knowledge.publication_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL,
+    project_id UUID NOT NULL,
+    release_id UUID NOT NULL,
+    publication_id UUID NOT NULL,
+    document_id UUID NOT NULL,
+    document_version_id UUID NOT NULL,
+    ordinal_no INTEGER NOT NULL,
+    chunk_count INTEGER NOT NULL,
+    chunk_manifest JSONB NOT NULL,
+    chunk_manifest_sha256 TEXT NOT NULL,
+    qdrant_collection TEXT NOT NULL,
+    qdrant_index_version TEXT NOT NULL,
+    acl_snapshot JSONB NOT NULL,
+    acl_snapshot_sha256 TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_by UUID NOT NULL,
+    CONSTRAINT fk_publication_items_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES bridgeai_identity.organizations (id) ON DELETE RESTRICT,
+    CONSTRAINT fk_publication_items_project_scope
+        FOREIGN KEY (project_id, organization_id)
+        REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_publication_items_release_scope
+        FOREIGN KEY (release_id, organization_id, project_id)
+        REFERENCES bridgeai_knowledge.knowledge_releases (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_publication_items_publication_scope
+        FOREIGN KEY (publication_id, organization_id, project_id)
+        REFERENCES bridgeai_knowledge.publications (id, organization_id, project_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT fk_publication_items_document_version_scope
+        FOREIGN KEY (document_version_id, organization_id, project_id, document_id)
+        REFERENCES bridgeai_knowledge.document_versions
+                   (id, organization_id, project_id, document_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT uq_publication_items_id_scope UNIQUE (id, organization_id, project_id),
+    CONSTRAINT uq_publication_items_release_ordinal
+        UNIQUE (organization_id, project_id, release_id, ordinal_no),
+    CONSTRAINT uq_publication_items_release_version
+        UNIQUE (organization_id, project_id, release_id, document_version_id),
+    CONSTRAINT ck_publication_items_ordinal_nonnegative CHECK (ordinal_no >= 0),
+    CONSTRAINT ck_publication_items_chunk_count_positive CHECK (chunk_count > 0),
+    CONSTRAINT ck_publication_items_chunk_manifest_array
+        CHECK (jsonb_typeof(chunk_manifest) = 'array'),
+    CONSTRAINT ck_publication_items_chunk_manifest_sha256
+        CHECK (chunk_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_publication_items_collection
+        CHECK (qdrant_collection LIKE 'bridgeai_knowledge_prod_%'),
+    CONSTRAINT ck_publication_items_index_version_nonblank
+        CHECK (btrim(qdrant_index_version) <> ''),
+    CONSTRAINT ck_publication_items_acl_object CHECK (jsonb_typeof(acl_snapshot) = 'object'),
+    CONSTRAINT ck_publication_items_acl_sha256
+        CHECK (acl_snapshot_sha256 ~ '^[0-9a-f]{64}$')
+);
+
 CREATE TABLE bridgeai_knowledge.index_sync_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     organization_id UUID NOT NULL,
     project_id UUID NOT NULL,
     chunk_id UUID,
-    publication_id UUID,
+    release_id UUID,
+    sync_phase TEXT NOT NULL,
     operation TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
     idempotency_key TEXT NOT NULL,
@@ -3000,25 +3179,29 @@ CREATE TABLE bridgeai_knowledge.index_sync_jobs (
         FOREIGN KEY (chunk_id, organization_id, project_id)
         REFERENCES bridgeai_knowledge.chunks (id, organization_id, project_id)
         ON DELETE RESTRICT,
-    CONSTRAINT fk_index_sync_jobs_publication_scope
-        FOREIGN KEY (publication_id, organization_id, project_id)
-        REFERENCES bridgeai_knowledge.publications (id, organization_id, project_id)
+    CONSTRAINT fk_index_sync_jobs_release_scope
+        FOREIGN KEY (release_id, organization_id, project_id)
+        REFERENCES bridgeai_knowledge.knowledge_releases (id, organization_id, project_id)
         ON DELETE RESTRICT,
     CONSTRAINT uq_index_sync_jobs_id_scope UNIQUE (id, organization_id, project_id),
     CONSTRAINT uq_index_sync_jobs_idempotency
         UNIQUE (organization_id, project_id, idempotency_key),
+    CONSTRAINT ck_index_sync_jobs_phase CHECK (sync_phase IN ('build', 'activate')),
     CONSTRAINT ck_index_sync_jobs_target_shape CHECK (
-        (operation IN ('upsert', 'delete_point', 'verify_point')
-         AND chunk_id IS NOT NULL AND publication_id IS NULL)
-        OR (operation IN ('publish_collection', 'withdraw_collection', 'verify_collection')
-            AND publication_id IS NOT NULL AND chunk_id IS NULL)
+        (sync_phase = 'build'
+         AND operation IN ('upsert', 'delete_point', 'verify_point')
+         AND chunk_id IS NOT NULL AND release_id IS NULL)
+        OR (sync_phase = 'activate'
+            AND operation IN ('publish_collection', 'withdraw_collection', 'verify_collection')
+            AND release_id IS NOT NULL AND chunk_id IS NULL)
     ),
     CONSTRAINT ck_index_sync_jobs_status CHECK (
         status IN ('queued', 'running', 'succeeded', 'failed', 'dead_letter', 'cancelled')
     ),
     CONSTRAINT ck_index_sync_jobs_key_nonblank CHECK (btrim(idempotency_key) <> ''),
     CONSTRAINT ck_index_sync_jobs_collection_namespace CHECK (
-        qdrant_collection LIKE 'bridgeai_knowledge_%'
+        (sync_phase = 'build' AND qdrant_collection LIKE 'bridgeai_knowledge_staging_%')
+        OR (sync_phase = 'activate' AND qdrant_collection LIKE 'bridgeai_knowledge_prod_%')
     ),
     CONSTRAINT ck_index_sync_jobs_point_shape CHECK (
         operation IN ('publish_collection', 'withdraw_collection', 'verify_collection')
@@ -3045,6 +3228,9 @@ CREATE INDEX ix_chunks_version_locator
 CREATE INDEX ix_citations_consumer
     ON bridgeai_knowledge.citations
        (organization_id, project_id, cited_by_type, cited_by_id);
+CREATE INDEX ix_publication_items_release
+    ON bridgeai_knowledge.publication_items
+       (organization_id, project_id, release_id, ordinal_no);
 CREATE INDEX ix_index_sync_jobs_claim
     ON bridgeai_knowledge.index_sync_jobs
        (organization_id, project_id, status, available_at)
@@ -3053,11 +3239,13 @@ CREATE INDEX ix_index_sync_jobs_claim
 
 `cited_by_type + cited_by_id` 是受控的多态消费方引用，不伪装成数据库外键：允许类型只有上表 CHECK 中四种，写入入口统一为 Citation Service；该服务在同一请求中按类型解析目标表、校验组织/项目可见性并保存目标稳定 ID，删除/撤签事件再由一致性作业复核引用。强业务关系位于引用的证据一侧，因此 chunk、文档版本和 Artifact 版本全部使用可验证组合外键。`workflow_events.id` 是 BIGINT 且带分区键，报告修订与外部导出又有不同键形状，强行把这些消费方塞入一个 UUID 外键只会产生无法验证的伪关系。
 
-`qdrant_collection`、`qdrant_point_id` 和 `qdrant_index_version` 明确是派生同步字段：只能由索引投影器更新 `index_sync_jobs`，不得由 Qdrant 回写 `document_versions`、`chunks`、`publications` 或 `citations`。知识集合强制使用 `bridgeai_knowledge_` 前缀。
+`knowledge_releases` 是一次生产发布的聚合根，`publication_items` 冻结该 release 的文档版本集合、逐版本 Chunk ID/哈希清单、生产 collection/index version 和 ACL 快照；历史查询以 `release_id` 读取这些 item，不重新计算“当前发布版本”。`publications` 仍是单文档状态动作证据，不能单独替代集合快照。
+
+`qdrant_collection`、`qdrant_point_id` 和 `qdrant_index_version` 明确是派生同步字段：只能由索引投影器更新 `index_sync_jobs`，不得由 Qdrant 回写权威版本或发布快照。`sync_phase='build'` 只允许 `indexing/review_pending` 文档写入 `bridgeai_knowledge_staging_*`；`sync_phase='activate'` 只允许依据已发布/撤回 release 操作其冻结的 `bridgeai_knowledge_prod_*` 集合。registered/rejected/failed 不得进入生产投影。
 
 ### 8.16.3 版本与发布保护
 
-已发布版本不可覆盖。文档版本允许状态推进，但来源 Artifact、哈希、版本号、有效期及解析/切分版本一旦离开 `registered` 就冻结；正文片段、发布记录和引用快照均追加写。需要纠错时创建新的 `document_versions` 和 `chunks`，以 `supersedes_version_id` 关联旧版本，再追加 `publications(publication_action='supersede')`。
+已发布版本不可覆盖。文档版本允许状态推进；来源 Artifact、哈希、版本号和有效期在首次更新后保持不可变，解析器、切分策略与 embedding contract 则在首次进入 `indexing` 时完整落盘并设置持久锁，之后即使 `failed → parsing` 重试也不得改写。正文片段、发布记录和引用快照均追加写。需要纠错时创建新的 `document_versions` 和 `chunks`，以 `supersedes_version_id` 关联旧版本，再追加 `publications(publication_action='supersede')`。
 
 ```sql
 CREATE OR REPLACE FUNCTION bridgeai_knowledge.enforce_document_version_transition()
@@ -3066,8 +3254,8 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
-        IF NEW.status <> 'registered' THEN
-            RAISE EXCEPTION 'document version initial status must be registered';
+        IF NEW.status <> 'registered' OR NEW.processing_contract_locked_at IS NOT NULL THEN
+            RAISE EXCEPTION 'document version must start registered with unlocked processing contract';
         END IF;
         RETURN NEW;
     END IF;
@@ -3084,11 +3272,28 @@ BEGIN
         RAISE EXCEPTION 'document version identity and processing inputs are immutable';
     END IF;
 
-    IF OLD.status IN ('indexing', 'review_pending', 'published', 'superseded', 'archived')
-       AND ROW(NEW.parser_name, NEW.parser_version, NEW.chunking_policy_version)
-           IS DISTINCT FROM ROW(OLD.parser_name, OLD.parser_version, OLD.chunking_policy_version)
-    THEN
-        RAISE EXCEPTION 'document parsing and chunking versions are frozen at indexing';
+    IF OLD.processing_contract_locked_at IS NOT NULL AND (
+        NEW.processing_contract_locked_at IS DISTINCT FROM OLD.processing_contract_locked_at
+        OR ROW(
+            NEW.parser_name, NEW.parser_version, NEW.chunking_policy_version,
+            NEW.embedding_contract_version
+        ) IS DISTINCT FROM ROW(
+            OLD.parser_name, OLD.parser_version, OLD.chunking_policy_version,
+            OLD.embedding_contract_version
+        )
+    ) THEN
+        RAISE EXCEPTION 'locked processing contract is immutable; create a new document version';
+    END IF;
+
+    IF NEW.status = 'indexing' AND OLD.processing_contract_locked_at IS NULL THEN
+        IF NEW.parser_name IS NULL OR btrim(NEW.parser_name) = ''
+           OR NEW.parser_version IS NULL OR btrim(NEW.parser_version) = ''
+           OR NEW.chunking_policy_version IS NULL OR btrim(NEW.chunking_policy_version) = ''
+           OR NEW.embedding_contract_version IS NULL
+           OR btrim(NEW.embedding_contract_version) = '' THEN
+            RAISE EXCEPTION 'indexing requires complete parser/chunker/embedding contract';
+        END IF;
+        NEW.processing_contract_locked_at := CURRENT_TIMESTAMP;
     END IF;
 
     IF OLD.status <> NEW.status AND NOT (
@@ -3151,6 +3356,284 @@ CREATE TRIGGER trg_publications_validate_insert
 BEFORE INSERT ON bridgeai_knowledge.publications
 FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.validate_publication_insert();
 
+CREATE OR REPLACE FUNCTION bridgeai_knowledge.validate_chunk_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    version_status TEXT;
+    locked_parser_version TEXT;
+    locked_chunking_version TEXT;
+BEGIN
+    SELECT status, parser_version, chunking_policy_version
+      INTO version_status, locked_parser_version, locked_chunking_version
+    FROM bridgeai_knowledge.document_versions
+    WHERE id = NEW.document_version_id
+      AND organization_id = NEW.organization_id
+      AND project_id = NEW.project_id
+      AND document_id = NEW.document_id;
+
+    IF version_status <> 'indexing' THEN
+        RAISE EXCEPTION 'chunks may be inserted only while document version is indexing';
+    END IF;
+    IF NEW.parser_version <> locked_parser_version
+       OR NEW.chunking_policy_version <> locked_chunking_version THEN
+        RAISE EXCEPTION 'chunk processing versions differ from locked document contract';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_chunks_validate_insert
+BEFORE INSERT ON bridgeai_knowledge.chunks
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.validate_chunk_insert();
+
+CREATE OR REPLACE FUNCTION bridgeai_knowledge.validate_citation_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    version_status TEXT;
+BEGIN
+    SELECT status INTO version_status
+    FROM bridgeai_knowledge.document_versions
+    WHERE id = NEW.document_version_id
+      AND organization_id = NEW.organization_id
+      AND project_id = NEW.project_id
+      AND document_id = NEW.document_id;
+    IF version_status <> 'published' THEN
+        RAISE EXCEPTION 'new citation requires a published document version';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_citations_validate_insert
+BEFORE INSERT ON bridgeai_knowledge.citations
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.validate_citation_insert();
+
+CREATE OR REPLACE FUNCTION bridgeai_knowledge.enforce_publication_item_snapshot()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    release_status TEXT;
+    old_release_status TEXT;
+    publication_action TEXT;
+    publication_version_id UUID;
+    version_status TEXT;
+    actual_chunk_count INTEGER;
+    actual_chunk_manifest JSONB;
+BEGIN
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        SELECT status INTO old_release_status
+        FROM bridgeai_knowledge.knowledge_releases
+        WHERE id = OLD.release_id
+          AND organization_id = OLD.organization_id
+          AND project_id = OLD.project_id
+        FOR UPDATE;
+        IF old_release_status <> 'draft' THEN
+            RAISE EXCEPTION 'publication item snapshot is immutable after release publication';
+        END IF;
+    END IF;
+
+    SELECT status INTO release_status
+    FROM bridgeai_knowledge.knowledge_releases
+    WHERE id = COALESCE(NEW.release_id, OLD.release_id)
+      AND organization_id = COALESCE(NEW.organization_id, OLD.organization_id)
+      AND project_id = COALESCE(NEW.project_id, OLD.project_id)
+    FOR UPDATE;
+
+    IF release_status <> 'draft' THEN
+        RAISE EXCEPTION 'publication item snapshot is immutable after release publication';
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+
+    SELECT p.publication_action, p.document_version_id, dv.status
+      INTO publication_action, publication_version_id, version_status
+    FROM bridgeai_knowledge.publications AS p
+    JOIN bridgeai_knowledge.document_versions AS dv
+      ON dv.id = p.document_version_id
+     AND dv.organization_id = p.organization_id
+     AND dv.project_id = p.project_id
+     AND dv.document_id = p.document_id
+    WHERE p.id = NEW.publication_id
+      AND p.organization_id = NEW.organization_id
+      AND p.project_id = NEW.project_id;
+
+    IF publication_action <> 'publish'
+       OR publication_version_id <> NEW.document_version_id
+       OR version_status <> 'published' THEN
+        RAISE EXCEPTION 'release item requires the matching publish action and published version';
+    END IF;
+
+    SELECT count(*)::integer,
+           jsonb_agg(
+               jsonb_build_object(
+                   'chunk_id', c.id::text,
+                   'content_sha256', c.content_sha256
+               ) ORDER BY c.ordinal_no
+           )
+      INTO actual_chunk_count, actual_chunk_manifest
+    FROM bridgeai_knowledge.chunks AS c
+    WHERE c.organization_id = NEW.organization_id
+      AND c.project_id = NEW.project_id
+      AND c.document_version_id = NEW.document_version_id;
+
+    IF actual_chunk_count <> NEW.chunk_count
+       OR actual_chunk_manifest IS DISTINCT FROM NEW.chunk_manifest
+       OR encode(digest(NEW.chunk_manifest::text, 'sha256'), 'hex')
+          <> NEW.chunk_manifest_sha256 THEN
+        RAISE EXCEPTION 'release item chunk manifest does not match authoritative chunks';
+    END IF;
+    IF encode(digest(NEW.acl_snapshot::text, 'sha256'), 'hex')
+       <> NEW.acl_snapshot_sha256 THEN
+        RAISE EXCEPTION 'release item ACL snapshot hash mismatch';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_publication_items_snapshot
+BEFORE INSERT OR UPDATE OR DELETE ON bridgeai_knowledge.publication_items
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.enforce_publication_item_snapshot();
+
+CREATE OR REPLACE FUNCTION bridgeai_knowledge.enforce_knowledge_release_transition()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    actual_item_count INTEGER;
+    actual_manifest JSONB;
+    incompatible_item_count INTEGER;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status <> 'draft' THEN
+            RAISE EXCEPTION 'knowledge release initial status must be draft';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.status IN ('published', 'withdrawn') AND ROW(
+        NEW.organization_id, NEW.project_id, NEW.release_code, NEW.item_count,
+        NEW.production_collection, NEW.qdrant_index_version, NEW.acl_snapshot,
+        NEW.acl_snapshot_sha256, NEW.release_manifest, NEW.release_manifest_sha256,
+        NEW.published_at, NEW.published_by
+    ) IS DISTINCT FROM ROW(
+        OLD.organization_id, OLD.project_id, OLD.release_code, OLD.item_count,
+        OLD.production_collection, OLD.qdrant_index_version, OLD.acl_snapshot,
+        OLD.acl_snapshot_sha256, OLD.release_manifest, OLD.release_manifest_sha256,
+        OLD.published_at, OLD.published_by
+    ) THEN
+        RAISE EXCEPTION 'published release aggregate is immutable';
+    END IF;
+
+    IF OLD.status <> NEW.status AND NOT (
+        (OLD.status = 'draft' AND NEW.status = 'published')
+        OR (OLD.status = 'published' AND NEW.status = 'withdrawn')
+    ) THEN
+        RAISE EXCEPTION 'invalid knowledge release transition: % -> %', OLD.status, NEW.status;
+    END IF;
+
+    IF OLD.status = 'draft' AND NEW.status = 'published' THEN
+        SELECT count(*)::integer,
+               jsonb_agg(
+                   jsonb_build_object(
+                       'publication_item_id', i.id::text,
+                       'document_version_id', i.document_version_id::text,
+                       'chunk_manifest_sha256', i.chunk_manifest_sha256,
+                       'qdrant_index_version', i.qdrant_index_version,
+                       'qdrant_collection', i.qdrant_collection,
+                       'acl_snapshot_sha256', i.acl_snapshot_sha256
+                   ) ORDER BY i.ordinal_no
+               ),
+               count(*) FILTER (
+                   WHERE i.qdrant_collection <> NEW.production_collection
+                      OR i.qdrant_index_version <> NEW.qdrant_index_version
+               )::integer
+          INTO actual_item_count, actual_manifest, incompatible_item_count
+        FROM bridgeai_knowledge.publication_items AS i
+        WHERE i.release_id = NEW.id
+          AND i.organization_id = NEW.organization_id
+          AND i.project_id = NEW.project_id;
+
+        IF actual_item_count <> NEW.item_count
+           OR actual_item_count = 0
+           OR actual_manifest IS DISTINCT FROM NEW.release_manifest
+           OR encode(digest(NEW.release_manifest::text, 'sha256'), 'hex')
+              <> NEW.release_manifest_sha256
+           OR encode(digest(NEW.acl_snapshot::text, 'sha256'), 'hex')
+              <> NEW.acl_snapshot_sha256
+           OR incompatible_item_count <> 0 THEN
+            RAISE EXCEPTION 'release aggregate does not match publication item snapshots';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_knowledge_releases_transition
+BEFORE INSERT OR UPDATE ON bridgeai_knowledge.knowledge_releases
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.enforce_knowledge_release_transition();
+
+CREATE OR REPLACE FUNCTION bridgeai_knowledge.validate_index_sync_job_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    version_status TEXT;
+    authoritative_sha256 TEXT;
+    release_status TEXT;
+    release_collection TEXT;
+    release_index_version TEXT;
+    authoritative_release_manifest_sha256 TEXT;
+BEGIN
+    IF NEW.sync_phase = 'build' THEN
+        SELECT dv.status, c.content_sha256
+          INTO version_status, authoritative_sha256
+        FROM bridgeai_knowledge.chunks AS c
+        JOIN bridgeai_knowledge.document_versions AS dv
+          ON dv.id = c.document_version_id
+         AND dv.organization_id = c.organization_id
+         AND dv.project_id = c.project_id
+         AND dv.document_id = c.document_id
+        WHERE c.id = NEW.chunk_id
+          AND c.organization_id = NEW.organization_id
+          AND c.project_id = NEW.project_id;
+        IF version_status NOT IN ('indexing', 'review_pending')
+           OR authoritative_sha256 <> NEW.source_revision_sha256 THEN
+            RAISE EXCEPTION 'staging build requires indexing/review_pending version and current chunk hash';
+        END IF;
+    ELSE
+        SELECT status, production_collection, qdrant_index_version,
+               kr.release_manifest_sha256
+          INTO release_status, release_collection, release_index_version,
+               authoritative_release_manifest_sha256
+        FROM bridgeai_knowledge.knowledge_releases AS kr
+        WHERE kr.id = NEW.release_id
+          AND kr.organization_id = NEW.organization_id
+          AND kr.project_id = NEW.project_id;
+        IF (
+            NEW.operation IN ('publish_collection', 'verify_collection')
+            AND release_status <> 'published'
+        ) OR (
+            NEW.operation = 'withdraw_collection' AND release_status <> 'withdrawn'
+        ) OR NEW.qdrant_collection <> release_collection
+          OR NEW.qdrant_index_version <> release_index_version
+          OR NEW.source_revision_sha256 <> authoritative_release_manifest_sha256 THEN
+            RAISE EXCEPTION 'production activation must match published/withdrawn release snapshot';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_index_sync_jobs_validate_insert
+BEFORE INSERT ON bridgeai_knowledge.index_sync_jobs
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.validate_index_sync_job_insert();
+
 CREATE OR REPLACE FUNCTION bridgeai_knowledge.reject_immutable_row_change()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -3169,6 +3652,9 @@ FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.reject_immutable_row_change();
 CREATE TRIGGER trg_citations_append_only
 BEFORE UPDATE OR DELETE ON bridgeai_knowledge.citations
 FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.reject_immutable_row_change();
+CREATE TRIGGER trg_knowledge_releases_no_delete
+BEFORE DELETE ON bridgeai_knowledge.knowledge_releases
+FOR EACH ROW EXECUTE FUNCTION bridgeai_knowledge.reject_immutable_row_change();
 ```
 
 ### 8.16.4 RLS 与一致性验证
@@ -3180,7 +3666,8 @@ DECLARE
 BEGIN
     FOREACH table_name IN ARRAY ARRAY[
         'knowledge_sources', 'documents', 'document_versions', 'chunks',
-        'publications', 'citations', 'index_sync_jobs'
+        'publications', 'citations', 'knowledge_releases', 'publication_items',
+        'index_sync_jobs'
     ]
     LOOP
         EXECUTE format('ALTER TABLE bridgeai_knowledge.%I ENABLE ROW LEVEL SECURITY', table_name);
@@ -3221,14 +3708,40 @@ WHERE c.page_start IS NULL
   AND c.clause_number IS NULL
   AND c.char_start IS NULL;
 
--- Qdrant 只能是可重建投影；成功 job 的来源哈希须仍等于权威 chunk 哈希。
+-- Qdrant 只能是可重建投影；成功 build job 的来源哈希须仍等于权威 chunk 哈希。
 SELECT j.id
 FROM bridgeai_knowledge.index_sync_jobs AS j
 JOIN bridgeai_knowledge.chunks AS c
   ON (c.id,c.organization_id,c.project_id) = (j.chunk_id,j.organization_id,j.project_id)
 WHERE j.status = 'succeeded'
+  AND j.sync_phase = 'build'
   AND j.operation IN ('upsert', 'verify_point')
   AND j.source_revision_sha256 <> c.content_sha256;
+
+-- published release 必须可仅靠冻结 item 恢复，且生产激活参数与 aggregate 完全一致。
+SELECT r.id
+FROM bridgeai_knowledge.knowledge_releases AS r
+LEFT JOIN bridgeai_knowledge.publication_items AS i
+  ON (i.release_id,i.organization_id,i.project_id) = (r.id,r.organization_id,r.project_id)
+WHERE r.status = 'published'
+GROUP BY r.id, r.item_count, r.production_collection, r.qdrant_index_version,
+         r.release_manifest_sha256
+HAVING count(i.id) <> r.item_count
+    OR count(*) FILTER (
+        WHERE i.qdrant_collection <> r.production_collection
+           OR i.qdrant_index_version <> r.qdrant_index_version
+    ) <> 0
+    OR NOT EXISTS (
+        SELECT 1 FROM bridgeai_knowledge.index_sync_jobs AS j
+        WHERE j.release_id = r.id
+          AND j.organization_id = r.organization_id
+          AND j.project_id = r.project_id
+          AND j.sync_phase = 'activate'
+          AND j.operation IN ('publish_collection','verify_collection')
+          AND j.qdrant_collection = r.production_collection
+          AND j.qdrant_index_version = r.qdrant_index_version
+          AND j.source_revision_sha256 = r.release_manifest_sha256
+    );
 ```
 
 ## 8.17 Memory 与 Context 数据模型
@@ -3527,6 +4040,7 @@ CREATE TABLE bridgeai_memory.context_manifests (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     organization_id UUID NOT NULL,
     project_id UUID NOT NULL,
+    user_id UUID NOT NULL,
     task_id UUID NOT NULL,
     run_id UUID NOT NULL,
     thread_id TEXT NOT NULL,
@@ -3555,6 +4069,9 @@ CREATE TABLE bridgeai_memory.context_manifests (
     CONSTRAINT fk_context_manifests_project_scope
         FOREIGN KEY (project_id, organization_id)
         REFERENCES bridgeai_core.projects (id, organization_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_context_manifests_user_scope
+        FOREIGN KEY (user_id, organization_id)
+        REFERENCES bridgeai_identity.users (id, organization_id) ON DELETE RESTRICT,
     CONSTRAINT fk_context_manifests_task_scope
         FOREIGN KEY (task_id, organization_id, project_id)
         REFERENCES bridgeai_workflow.workflow_tasks (id, organization_id, project_id)
@@ -3665,7 +4182,7 @@ CREATE TABLE bridgeai_memory.context_manifest_items (
 );
 ```
 
-每条 `context_manifest_items` 都是候选清单的一项，`candidate_rank` 保存进入裁剪前的位置，`disposition` 冻结最终 used/omitted/compressed 结果，且引用具体 `memory_revision_id` 或 RAG `citation_id`，不会在历史复现时漂移到“最新版本”。`business_ref_type/id` 与 Citation 消费端一样只是受控外部引用，由 Context Builder 通过领域服务校验，不宣称数据库强关系。
+每条 `context_manifest_items` 都是候选清单的一项，`candidate_rank` 保存进入裁剪前的位置，`disposition` 冻结最终 used/omitted/compressed 结果，且引用具体 `memory_revision_id` 或 RAG `citation_id`，不会在历史复现时漂移到“最新版本”。Manifest 同时冻结调用者 `user_id`；task 记忆必须与 manifest 的 task 和 project 都一致，project 记忆必须同 project，user 记忆必须同 user，organization 记忆只继承同组织。只有在 `as_of` 时仍为 active、有效且指向当前修订的记忆可标为 used/compressed；失效候选只能作为带原因的 omitted 审计项。`business_ref_type/id` 与 Citation 消费端一样只是受控外部引用，由 Context Builder 通过领域服务校验，不宣称数据库强关系。
 
 ### 8.17.3 删除传播与最小墓碑
 
@@ -3762,7 +4279,7 @@ CREATE INDEX ix_deletion_jobs_claim
     WHERE status IN ('pending', 'failed');
 ```
 
-删除顺序固定为：同一 PostgreSQL 事务先将 active 记录转为 `revoked` 并创建幂等 job → 使缓存失效 → 只从 `bridgeai_memory_*` 集合删除 Memory point → 按保留/法律冻结策略清理 Artifact → 将记录转为 `tombstoned` 并通过受控过程清除修订正文 → 逐项核对成功后将 job 与记录标记 `complete/deleted`。`context_manifest_items`、原内容哈希、来源 ID/版本、删除依据、主体和时间作为不含正文的最小墓碑保留，使历史运行能说明“来源已删除”而不是静默换用新记忆。
+删除顺序固定为：同一 PostgreSQL 事务先将 active 记录转为 `revoked` 并以 `pending` 创建幂等 job → job 进入 `running` 后使缓存失效 → 只从 `bridgeai_memory_*` 集合删除 Memory point → 按保留/法律冻结策略清理 Artifact → 将记录转为 `tombstoned` 并通过受控过程清除全部修订正文 → 四个传播目标逐项核对成功后先把 job 标记 `complete`，再把记录标记 `deletion_status='complete'/status='deleted'`。记录的完成转换会再次验证同范围 complete job 与所有修订均已脱敏，不能靠直接更新状态绕过。`context_manifest_items`、原内容哈希、来源 ID/版本、删除依据、主体和时间作为不含正文的最小墓碑保留，使历史运行能说明“来源已删除”而不是静默换用新记忆。
 
 Memory 与 RAG 的 Qdrant 集合强制隔离：Memory 仅允许 `bridgeai_memory_*`，知识同步仅允许 `bridgeai_knowledge_*`；不得共享集合或生产别名，Memory 命中不得冒充 `citations`/RAG Evidence。
 
@@ -3777,6 +4294,9 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     source_count INTEGER;
+    authoritative_source_count INTEGER;
+    complete_deletion_job_count INTEGER;
+    unredacted_revision_count INTEGER;
     predecessor bridgeai_memory.memory_records%ROWTYPE;
 BEGIN
     IF TG_OP = 'INSERT' THEN
@@ -3827,6 +4347,27 @@ BEGIN
         IF source_count = 0 THEN
             RAISE EXCEPTION 'active memory requires an active versioned source';
         END IF;
+        IF NEW.risk_level IN ('high', 'critical') THEN
+            IF NEW.validation_status NOT IN ('source_verified', 'human_confirmed') THEN
+                RAISE EXCEPTION 'high/critical memory requires confirmed validation status';
+            END IF;
+            SELECT count(*) INTO authoritative_source_count
+            FROM bridgeai_memory.memory_sources AS s
+            WHERE s.memory_id = NEW.id
+              AND s.organization_id = NEW.organization_id
+              AND s.memory_revision_id = NEW.current_revision_id
+              AND s.availability_status = 'active'
+              AND s.source_type IN (
+                  'business_record', 'human_review', 'signed_report', 'evaluation_report'
+              )
+              AND (
+                  s.source_type <> 'evaluation_report'
+                  OR s.source_locator ->> 'publication_status' = 'published'
+              );
+            IF authoritative_source_count = 0 THEN
+                RAISE EXCEPTION 'high/critical memory requires authoritative active source';
+            END IF;
+        END IF;
     END IF;
 
     IF NEW.supersedes_memory_id IS NOT NULL THEN
@@ -3840,6 +4381,35 @@ BEGIN
            OR predecessor.user_id IS DISTINCT FROM NEW.user_id
            OR predecessor.memory_family_id <> NEW.memory_family_id THEN
             RAISE EXCEPTION 'superseded memory must have identical scope and family';
+        END IF;
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND (
+        NEW.status = 'deleted'
+        OR (NEW.deletion_status = 'complete' AND OLD.deletion_status <> 'complete')
+    ) THEN
+        SELECT count(*) INTO complete_deletion_job_count
+        FROM bridgeai_memory.deletion_jobs AS d
+        WHERE d.memory_id = NEW.id
+          AND d.organization_id = NEW.organization_id
+          AND d.project_id IS NOT DISTINCT FROM NEW.project_id
+          AND d.status = 'complete'
+          AND d.postgres_redaction_status IN ('succeeded', 'not_required')
+          AND d.qdrant_delete_status IN ('succeeded', 'not_required')
+          AND d.cache_invalidation_status IN ('succeeded', 'not_required')
+          AND d.artifact_cleanup_status IN ('succeeded', 'not_required');
+
+        SELECT count(*) INTO unredacted_revision_count
+        FROM bridgeai_memory.memory_revisions AS r
+        WHERE r.memory_id = NEW.id
+          AND r.organization_id = NEW.organization_id
+          AND (
+              r.redacted_at IS NULL OR r.content_text IS NOT NULL
+              OR r.summary IS NOT NULL OR r.structured_facts <> '{}'::jsonb
+          );
+
+        IF complete_deletion_job_count = 0 OR unredacted_revision_count <> 0 THEN
+            RAISE EXCEPTION 'deleted/complete memory requires completed propagation job and all revisions redacted';
         END IF;
     END IF;
     RETURN NEW;
@@ -3944,20 +4514,98 @@ CREATE TRIGGER trg_deletion_jobs_parent_scope
 BEFORE INSERT OR UPDATE ON bridgeai_memory.deletion_jobs
 FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.enforce_memory_child_scope();
 
+CREATE OR REPLACE FUNCTION bridgeai_memory.enforce_deletion_job_transition()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    unredacted_revision_count INTEGER;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status <> 'pending' THEN
+            RAISE EXCEPTION 'deletion job initial status must be pending';
+        END IF;
+    ELSIF OLD.status <> NEW.status AND NOT (
+        (OLD.status = 'pending' AND NEW.status IN ('running', 'blocked', 'failed'))
+        OR (OLD.status IN ('blocked', 'failed') AND NEW.status = 'running')
+        OR (OLD.status = 'running' AND NEW.status IN ('complete', 'blocked', 'failed'))
+    ) THEN
+        RAISE EXCEPTION 'invalid deletion job transition: % -> %', OLD.status, NEW.status;
+    END IF;
+
+    IF TG_OP = 'UPDATE' AND OLD.status <> 'complete' AND NEW.status = 'complete' THEN
+        SELECT count(*) INTO unredacted_revision_count
+        FROM bridgeai_memory.memory_revisions AS r
+        WHERE r.memory_id = NEW.memory_id
+          AND r.organization_id = NEW.organization_id
+          AND (
+              r.redacted_at IS NULL OR r.content_text IS NOT NULL
+              OR r.summary IS NOT NULL OR r.structured_facts <> '{}'::jsonb
+          );
+        IF unredacted_revision_count <> 0 THEN
+            RAISE EXCEPTION 'deletion job cannot complete before every revision is redacted';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_deletion_jobs_transition
+BEFORE INSERT OR UPDATE ON bridgeai_memory.deletion_jobs
+FOR EACH ROW EXECUTE FUNCTION bridgeai_memory.enforce_deletion_job_transition();
+
 CREATE OR REPLACE FUNCTION bridgeai_memory.enforce_manifest_memory_scope()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 DECLARE
+    memory_scope_type TEXT;
     memory_project_id UUID;
+    memory_task_id UUID;
+    memory_user_id UUID;
+    memory_status TEXT;
+    memory_current_revision_id UUID;
+    memory_valid_from TIMESTAMPTZ;
+    memory_valid_until TIMESTAMPTZ;
+    manifest_project_id UUID;
+    manifest_task_id UUID;
+    manifest_user_id UUID;
+    manifest_as_of TIMESTAMPTZ;
 BEGIN
     IF NEW.item_kind = 'memory_revision' THEN
-        SELECT project_id INTO memory_project_id
+        SELECT scope_type, project_id, task_id, user_id, status,
+               current_revision_id, valid_from, valid_until
+          INTO memory_scope_type, memory_project_id, memory_task_id, memory_user_id,
+               memory_status, memory_current_revision_id, memory_valid_from,
+               memory_valid_until
         FROM bridgeai_memory.memory_records
         WHERE id = NEW.memory_id AND organization_id = NEW.organization_id;
-        IF NOT FOUND
-           OR (memory_project_id IS NOT NULL AND memory_project_id <> NEW.project_id) THEN
-            RAISE EXCEPTION 'project/task memory cannot enter another project manifest';
+
+        SELECT project_id, task_id, user_id, as_of
+          INTO manifest_project_id, manifest_task_id, manifest_user_id, manifest_as_of
+        FROM bridgeai_memory.context_manifests
+        WHERE id = NEW.context_manifest_id
+          AND organization_id = NEW.organization_id
+          AND project_id = NEW.project_id;
+
+        IF NOT FOUND OR (
+            memory_scope_type = 'task'
+            AND (memory_project_id <> manifest_project_id OR memory_task_id <> manifest_task_id)
+        ) OR (
+            memory_scope_type = 'project' AND memory_project_id <> manifest_project_id
+        ) OR (
+            memory_scope_type = 'user' AND memory_user_id <> manifest_user_id
+        ) OR memory_scope_type NOT IN ('task', 'project', 'user', 'organization') THEN
+            RAISE EXCEPTION 'memory primary scope is not inherited by this manifest';
+        END IF;
+
+        IF NEW.disposition IN ('used', 'compressed') AND (
+            memory_status <> 'active'
+            OR memory_current_revision_id <> NEW.memory_revision_id
+            OR memory_valid_from > manifest_as_of
+            OR (memory_valid_until IS NOT NULL AND memory_valid_until <= manifest_as_of)
+        ) THEN
+            RAISE EXCEPTION 'used/compressed item requires active current memory revision at manifest as_of';
         END IF;
     END IF;
     RETURN NEW;
