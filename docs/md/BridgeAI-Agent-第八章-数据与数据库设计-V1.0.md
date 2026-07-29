@@ -8274,7 +8274,395 @@ contract 不与 switch 同日执行。删除列／表、重编码 ID／分区键
 
 ## 8.25 备份、恢复与灾难演练
 
+### 8.25.1 恢复目标、计时口径与失败语义
+
+本节的灾难恢复范围覆盖 PostgreSQL 17 权威数据库、LangGraph 官方
+Checkpointer 表、MinIO/S3 Artifact 不可变对象版本，以及由 PostgreSQL 权威状态
+派生的 Qdrant 索引和 Redis 缓存。任何演练在开始前都必须指定灾难场景、故障时刻
+`T_failure`、恢复点、隔离环境、数据集规模和负责人；生产实例不得作为试恢复目标，
+也不得在演练中删除生产 WAL、对象版本或集合。
+
+第一阶段服务目标为 **RPO 不超过 15 分钟、RTO 不超过 4 小时**：
+
+- PostgreSQL 数据损失窗口为 `T_failure - T_last_recoverable_commit`；
+  `T_last_recoverable_commit` 必须由实际回放后的事务、恢复 LSN 与业务时间戳共同证明。
+- Artifact 数据损失窗口为 `T_failure - T_last_recoverable_object_version`；该对象版本必须
+  同时存在于对象存储备份和同一恢复边界导出的 Artifact Manifest 中，并通过 SHA-256
+  和字节数校验。
+- 端到端 RPO 取 PostgreSQL 与所有受保护 Artifact 中的**最大**数据损失窗口，不取组件
+  平均值。Qdrant 和 Redis 是派生层，不单独放宽权威数据 RPO。
+- RTO 从事件被宣告且写入入口被隔离的 `T_declared` 开始，到 8.25.5 全部门禁通过、
+  恢复负责人签署 `T_service_accepted` 为止，即
+  `RTO = T_service_accepted - T_declared`。数据库进程启动、端口可连、对象服务返回 200
+  或 Qdrant 集合创建成功都不是 RTO 结束。
+
+`archive_timeout`、基础备份周期、对象复制周期和监控采样周期只是配置输入，不能单独
+证明 RPO；组件启动日志、无断言的脚本退出码、截图或手工口头确认也不能证明 RTO。
+任一权威组件超过 15 分钟、任一强门禁在 4 小时内未通过，或计时证据不完整，本次
+演练状态都必须为 `FAILED`，不能以“部分通过”抵消。
+
+### 8.25.2 备份分层与恢复契约
+
+| 数据层 | 备份合同 | 恢复用途 | 完整性证据 | 失败处理 |
+|---|---|---|---|---|
+| PostgreSQL 物理层 | 周期性全量 `pg_basebackup`，持续归档其后 WAL；基准备份和 WAL 在独立故障域加密保存 | 整库、跨 Schema、Checkpoint 和审计的一致 PITR；主灾备路径 | `pg_verifybackup`、backup manifest、起止 LSN、WAL 连续性、数据校验和状态、实际目标时刻恢复 | 缺任一 WAL 段、manifest 校验失败或时间线不明即阻断，不跳过坏段启动 |
+| PostgreSQL 逻辑层 | 按发布／合同变更创建 `pg_dump --format=custom`；另将全局角色和成员关系以受控、加密、最小权限方式导出 | 新空库兼容验证、选择性取证和物理恢复后的交叉核对；不替代 PITR | `pg_restore --list`、新空库恢复退出码、行数／哈希／约束／RLS 目录核对 | 不用逻辑备份宣称达到 15 分钟 RPO；角色文件可能含敏感 verifier，禁止写普通日志或仓库 |
+| MinIO/S3 Artifact | bucket versioning 开启；保留精确 `bucket/object_key/version_id`，复制或离线备份对象版本；每个数据库恢复边界导出 Artifact Manifest | 恢复原始影像、模型、报告、知识原件及其他不可变字节 | 对象版本可读、`size_bytes` 一致、流式 SHA-256 一致、legal hold/retention 元数据核对、抽样与全量清单统计 | 禁止回退到同 key 的 latest 对象；对象缺失或哈希不一致时对应引用保持拒读并告警 |
+| Qdrant | 保存 collection 配置、向量维数／距离、payload index、别名与 `index_version`；Point 可从权威记录重建 | 派生索引重建，不作为业务事实备份 | active/published 权威 ID 与 Point 双向差集、payload scope/version 抽样、别名切换记录 | 不完整集合不得挂生产别名；缺失时按第六、七章规则降级或拒绝，不扩大 SQL 扫描 |
+| Redis | 不保存唯一权威数据，不要求内容级备份 | 从 PostgreSQL 和当前派生版本重建缓存 | 命名空间版本、ACL 版本和失效事件核对 | 丢失时冷启动；不得用旧 ACL 缓存恢复放行 |
+
+物理备份作业使用受限备份角色和密钥管理系统注入的连接信息。以下是 PostgreSQL 17
+命令形态，不包含凭据；实际目录、DSN、保留、带宽和归档工具必须来自版本化 Runbook，
+并在非生产演练环境验证：
+
+```bash
+pg_basebackup \
+  --dbname="$BRIDGEAI_BACKUP_DSN" \
+  --pgdata="$BRIDGEAI_BASEBACKUP_DIR" \
+  --format=plain \
+  --wal-method=stream \
+  --checkpoint=fast \
+  --manifest-checksums=SHA256 \
+  --progress
+
+pg_verifybackup "$BRIDGEAI_BASEBACKUP_DIR"
+
+pg_dump \
+  --dbname="$BRIDGEAI_SOURCE_DSN" \
+  --format=custom \
+  --no-owner \
+  --no-acl \
+  --file="$BRIDGEAI_LOGICAL_DUMP"
+
+pg_dumpall \
+  --dbname="$BRIDGEAI_SOURCE_DSN" \
+  --globals-only \
+  --no-role-passwords \
+  --file="$BRIDGEAI_GLOBALS_SQL"
+
+pg_restore --list "$BRIDGEAI_LOGICAL_DUMP"
+pg_restore \
+  --dbname="$BRIDGEAI_EMPTY_RESTORE_DSN" \
+  --exit-on-error \
+  --no-owner \
+  --no-acl \
+  "$BRIDGEAI_LOGICAL_DUMP"
+```
+
+逻辑恢复目标必须是新建空库；`pg_dumpall --globals-only --no-role-passwords` 只保存角色
+属性和成员关系，不保存 verifier，恢复时由密钥管理流程重新配置凭据。对象 owner、角色
+成员关系、RLS 和函数授权随后按迁移 manifest 恢复并以目录查询验收，而不是因为使用了
+`--no-owner/--no-acl` 就省略。物理
+PITR 从一份已通过 `pg_verifybackup` 的基准备份开始，恢复实例配置 `restore_command`，
+创建 `recovery.signal`，并设置明确的 `recovery_target_time` 或经批准的
+`recovery_target_lsn`；`recovery_target_action = 'pause'` 使负责人先核对目标点，再决定
+promote。归档命令、恢复命令、时间线历史文件和介质路径依部署实现，只有在隔离环境
+实际取回每个所需 WAL 段并到达目标点后才记录 `VERIFIED`。不得把本文示例替换成未经
+执行的生产参数，也不得使用 `recovery_target = 'immediate'` 冒充指定时刻 PITR。
+
+每次备份同时保存以下可追踪信息：集群 system identifier、PostgreSQL/扩展版本、
+数据校验和状态、Alembic heads、配置摘要、基准备份起止时间／LSN／时间线、WAL 归档
+连续区间、所有非系统 Schema、对象 owner、角色属性／成员关系、RLS/Policy/grant
+manifest、已验证约束、有效索引、分区边界、行数和不可变列摘要。密钥、口令、访问令牌
+和敏感正文不得进入证据包。
+
+### 8.25.3 Artifact Manifest 与跨存储一致恢复点
+
+Artifact Manifest 不是对象 key 列表，而是数据库恢复边界处的不可变引用集合。备份
+控制器在 `REPEATABLE READ, READ ONLY` 快照内记录 `pg_current_wal_lsn()`、事务时间和
+Alembic heads，并导出所有尚未 `deleted` 的版本。示例字段合同如下：
+
+```sql
+SELECT
+    a.organization_id,
+    a.project_id,
+    a.id AS artifact_id,
+    a.artifact_code,
+    a.artifact_kind,
+    a.status AS artifact_status,
+    av.id AS artifact_version_id,
+    av.revision_no,
+    av.provider,
+    av.bucket,
+    av.object_key,
+    av.version_id AS object_version_id,
+    av.sha256,
+    av.size_bytes,
+    av.media_type,
+    av.status AS artifact_version_status,
+    av.sensitivity_level,
+    av.verified_at,
+    av.activated_at,
+    av.retention_until,
+    av.legal_hold,
+    av.created_at,
+    av.updated_at
+FROM bridgeai_core.artifacts AS a
+JOIN bridgeai_core.artifact_versions AS av
+  ON (av.artifact_id, av.organization_id, av.project_id)
+   = (a.id, a.organization_id, a.project_id)
+WHERE av.status <> 'deleted'
+ORDER BY a.organization_id, a.project_id, a.id, av.revision_no;
+```
+
+Manifest 使用确定性 CSV 或 JSON Lines 编码，记录行数、总字节数、文件 SHA-256、生成器
+版本、数据库 LSN、快照时间和签名人；文件本身写入版本化、加密、不可覆盖的备份位置。
+对象复制任务逐项读取精确 `object_version_id`，流式计算哈希而不把大对象整体装入内存。
+`sha256`/`size_bytes` 为空的 staged 行只可作为待收敛异常登记，不能计入已保护对象；
+active/archived/revoked/deleting 对象缺版本、缺哈希或 legal hold/retention 元数据不一致
+均阻断备份完成。
+
+PostgreSQL 快照与对象清单必须形成命名恢复点：先冻结或版本化业务写入边界，记录 LSN，
+导出 Manifest，再等待 Manifest 所列对象版本全部进入备份故障域，最后写完成标记。完成
+标记包含 PostgreSQL backup ID、WAL 连续上界和 Manifest SHA-256。没有该完成标记的
+组合只能作为候选恢复材料，不能宣称达到 RPO。
+
+### 8.25.4 隔离恢复顺序与逐步门禁
+
+恢复全程默认 deny-by-default：入口、Worker、定时任务、Outbox 发布、对象删除、索引
+别名切换和报告签发均保持关闭。每步必须保存执行者、起止时间、命令／查询版本、原始
+机器可读结果和裁决；`expected` 不满足时停止后续放流，但可继续只读取证。
+
+| 顺序 | 恢复动作与负责人 | 验证查询／证据 | 期望 | 不满足时的阻断 |
+|---:|---|---|---|---|
+| 0 | 事件指挥选择 `T_target`、backup ID、时间线和 Artifact Manifest | 比较 `T_failure`、LSN/WAL 覆盖区间、Manifest 快照时间与 SHA-256 | 同一命名恢复点，计算的最坏数据损失 ≤ 15 分钟 | 时间线分叉不明、WAL 缺段或清单未完成则不得恢复 |
+| 1 | 数据库负责人在隔离网络恢复物理基线并回放 WAL 到目标点 | PostgreSQL recovery 日志、`pg_is_in_recovery()`、`pg_last_wal_replay_lsn()`、目标事务抽样 | 精确到批准目标且先 pause；promote 后时间线被记录 | 到达错误目标、自动越过目标或需跳过坏 WAL 均失败 |
+| 2 | 平台负责人核对扩展和空间基线 | `SELECT extname,extversion FROM pg_extension ORDER BY 1;`；`SELECT PostGIS_Full_Version();`；检查 `spatial_ref_sys` 中本项目 SRID | `pgcrypto`、`pg_trgm`、`btree_gist`、PostGIS 及 SRID 与 manifest 一致 | 扩展/SRID 缺失或版本未经兼容验证时不运行空间迁移与查询 |
+| 3 | 数据库迁移负责人核对 Schema revision | Alembic `current`/`heads`；`pg_namespace`、`pg_class` 和 migration manifest 差集 | 恢复库只处于一个已批准 revision；不存在意外 ahead/behind | 不在恢复库盲目补跑未知 migration；先裁决 forward-fix 或重选恢复点 |
+| 4 | 安全与数据库负责人恢复／验证角色、owner、RLS 与函数授权 | `pg_roles`、`pg_auth_members`、`pg_class.relrowsecurity/relforcerowsecurity`、`pg_policies`、`information_schema.routine_privileges` | migration owner 不登录；应用无 `BYPASSRLS`；租户表 `ENABLE+FORCE`；SECURITY DEFINER 固定 `search_path` 且 PUBLIC 无 EXECUTE | 任一 owner/Policy/grant 漂移即保持所有应用连接关闭 |
+| 5 | 数据负责人验证强约束、索引和分区 | `pg_constraint.convalidated`、`pg_index.indisvalid/indisready`、`pg_partition_tree`、DEFAULT 行数、未来 62 天边界 | 所有目标 FK/CHECK 已验证；索引有效；DEFAULT 为 0；分区覆盖合同成立 | 约束未验证、无效索引或分区洞阻断写入 |
+| 6 | 安全负责人执行双租户正负向 RLS 验收 | 分别设置受信任组织／项目上下文读取自身行，再以另一项目上下文查询和写入同一 ID | 同租户授权成功；跨组织／项目查询返回 0、写入被拒绝；审计可定位 | 只做正向查询或用 owner/superuser 测试均无效 |
+| 7 | 对象负责人逐项恢复 Artifact | 按 Manifest 精确读取 bucket/key/object_version_id，核对 SHA-256、size、status、retention、legal hold；业务 FK anti-join | 所有强引用版本存在且字节一致；删除中／冻结对象状态不倒退 | 禁止以 latest 版本替代；缺失对象的上层记录保持不可读 |
+| 8 | 领域负责人核对病害、报告与签发证据 | 当前 `damage_revision_id` 指针、revision 链和量测；报告版本、citation、lineage、signature 与 Artifact 版本 anti-join | confirmed 修订不被改写；签发报告所有证据版本和签名引用闭合 | 缺任何证据时报告签发／下载保持关闭，不换用“最新”来源 |
+| 9 | Workflow 负责人核对业务表与官方 Checkpoint | 按 `thread_id/task_id/run_id` 检查任务、运行、复核、最后稳定节点、checkpoint 时间；执行原幂等键 dry-run | 非终态业务状态与 checkpoint 一致；Interrupt 前副作用可证明幂等 | 不直接改官方表；无法恢复关键上下文的任务进入人工复核 |
+| 10 | Knowledge/Memory 负责人先加载 ACL、撤销、删除日志和墓碑，再重建派生索引 | active/published 权威集合与 Qdrant Point 双向差集；collection/index version、payload scope/ACL；Context Manifest 引用 | 已撤回／删除内容不复活；RAG 与 Memory 集合隔离；差集为 0 后才切别名 | Qdrant 不可用可按第六、七章降级；不得恢复旧集合绕过 ACL |
+| 11 | 集成负责人恢复 Outbox 与审计链 | 非终态 Outbox claim/lease、dead-letter、语义哈希；业务版本与事件差集；审计序列、血缘和删除 job | 未发布事件不丢失不重复；相同 key 不同语义仍拒绝；审计与墓碑连续 | 不手改 Outbox 为 published；差异先用受控重放／前滚修复 |
+| 12 | 事件指挥运行读写冒烟、关键 Workflow 与容量检查后签署开放 | 8.25.5 与 8.26.6 证据矩阵；监控无 P0/P1；恢复报告双人签署 | 全部门禁通过，记录 `T_service_accepted`，RTO ≤ 4 小时 | 任一强门禁失败则保持隔离，记录 `FAILED` 或明确 `GAP` |
+
+逻辑恢复时角色必须在对象恢复前由受控流程创建；表和函数恢复后仍按上表第 4 步重新
+赋 owner/grant。物理恢复包含全局目录，但不因此省略角色属性和 RLS 复核。删除日志、
+ACL、legal hold、retention、墓碑和审计必须先于普通业务读开放，防止旧备份让已撤销
+内容重新可见。
+
+### 8.25.5 季度灾难演练与证据包
+
+至少**每季度一次**在隔离网络做端到端恢复；重大 PostgreSQL/扩展升级、备份拓扑、
+MinIO 版本策略、Schema 合同或加密密钥流程改变后追加演练。四个连续季度轮换覆盖：
+整库丢失 PITR、误操作指定时刻恢复、单一 Artifact 版本丢失、Qdrant 全集合丢失并从
+PostgreSQL 重建；每次都包含 Workflow Checkpoint 恢复、跨租户负向测试、Outbox 重放
+和至少一个签发报告证据链。
+
+演练步骤为：预登记场景与成功标准 → 记录故障点和最后已提交探针 → 隔离恢复 → 按
+8.25.4 执行 → 在目标点后写入 canary 以确认回放停止 → 对 Manifest 对象全量元数据
+核对并按风险分层抽样字节哈希 → 重建派生层 → 执行关键 Workflow → 计算端到端
+RPO/RTO → 双人复核 → 记录缺陷、负责人和截止时间。演练不得使用生产凭据复制到普通
+日志，测试数据必须脱敏，临时恢复环境在证据固化和批准后按受控流程清理。
+
+证据包至少包含：场景和范围；参与人和审批；硬件／网络／数据规模；备份 ID；system
+identifier；时间线与 LSN；目标时间；`pg_verifybackup` 输出；所需和已取回 WAL 清单；
+PITR pause/promote 时刻；Alembic/扩展/角色/RLS/约束/索引/分区目录结果；Manifest 与
+对象校验摘要；租户正负向结果；Workflow/Checkpoint 对账；RAG/Memory 重建差集；
+Outbox/审计对账；故障注入记录；所有步骤起止时间；实际 RPO/RTO；失败原始输出；最终
+`VERIFIED`/`FAILED`/`GAP` 状态和签署。只保留成功截图、删去失败日志或补写未执行结果
+均视为证据无效。
+
 ## 8.26 性能、容量、可观测性与测试
+
+### 8.26.1 性能 SLO 与可复现实验合同
+
+数据库侧第一阶段硬目标如下；它们是第六、七章端到端目标的子预算，不能替代 RAG、
+Memory、模型或对象传输的整体 SLO：
+
+| 查询类别 | 数据库 p95 目标 | 代表合同 |
+|---|---:|---|
+| 主键读取与幂等重复写入 | p95 ≤ 100 ms | 在完整组织／项目 RLS 上下文中按业务唯一键读取 Artifact、任务、报告或当前版本；同 key 重复调用受控幂等入口 |
+| 项目任务、病害与报告列表 | p95 ≤ 300 ms | 按 scope、状态和时间范围分页，含真实 JOIN、稳定排序和 keyset cursor |
+| 单资产多期病害与典型空间查询 | p95 ≤ 500 ms | 8.22.2 的 Q2/Q6 原样绑定；包含 PostGIS 谓词、时间过滤、必要聚合与分区剪枝 |
+
+任何性能结论必须附完整实验合同：Git SHA、Alembic revision、PostgreSQL/扩展版本、
+Schema 与统计信息时间、硬件型号／CPU／内存／磁盘、OS、PostgreSQL 配置 diff、连接池
+大小、客户端位置、数据行数／字节数／组织和项目分布、空间选择率、分区数量、索引清单、
+真实或等分布脱敏数据生成版本、并发和到达率、持续时间、预热次数、冷热缓存状态、超时、
+错误率，以及 P50/P95/P99。至少报告冷缓存与热缓存、1/5/20 个并发会话；本地 Memory
+基线还须保留第七章的 20 并发预热场景。缓存命中结果与未命中结果分开，不得混为一个
+P95。
+
+延迟从客户端发出请求到完整结果被消费计时，包含连接池排队、事务、`SET LOCAL` 受信
+任上下文、RLS、数据库执行和结果传输；大 Artifact 字节传输另列对象存储 SLO，不能从
+数据库查询时延中隐藏。每个场景至少有足以稳定分位数的样本，预热、正式测量和故障
+注入结果分开保存。零错误且 P95 达标才通过；超时请求仍计入分位和错误率。
+
+代表性计划使用真实绑定值和应用角色采集：
+
+```sql
+BEGIN READ ONLY;
+SET LOCAL ROLE bridgeai_app_rw;
+SELECT set_config('app.organization_id', :organization_id, true);
+SELECT set_config('app.project_id', :project_id, true);
+
+EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON)
+-- 此处粘贴 8.22.2 Q1 或 Q5 的原样 SQL，并绑定同一验收参数；不得改写为简化查询。
+SELECT 1;
+ROLLBACK;
+```
+
+上例的 `SELECT 1` 只是说明 `EXPLAIN` 语法位置，不是可接受计划。证据必须替换为 Q1/Q5
+真实查询，保存实际／估算行数、loop、shared/local/temp block、sort spill、WAL、planning/
+execution time、分区剪枝和索引条件。生产环境只在审批的低风险窗口使用 `ANALYZE`；
+不得为“好看”的计划关闭 RLS、强制 planner GUC、移除真实 JOIN 或只选最有利参数。
+
+### 8.26.2 容量模型、预测与扩缩容门槛
+
+容量基线按天快照，至少保存 90 天；新系统在历史不足时使用压测和导入计划形成有来源
+的先验，并明确置信区间。每种资源都分配 owner、软阈值、硬阈值、采购／扩容 lead time
+和降级策略：
+
+| 资源 | 基线与增长公式 | 软／硬门槛 | 提前期与动作 |
+|---|---|---|---|
+| 表与 TOAST | `daily_growth = (total_bytes[D]-total_bytes[D-7])/7`；按 schema/table/partition、活跃和归档分别统计 | 预测可用空间 < 90 天或磁盘 ≥ 75% 告警；< 30 天或 ≥ 85% 严重 | 平台 owner，提前 90 天扩盘／归档；硬门槛冻结批量导入，保留关键在线写入 |
+| 索引 | `index_ratio = index_bytes/table_bytes`，跟踪每日增长、重复／未使用索引和 bloat 证据 | 单索引逼近介质／维护窗限制、无效索引 > 0 为严重；增长偏离表增长 2 倍持续 7 天告警 | DBA 评审 8.22.3 生命周期；只能在工作负载证据和回归后删改 |
+| WAL 与归档 | `wal_rate = delta(pg_stat_wal.wal_bytes)/seconds`；容量按 P95 写入速率 × 峰值因子 × 最长故障／保留窗 | 最近成功归档距今 > 5 分钟告警、> 10 分钟严重；归档失败增加立即严重 | DBA/存储 owner 先恢复归档连续性并限流批量写；15 分钟前升级灾备事件 |
+| 月分区 | 每父表记录当月、DEFAULT、未来覆盖和迟到率 | DEFAULT 任一行立即严重；未来覆盖 < 62 天告警；单月预测超过维护窗能力告警 | DBA 预建／拆分粒度；保留 DEFAULT 护栏，不临时移除 |
+| Outbox/审计 | 行数、最老可 claim 年龄、dead-letter、每日事件字节 | 正常 oldest pending > 30 秒告警，> 5 分钟严重；dead-letter 新增立即告警 | 集成 owner 扩 Worker／熔断派生写；不直接改 published |
+| MinIO/S3 | 按 bucket、版本状态、media type 统计对象数／逻辑字节／实际占用，计入非当前版本和复制开销 | 预测余量 < 90/30 天；Manifest 引用版本缺失或校验失败立即严重 | 对象 owner 扩容或按 8.23 门禁归档；不得覆盖版本或越过 legal hold |
+| Qdrant | collection/index version 的 Point 数、向量维数、payload、segment 和磁盘／内存；按发布量预测 | 资源 ≥ 75% 告警、≥ 85% 严重；Point 与权威集合差异 > 0 阻断别名 | Knowledge/Memory owner 建新版本集合、限流重建；禁止混用两类集合 |
+| 连接与内存 | 活跃／等待连接、池排队、事务年龄、temp bytes、work_mem 乘并发上界 | 池占用 ≥ 80% 持续 10 分钟告警，≥ 90% 或等待 > 30 秒严重；idle in transaction > 60 秒严重 | 应用 owner 限并发、排查长事务；不靠无限增大 max_connections |
+
+预测使用 `effective_daily_growth = max(P50_recent, planned_import_rate) × peak_factor`；
+`days_to_exhaust = usable_free_bytes / effective_daily_growth`。`peak_factor`、压缩率、版本
+保留倍数、复制副本数、Autovacuum 空间和恢复临时空间必须显式记录，不能默认等于 1。
+年度采购按 P95 峰值与 lead time 规划，短期降级优先暂停批量 OCR/Embedding/索引重建和
+非关键分析，不暂停审计、Outbox、删除拒读或正式业务结果持久化。
+
+PostgreSQL 容量快照的可执行基线为：
+
+```sql
+SELECT n.nspname AS schema_name, c.relname,
+       pg_total_relation_size(c.oid) AS total_bytes,
+       pg_relation_size(c.oid) AS heap_bytes,
+       pg_indexes_size(c.oid) AS index_bytes,
+       COALESCE(s.n_live_tup, 0) AS estimated_live_rows,
+       COALESCE(s.n_dead_tup, 0) AS estimated_dead_rows,
+       s.last_analyze, s.last_autovacuum
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
+WHERE n.nspname LIKE 'bridgeai\_%' ESCAPE '\'
+  AND c.relkind IN ('r', 'p', 'm')
+ORDER BY total_bytes DESC;
+
+SELECT wal_bytes, wal_records, wal_fpi, stats_reset
+FROM pg_stat_wal;
+
+SELECT archived_count, last_archived_wal, last_archived_time,
+       failed_count, last_failed_wal, last_failed_time, stats_reset
+FROM pg_stat_archiver;
+```
+
+### 8.26.3 数据库指标、告警与可定位性
+
+每条告警定义都必须包含来源、公式、维度、阈值、窗口、严重级别、Runbook 和 owner。
+推荐基线如下，生产阈值须以压测和至少 30 天趋势校准，但不能放宽安全与恢复硬门禁：
+
+| 信号 | 来源／公式与低基数维度 | 告警合同 | Runbook 首动作 |
+|---|---|---|---|
+| 查询延迟／错误 | 应用 OpenTelemetry；按 `operation,route,result,db_role` 统计 histogram 和 error rate | 任一数据库类别 P95 连续 10 分钟超 8.26.1 目标为 P1；错误率 > 1% 持续 5 分钟为 P1 | 对照 trace 查池等待与 query fingerprint，再查计划漂移／锁／IO；禁止记录绑定的敏感正文 |
+| 连接池饱和 | 池 metrics：`checked_out/max_size` 与 wait histogram；维度 `service,pool` | ≥ 80% 10 分钟 P2；≥ 90% 或等待 P95 > 1 秒 5 分钟 P1 | 限流批任务，定位长事务和泄漏，不先加连接数 |
+| 锁等待／长事务 | `pg_stat_activity`、`pg_locks`；等待年龄和 `xact_start` | 阻塞关键写 > 30 秒或事务 > 5 分钟 P1；idle in transaction > 60 秒 P1 | 保存阻塞图、联系 owner；终止会话需事件审批 |
+| 缓存／IO | `pg_stat_database` 的 blks_hit/read、temp_bytes；OS 磁盘时延 | cache hit ratio 异常下降或 temp_bytes 速率较基线翻倍 15 分钟 P2；磁盘延迟越 SLO P1 | 对照工作负载和 plan，检查 spill、顺扫、统计信息与磁盘 |
+| 表健康 | `pg_stat_user_tables` 的 dead/live、last_autovacuum/analyze；`pg_stat_progress_vacuum` | `dead/live > 10%` 且 dead > 100000 持续 30 分钟 P2；关键表 24 小时未 analyze 且变化大为 P2 | 查长事务和 autovacuum 配置，先验证再手动 VACUUM/ANALYZE |
+| 复制／归档／备份 | `pg_stat_replication` LSN 差、`pg_stat_archiver`、备份作业和季度恢复证据 | 归档 5/10 分钟阈值见 8.26.2；最近成功物理备份超过计划窗口 P1；季度恢复逾期 P1 | 先保护 WAL 连续性和介质容量；不能以 archive_timeout 关闭告警 |
+| 分区／约束／索引 | 目录巡检、DEFAULT 行数、未来边界、`convalidated`、`indisvalid/indisready` | DEFAULT > 0、约束意外未验证、失效索引均 P1 | 停相关发布／归档，按 8.23/8.24 前滚修复 |
+| Outbox／删除 | `outbox_events`、`deletion_jobs`、`retention_executions` 的状态年龄和 semantic digest | oldest 30 秒 P2／5 分钟 P1；dead-letter 或删除状态倒退 P1 | 保持 revoked/deny-read，检查 lease、worker 和外部依赖，受控重放 |
+| Artifact | Manifest 对账、对象 HEAD/GET、哈希抽样 | 强引用版本缺失、SHA-256 不一致、legal hold/retention 漂移均 P0/P1 | 阻断对象及上层证据读取，保全版本和审计，不以 latest 替代 |
+| 租户隔离 | 应用拒绝计数、安全审计和持续合成越权探针 | 合成探针任何一次越权成功为 P0；异常拒绝率激增 P1 | 立即隔离入口，保存 Policy/role/trace 证据并启动安全响应 |
+
+数据库即时诊断只读查询示例：
+
+```sql
+SELECT pid, usename, application_name, backend_type, state, wait_event_type,
+       wait_event, clock_timestamp() - xact_start AS transaction_age,
+       clock_timestamp() - query_start AS query_age,
+       query_id
+FROM pg_stat_activity
+WHERE datname = current_database()
+ORDER BY query_age DESC NULLS LAST;
+
+SELECT datname, numbackends, xact_commit, xact_rollback,
+       blks_read, blks_hit, temp_files, temp_bytes, deadlocks, stats_reset
+FROM pg_stat_database
+WHERE datname = current_database();
+
+SELECT schemaname, relname, seq_scan, idx_scan, n_live_tup, n_dead_tup,
+       last_autovacuum, last_autoanalyze
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC;
+```
+
+指标标签禁止使用 `organization_id`、`project_id`、`user_id`、Artifact ID、自然语言 query、
+`request_id` 或完整 `query_id` 等高基数／敏感值。精确定位键进入受控 trace、结构化日志或
+审计，并受脱敏、访问控制和保留策略保护；metrics 只使用操作类别、服务、结果、区域、
+数据库角色等低基数维度。日志不得包含访问令牌、数据库凭据、完整 SQL 参数、Artifact
+正文、完整 Prompt 或未脱敏个人信息。
+
+### 8.26.4 降级、运行手册与变更回归
+
+性能或容量压力不得破坏一致性和权限边界。允许的顺序是：限制批量入库／回填／索引
+重建 → 降低非关键统计频率 → 对 Qdrant/Reranker/摘要按第六、七章明确标记降级 → 对
+仍超载的租户实施公平限流。禁止关闭 RLS、跳过引用校验、恢复 revoked 内容、丢弃审计
+或 Outbox、把签发报告降级为无证据结果、无限增加连接数，或用全库模糊 SQL 替代不可用
+向量检索。
+
+每个 P0/P1/P2 告警 Runbook 至少说明：影响与安全边界、owner/升级路径、只读诊断、
+停止条件、可逆缓解、需审批的破坏性动作、恢复查询、数据一致性复核和复盘证据。高风险
+动作如终止后端、promote、分区 DETACH、对象删除、别名切换和受控 Outbox 重放必须有
+精确目标、双人审批和审计；Runbook 不保存凭据。
+
+以下变化必须重跑受影响的功能、性能和恢复合同：PostgreSQL/扩展升级；Schema migration；
+RLS/Policy/owner/grant；索引与统计；分区／retention；Artifact 版本策略；Outbox；
+Checkpoint 版本；Qdrant collection/payload/别名；ACL、Embedding、检索和 Context Policy。
+计划回归以相同数据和参数比较，新计划若 P95 退化超过 20%、buffer/temp/WAL 明显增加、
+分区剪枝消失、估算偏差超过 10 倍或出现跨 scope 行，均阻断发布，除非评审记录新的基线
+和容量影响；安全负向失败没有豁免。
+
+### 8.26.5 测试与恢复验收矩阵
+
+| 层级／场景 | 正向断言 | 负向／并发／故障注入 | 必须保存的证据 | 验收 |
+|---|---|---|---|---|
+| DDL 与迁移 | PostgreSQL 17 空库从零迁移、旧版本 expand-backfill-verify-switch-contract；所有 Schema/表/索引/触发器存在 | 未知状态、孤儿、重复、NULL、失效索引、低位漏扫、并发旧写使发布阻断 | revision、目录 diff、行数/min/max/hash、`convalidated`、`indisvalid/indisready`、锁时长 | 所有强门禁满足且重跑幂等 |
+| RLS 与角色 | 每个角色在授权组织／项目完成允许操作；SECURITY DEFINER 经受控入口生效 | 未设置上下文、跨组织、跨项目、伪造 actor、PUBLIC EXECUTE、owner/app BYPASSRLS 均拒绝 | 角色、owner、Policy/grant catalog 与正负向 SQL 原始结果 | 越权成功数为 0 |
+| 约束与状态机 | 合法 Artifact、病害修订、报告签发、Memory、发布和删除流转成功 | 越界组合 FK、原地改写 immutable、跳状态、legal hold/retention 绕过、共享引用删除均拒绝 | 事务结果、错误码、回滚后 anti-join | 失败事务不留半状态 |
+| 幂等／并发／Outbox | 同 key 同 request/semantic digest 返回同结果；不同 key 独立；claim/ack 正常 | 同 key 不同 hash/payload/max_attempts 冲突；并发 claim 不重复；lease 过期、Worker 崩溃、dead-letter、受控重放 | 稳定 key、semantic digest、并发时间线、锁／lease、业务与 Outbox 差集 | 无重复副作用，无已提交业务变更缺事件 |
+| 分区与保留 | 月边界、迟到行迁移、registry/shadow、归档读取和恢复正常 | DEFAULT 行、边界时区、ATTACH 摘要不符、被 review 引用、legal hold、pending deletion 时 DETACH/drop 阻断 | `tableoid`、边界、摘要、双向 anti-join、审批和恢复对象版本 | DEFAULT 为 0；门禁失败不物理删除 |
+| 物理备份与 PITR | 基准备份验证并回放到选定事务；角色/RLS/约束/Checkpoint 完整 | 删除一段演练 WAL、错误时间线、目标点之后 canary、归档中断 | backup/WAL manifest、replay LSN、目标事务、失败日志、实测 RPO/RTO | 全链 ≤15 分钟/≤4 小时，否则 FAILED |
+| 逻辑恢复 | custom dump 恢复到新空 PostgreSQL 17 库并做目录/数据对账 | 非空目标、缺角色／扩展、错误 revision、约束/RLS/grant 漂移阻断 | dump digest、restore list/exit、catalog diff、行数/hash | 仅作补充证据，不冒充 PITR |
+| Artifact/MinIO | Manifest 中每个强引用 object_version_id 可读且 hash/size 一致 | latest 与 version 不同、缺版本、篡改字节、legal hold/retention 漂移、对象服务中断 | Manifest digest、inventory、HEAD/GET 和 SHA-256 汇总 | 差异为 0；否则相关上层拒读 |
+| PostGIS | 目标 SRID、空间约束、Q1/Q5、GiST 和空间结果在真实扩展运行 | 错 SRID、越界坐标、空 geometry、错误 bbox 被拒绝；计划退化阻断 | PostGIS 版本、SRID、结果集、`EXPLAIN (ANALYZE, BUFFERS)` | 没有 PostGIS 实例不得标 PASS |
+| Qdrant/RAG/Memory | 从 active/published 权威集重建隔离集合并通过双向差集和 ACL | 集合全丢失、部分写、旧别名、跨集合／跨项目 payload、revoked point 被拒绝 | collection config/index version、Point 差集、别名、降级日志 | 差集和越权为 0 后才切别名 |
+| Workflow/Checkpoint | 原 thread 从最后稳定节点恢复，复核结果、报告和 context manifest 对账 | Checkpoint 后进程终止、Interrupt 重入、Artifact 缺失、权限／来源变化进入复核 | task/run/thread/checkpoint 时间线、幂等副作用、人工决策 | 不静默跳节点、不重复副作用 |
+| 性能与容量 | 8.26.1 三类 P95、第五至七章代表链和容量快照达标 | 冷缓存、20 并发、池饱和、锁、磁盘／WAL 压力、索引重建竞争和超时 | 完整实验合同、原始 histogram、EXPLAIN JSON、资源曲线、错误率 | 条件不完整或只测热缓存不得通过 |
+| 可观测性 | 每个阈值触发对应告警、trace 和 Runbook，恢复后自动关闭 | 高基数爆炸、敏感正文／凭据写日志、采集器断开、告警风暴 | 指标定义、合成触发、通知／升级时间、脱敏检查 | 无敏感泄漏；关键告警可行动 |
+
+SQLite、Mock、静态 SQL 解析和单元测试可以提供快速反馈，但**不能**作为 PostgreSQL 17
+的 RLS、锁、分区、约束、SECURITY DEFINER、`SKIP LOCKED`、PITR 或查询计划验收。
+未提供真实 PostGIS、MinIO/S3、Qdrant、WAL 归档或多会话并发环境时，对应状态必须为
+`GAP`，列出缺少的环境、待执行命令／场景、owner 和关闭条件，不能写成 `PASS`。
+
+### 8.26.6 证据判定与发布门禁
+
+每条测试结果只允许：`VERIFIED`（在声明环境实际运行且断言成立）、`FAILED`（实际运行
+且断言失败）或 `GAP`（环境／数据／权限不足而未运行）。文档中的 SQL、示例输出、预期值、
+他人历史截图、工具不存在时的跳过和“命令返回 0 但没有业务断言”都不是 VERIFIED。
+自动化报告必须保留命令版本、环境 fingerprint、起止时间、stdout/stderr、退出码、断言、
+失败样本和 Artifact digest；人工核验保存 reviewer、依据、时间和签名。
+
+发布前最低证据集为：目标 PostgreSQL 17 迁移和目录验收；多角色双租户 RLS 正负向；
+全部强 FK/CHECK/唯一／不可变状态机；幂等冲突和并发 Outbox；四类分区 DEFAULT/未来边界；
+Q1/Q5 查询计划及 Q2/Q6 真实 PostGIS／多期病害计划；三类数据库 P95 与 20 并发基线；Artifact 精确版本哈希；
+Workflow/Checkpoint 恢复；Qdrant RAG/Memory 双向差集；以及最近一个季度 RPO≤15 分钟、
+RTO≤4 小时的隔离恢复。任何 P0 安全失败、数据差异、不可恢复强引用、无效索引、
+DEFAULT 积压或过期演练都阻断发布；性能未达标可通过明确的容量修复后重测，不能仅靠
+风险接受跳过数据安全和恢复门禁。
 
 ## 8.27 第一阶段实施范围与架构决策
 
