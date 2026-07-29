@@ -499,6 +499,13 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status <> 'staged' THEN
+            RAISE EXCEPTION 'artifact version initial status must be staged, got %', NEW.status;
+        END IF;
+        RETURN NEW;
+    END IF;
+
     IF OLD.status <> 'staged' AND ROW(
         NEW.organization_id, NEW.project_id, NEW.artifact_id, NEW.revision_no,
         NEW.provider, NEW.bucket, NEW.object_key, NEW.version_id,
@@ -543,7 +550,7 @@ END;
 $$;
 
 CREATE TRIGGER trg_artifact_versions_transition
-BEFORE UPDATE
+BEFORE INSERT OR UPDATE
 ON bridgeai_core.artifact_versions
 FOR EACH ROW
 EXECUTE FUNCTION bridgeai_core.enforce_artifact_version_transition();
@@ -748,6 +755,20 @@ BEGIN
         RETURN NEW;
     END IF;
 
+    -- 对同一资产的构件树写入建立唯一串行化点，
+    -- 使等待者在前一事务提交后再读取祖先链。
+    PERFORM 1
+    FROM bridgeai_asset.assets AS a
+    WHERE a.id = NEW.asset_id
+      AND a.organization_id = NEW.organization_id
+      AND a.project_id = NEW.project_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'component asset scope does not exist for component %', NEW.id
+            USING ERRCODE = 'foreign_key_violation';
+    END IF;
+
     WITH RECURSIVE ancestors AS (
         SELECT c.id, c.parent_component_id
         FROM bridgeai_asset.components AS c
@@ -774,10 +795,9 @@ BEGIN
 END;
 $$;
 
-CREATE CONSTRAINT TRIGGER trg_components_reject_cycle
-AFTER INSERT OR UPDATE OF parent_component_id, organization_id, project_id, asset_id
+CREATE TRIGGER trg_components_reject_cycle
+BEFORE INSERT OR UPDATE OF parent_component_id, organization_id, project_id, asset_id
 ON bridgeai_asset.components
-DEFERRABLE INITIALLY IMMEDIATE
 FOR EACH ROW
 EXECUTE FUNCTION bridgeai_asset.reject_component_cycle();
 
@@ -831,7 +851,7 @@ CREATE INDEX ix_component_aliases_component_scope
        (organization_id, project_id, asset_id, component_id);
 ```
 
-构件停用只更改 `components.status/deactivated_at/deactivation_reason`，不删除稳定 UUID。重编码在同一事务中更新 `components.component_code`，并把原编码以 `component_aliases.alias_type = 'former_official_code'` 映射回同一 `component_id`；项目俗称使用 `project_alias`，不得覆盖正式编码。自组合外键阻止跨组织、跨项目和跨资产挂接，可延迟约束触发器进一步拒绝环形构件树。
+构件停用只更改 `components.status/deactivated_at/deactivation_reason`，不删除稳定 UUID。重编码在同一事务中更新 `components.component_code`，并把原编码以 `component_aliases.alias_type = 'former_official_code'` 映射回同一 `component_id`；项目俗称使用 `project_alias`，不得覆盖正式编码。自组合外键阻止跨组织、跨项目和跨资产挂接；重挂接前的 `BEFORE` 触发器先锁定共同 `assets` 行，将同资产构件树写入串行化后再检查祖先链，阻止单事务和并发双事务成环。
 
 ## 8.11 PostGIS 空间与工程定位设计
 
