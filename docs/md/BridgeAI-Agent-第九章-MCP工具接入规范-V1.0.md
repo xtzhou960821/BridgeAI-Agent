@@ -131,9 +131,9 @@ Host
 | `ToolContext` | MCP request context + server session | 由服务端注入组织、项目、actor、request_id |
 | `ToolResult.artifacts` | `content/resource_link/structuredContent` | 只返回 Artifact 引用，不返回未授权对象字节 |
 | `ToolError` | Protocol error 或 `isError=true` | 协议错误与业务错误分开 |
-| `requires_confirmation` | Tool annotations + BridgeAI policy | MCP annotation 只作提示，最终以服务端策略为准 |
+| `requires_confirmation` | BridgeAI Manifest 扩展 + Policy | MCP annotation 只表达通用行为提示，BridgeAI 风险和确认策略以内部注册表为准 |
 
-MCP Client 传入的自然语言参数不得覆盖 `organization_id`、`project_id`、`actor_id`、`role`、`permission_scope`、`RLS context` 和 `Artifact status`。这些字段只能由 Gateway/Policy Engine 根据认证身份和项目成员关系注入。
+MCP Client 传入的自然语言参数不得覆盖 `organization_id`、`project_id`、`actor_id`、`role`、`permission_scope`、`RLS context` 和 `Artifact status`。这些字段只能由 Gateway/Policy Engine 根据认证身份和项目成员关系注入。MCP 标准 annotations 只作为模型和 UI 的行为提示，不能承载 BridgeAI 的最终风险等级、审批门禁或授权结果。
 
 ## 9.7 Tool 命名、Manifest 与 Schema 规范
 
@@ -195,14 +195,20 @@ Manifest 最小字段：
     "required": ["model_run_id", "candidate_count", "review_required", "artifact_ids"]
   },
   "annotations": {
-    "bridgeai:risk": "medium",
-    "bridgeai:side_effect": true,
-    "bridgeai:human_confirmation": "required_for_high_risk"
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  },
+  "bridgeai_policy": {
+    "risk": "medium",
+    "side_effect": true,
+    "human_confirmation": "required_for_high_risk"
   }
 }
 ```
 
-MCP annotations 只作为客户端提示，不能作为服务端授权依据。服务端必须重新校验输入、权限、状态和幂等语义。
+MCP annotations 只作为客户端提示，不能作为服务端授权依据。`bridgeai_policy` 是内部 Tool Registry/Manifest 扩展，不要求外部 MCP Client 理解；服务端必须重新校验输入、权限、状态、风险和幂等语义。
 
 ## 9.8 Tool 调用合同
 
