@@ -2,7 +2,7 @@
 
 BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭环的行业级 AI Agent 架构设计项目。
 
-本仓库当前主要沉淀 V1.0 设计文档。正式文档主线已完成九章：项目背景、总体架构、Agent、Tool SDK、Workflow、RAG 行业知识库、Memory 与项目上下文、数据与数据库设计，以及 MCP 工具接入规范。
+本仓库当前主要沉淀 V1.0 设计文档。正式文档主线已完成十章：项目背景、总体架构、Agent、Tool SDK、Workflow、RAG 行业知识库、Memory 与项目上下文、数据与数据库设计、MCP 工具接入规范，以及 Prompt 与结构化输出规范。
 
 ## 目录结构
 
@@ -32,6 +32,7 @@ BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭�
 7. `docs/md/BridgeAI-Agent-第七章-Memory与项目上下文设计-V1.0.md`
 8. `docs/md/BridgeAI-Agent-第八章-数据与数据库设计-V1.0.md`
 9. `docs/md/BridgeAI-Agent-第九章-MCP工具接入规范-V1.0.md`
+10. `docs/md/BridgeAI-Agent-第十章-Prompt与结构化输出规范-V1.0.md`
 
 当前正式主线聚焦桥梁与道路巡检 AI Agent。历史 `temp/` 参考目录已清理，避免与 `docs/md/` 当前第一套正式目录混淆；智慧工地 BridgeAI-Site 不属于当前正式主线。
 
@@ -39,7 +40,6 @@ BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭�
 
 按照第一章确定的目录，后续将继续编制：
 
-- 第十章：Prompt 与结构化输出规范；
 - 第十一章：后端与前端架构；
 - 第十二章：模型管理与评测体系；
 - 第十三章：部署、监控与安全；
