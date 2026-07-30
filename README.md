@@ -2,7 +2,7 @@
 
 BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭环的行业级 AI Agent 架构设计项目。
 
-本仓库当前主要沉淀 V1.0 设计文档。正式文档主线已完成十三章：项目背景、总体架构、Agent、Tool SDK、Workflow、RAG 行业知识库、Memory 与项目上下文、数据与数据库设计、MCP 工具接入规范、Prompt 与结构化输出规范、后端与前端架构、模型管理与评测体系，以及部署、监控与安全。
+本仓库当前主要沉淀 V1.0 设计文档。正式文档主线已完成十四章：项目背景、总体架构、Agent、Tool SDK、Workflow、RAG 行业知识库、Memory 与项目上下文、数据与数据库设计、MCP 工具接入规范、Prompt 与结构化输出规范、后端与前端架构、模型管理与评测体系、部署监控与安全，以及实施路线图与版本规划。
 
 ## 目录结构
 
@@ -36,13 +36,17 @@ BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭�
 11. `docs/md/BridgeAI-Agent-第十一章-后端与前端架构-V1.0.md`
 12. `docs/md/BridgeAI-Agent-第十二章-模型管理与评测体系-V1.0.md`
 13. `docs/md/BridgeAI-Agent-第十三章-部署监控与安全-V1.0.md`
+14. `docs/md/BridgeAI-Agent-第十四章-实施路线图与版本规划-V1.0.md`
 
 当前正式主线聚焦桥梁与道路巡检 AI Agent。历史 `temp/` 参考目录已清理，避免与 `docs/md/` 当前第一套正式目录混淆；智慧工地 BridgeAI-Site 不属于当前正式主线。
 
-## 后续章节
+## 后续工作
 
-按照第一章确定的目录，后续将继续编制：
+第一套正式目录十四章已完成。后续可进入：
 
-- 第十四章：实施路线图与版本规划。
+- 按第十四章路线图拆分研发任务；
+- 编制后端、前端、Tool SDK、Agent/Workflow 的实现级 Issue；
+- 建立样例项目、演示数据、评测集和部署 Runbook；
+- 根据实际研发进展修订 V1.1、V1.2 和 V2.0 规划。
 
 当前 `agent/`、`backend/`、`frontend/`、`tools/` 和 `examples/` 为后续研发预留目录。
