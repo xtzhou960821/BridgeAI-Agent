@@ -1,0 +1,7 @@
+{
+  "task_id": "task_001",
+  "task_type": "bridge_inspection",
+  "objective": "检查桥梁无人机影像质量并生成第一轮任务状态",
+  "artifact_ids": ["art_001"],
+  "expected_tool": "image_quality_check"
+}

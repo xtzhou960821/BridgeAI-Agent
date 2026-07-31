@@ -8,17 +8,18 @@ BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭�
 
 ```text
 .
-├── agent/       # Agent 模块预留目录
-├── backend/     # 后端服务预留目录
+├── agent/       # Agent Runner 与 Workflow 最小骨架
+├── backend/     # 后端服务、API 入口与数据库迁移骨架
 ├── docs/
 │   ├── md/      # 第一套目录的正式 Markdown 设计文档
 │   ├── superpowers/
 │   │   ├── specs/   # 已确认的章节编制设计
 │   │   └── plans/   # 已确认的章节实施计划
 │   └── ai-agent-workflow-infographic.png
-├── examples/    # 示例与演示材料预留目录
-├── frontend/    # 前端应用预留目录
-└── tools/       # Tool SDK 与工具实现预留目录
+├── examples/    # 示例任务与演示材料
+├── frontend/    # Vue + TypeScript 工作台骨架
+├── tests/       # Python 核心骨架测试
+└── tools/       # Tool SDK 与工具执行骨架
 ```
 
 ## 正式架构文档
@@ -40,6 +41,25 @@ BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭�
 
 当前正式主线聚焦桥梁与道路巡检 AI Agent。历史 `temp/` 参考目录已清理，避免与 `docs/md/` 当前第一套正式目录混淆；智慧工地 BridgeAI-Site 不属于当前正式主线。
 
+## 开发状态
+
+当前已进入 V0.2 工程骨架开发阶段。第一轮骨架包含：
+
+- Tool SDK：Tool Manifest、注册表、执行器和必填输入校验；
+- Workflow：任务状态创建、推进、失败和恢复；
+- Agent Runner：桥梁巡检示例任务的最小单 Agent 调用循环；
+- Backend：Health payload 与可选 FastAPI 入口；
+- Frontend：Vue + TypeScript 工作台占位；
+- Data：PostgreSQL 迁移占位和样例任务。
+
+本地验证：
+
+```bash
+python -m pytest -v
+```
+
+详细说明见 `docs/development/v0.2-local-runbook.md`。
+
 ## 后续工作
 
 第一套正式目录十四章已完成。后续可进入：
@@ -49,4 +69,4 @@ BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭�
 - 建立样例项目、演示数据、评测集和部署 Runbook；
 - 根据实际研发进展修订 V1.1、V1.2 和 V2.0 规划。
 
-当前 `agent/`、`backend/`、`frontend/`、`tools/` 和 `examples/` 为后续研发预留目录。
+当前 `agent/`、`backend/`、`frontend/`、`tools/` 和 `examples/` 已开始承载 V0.2 工程骨架，后续将继续补齐真实后端 API、前端联调、Tool SDK 接入、Agent/Workflow 持久化和本地部署能力。

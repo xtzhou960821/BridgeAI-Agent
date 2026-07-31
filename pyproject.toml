@@ -1,0 +1,20 @@
+[project]
+name = "bridgeai-agent"
+version = "0.2.0"
+description = "Engineering skeleton for BridgeAI-Agent bridge and road inspection AI Agent."
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+backend = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+]
+dev = [
+  "pytest>=7.4",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra"
