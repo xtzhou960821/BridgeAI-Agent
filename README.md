@@ -58,6 +58,12 @@ BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭�
 python -m pytest -v
 ```
 
+本地启动后端时建议使用：
+
+```bash
+python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
 详细说明见 `docs/development/v0.2-local-runbook.md`。
 
 ## 后续工作

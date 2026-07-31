@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "bridgeai-agent"
 version = "0.2.0"
@@ -18,3 +22,7 @@ dev = [
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.setuptools.packages.find]
+include = ["agent*", "backend*", "tools*"]
+exclude = ["docs*", "examples*", "frontend*", "tests*"]

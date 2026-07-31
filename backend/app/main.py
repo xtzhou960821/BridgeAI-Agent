@@ -24,4 +24,4 @@ def create_app():
     return app
 
 
-app = create_app() if FastAPI is not None else None
+app = create_app()
