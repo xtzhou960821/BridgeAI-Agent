@@ -23,6 +23,7 @@ def test_migrations_apply_in_order_and_are_repeatable():
         "0002_task_history.sql",
         "0003_langgraph_runtime.sql",
         "0004_langgraph_thread_identity.sql",
+        "0005_artifacts.sql",
     ]
     assert second == []
     with psycopg.connect(database_url) as connection:
@@ -69,6 +70,58 @@ def test_migrations_apply_in_order_and_are_repeatable():
         ).fetchone()
     assert identity_constraint == (True,)
 
+    with psycopg.connect(database_url) as connection:
+        artifact_columns = {
+            row[0]: (row[1], row[2])
+            for row in connection.execute(
+                "SELECT column_name, data_type, is_nullable "
+                "FROM information_schema.columns "
+                "WHERE table_schema = 'public' "
+                "AND table_name = 'inspection_artifacts'",
+            ).fetchall()
+        }
+        artifact_constraints = {
+            row[0]
+            for row in connection.execute(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid = 'public.inspection_artifacts'::regclass",
+            ).fetchall()
+        }
+        history_index = connection.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname = 'public' "
+            "AND indexname = 'ix_inspection_artifacts_created_at'",
+        ).fetchone()
+
+    assert artifact_columns == {
+        "artifact_id": ("text", "NO"),
+        "original_filename": ("text", "NO"),
+        "storage_key": ("text", "NO"),
+        "sha256": ("text", "NO"),
+        "size_bytes": ("bigint", "NO"),
+        "mime_type": ("text", "NO"),
+        "width_px": ("integer", "NO"),
+        "height_px": ("integer", "NO"),
+        "status": ("text", "NO"),
+        "created_at": ("timestamp with time zone", "NO"),
+    }
+    assert artifact_constraints >= {
+        "inspection_artifacts_pkey",
+        "uq_inspection_artifacts_storage_key",
+        "ck_inspection_artifacts_original_filename_nonblank",
+        "ck_inspection_artifacts_storage_key_nonblank",
+        "ck_inspection_artifacts_sha256",
+        "ck_inspection_artifacts_size_bytes",
+        "ck_inspection_artifacts_mime_type",
+        "ck_inspection_artifacts_width_px",
+        "ck_inspection_artifacts_height_px",
+        "ck_inspection_artifacts_status",
+    }
+    assert history_index == (
+        "CREATE INDEX ix_inspection_artifacts_created_at ON public.inspection_artifacts "
+        "USING btree (created_at DESC, artifact_id DESC)",
+    )
+
 
 @pytest.mark.postgres
 def test_identity_migration_ignores_same_named_constraint_on_other_table(tmp_path):
@@ -87,7 +140,10 @@ def test_identity_migration_ignores_same_named_constraint_on_other_table(tmp_pat
                 "CHECK (value IS NOT NULL)",
             )
 
-        assert apply_migrations(database_url) == ["0004_langgraph_thread_identity.sql"]
+        assert apply_migrations(database_url) == [
+            "0004_langgraph_thread_identity.sql",
+            "0005_artifacts.sql",
+        ]
         with psycopg.connect(database_url) as connection:
             target_constraint = connection.execute(
                 "SELECT convalidated FROM pg_constraint "
@@ -125,6 +181,7 @@ def test_runtime_migration_ignores_same_named_constraints_on_other_tables(tmp_pa
         assert apply_migrations(database_url) == [
             "0003_langgraph_runtime.sql",
             "0004_langgraph_thread_identity.sql",
+            "0005_artifacts.sql",
         ]
         with psycopg.connect(database_url) as connection:
             target_constraints = {

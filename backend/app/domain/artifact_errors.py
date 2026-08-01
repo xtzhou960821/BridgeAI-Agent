@@ -24,6 +24,14 @@ class ArtifactIntegrityMismatchError(ArtifactError):
     code = "ARTIFACT_INTEGRITY_MISMATCH"
 
 
+class ArtifactNotFoundError(ArtifactError):
+    code = "ARTIFACT_NOT_FOUND"
+
+
+class ArtifactNotReadyError(ArtifactError):
+    code = "ARTIFACT_NOT_READY"
+
+
 class UnsupportedArtifactTypeError(ArtifactError):
     code = "UNSUPPORTED_ARTIFACT_TYPE"
 

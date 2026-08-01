@@ -22,7 +22,7 @@ def connect(database_url: str):
 
 
 def probe_database(database_url: str) -> bool:
-    """Report whether PostgreSQL and the V0.2 task tables are ready."""
+    """Report whether PostgreSQL and required V0.2 business tables are ready."""
 
     if not database_url:
         return False
@@ -30,7 +30,8 @@ def probe_database(database_url: str) -> bool:
         with connect(database_url) as connection:
             tables = connection.execute(
                 "SELECT to_regclass('public.inspection_tasks'), "
-                "to_regclass('public.inspection_task_runs')",
+                "to_regclass('public.inspection_task_runs'), "
+                "to_regclass('public.inspection_artifacts')",
             ).fetchone()
         return bool(tables and all(tables))
     except psycopg.Error:

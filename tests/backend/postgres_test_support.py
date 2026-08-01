@@ -21,7 +21,7 @@ def require_test_database_url() -> str:
 def reset_test_tables(database_url: str) -> None:
     with psycopg.connect(database_url) as connection:
         connection.execute(
-            "DROP TABLE IF EXISTS inspection_task_runs, "
+            "DROP TABLE IF EXISTS inspection_artifacts, inspection_task_runs, "
             "inspection_tasks, bridgeai_schema_migrations CASCADE",
         )
 

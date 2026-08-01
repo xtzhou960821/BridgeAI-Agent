@@ -1,4 +1,10 @@
+import psycopg
+import pytest
+
+from backend.app.repositories.postgres.connection import probe_database
+from backend.app.repositories.postgres.migrate import apply_migrations
 from backend.app.services.health import build_health_payload, build_local_health_payload
+from tests.backend.postgres_test_support import require_test_database_url, reset_test_tables
 
 
 def test_health_payload_reports_service_version_environment_and_components():
@@ -89,3 +95,19 @@ def test_local_health_exposes_unavailable_checkpointer_without_setup():
     )
 
     assert payload["components"]["langgraph_checkpointer"] == "unavailable"
+
+
+@pytest.mark.postgres
+def test_database_probe_requires_artifact_table():
+    database_url = require_test_database_url()
+    reset_test_tables(database_url)
+    try:
+        apply_migrations(database_url)
+        assert probe_database(database_url) is True
+
+        with psycopg.connect(database_url) as connection:
+            connection.execute("DROP TABLE inspection_artifacts")
+
+        assert probe_database(database_url) is False
+    finally:
+        reset_test_tables(database_url)
