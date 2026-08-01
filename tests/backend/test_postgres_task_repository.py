@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import pytest
 import psycopg
+import pytest
 
 from backend.app.domain.task_errors import (
     IdempotencyConflictError,
@@ -173,4 +173,42 @@ def test_repository_rejects_reused_checkpoint_thread_id(repository):
                 "INSERT INTO inspection_task_runs "
                 "(run_id, task_id, run_number, status, workflow_runtime, checkpoint_thread_id) "
                 "VALUES ('run_002', 'task_alpha', 2, 'running', 'langgraph', 'thread_001')",
+            )
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    ("run_id", "workflow_runtime", "checkpoint_thread_id"),
+    [
+        ("run_invalid_runtime", "unsupported", "thread_001"),
+        ("run_blank_thread", "langgraph", "   "),
+        ("run_legacy_thread", "legacy", "thread_003"),
+        ("run_missing_thread", "langgraph", None),
+    ],
+)
+def test_database_rejects_invalid_runtime_metadata(
+    repository,
+    run_id,
+    workflow_runtime,
+    checkpoint_thread_id,
+):
+    repository.create_task(
+        "task_alpha",
+        TaskCreate(
+            title="桥梁巡检",
+            task_type="bridge_inspection",
+            objective="检查影像",
+            artifact_ids=["art_001"],
+        ),
+        None,
+    )
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        database_url = require_test_database_url()
+        with psycopg.connect(database_url) as connection:
+            connection.execute(
+                "INSERT INTO inspection_task_runs "
+                "(run_id, task_id, run_number, status, workflow_runtime, checkpoint_thread_id) "
+                "VALUES (%s, 'task_alpha', 1, 'running', %s, %s)",
+                (run_id, workflow_runtime, checkpoint_thread_id),
             )
