@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
-from urllib.parse import urlparse
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
 
 
 EXPECTED_TEST_DATABASE = "bridgeai_agent_test"
@@ -11,18 +11,18 @@ EXPECTED_TEST_DATABASE = "bridgeai_agent_test"
 
 def require_test_database_url() -> str:
     url = os.environ.get("BRIDGEAI_TEST_DATABASE_URL", "").strip()
-    if urlparse(url).path.lstrip("/") != EXPECTED_TEST_DATABASE:
-        raise RuntimeError(
-            "BRIDGEAI_TEST_DATABASE_URL must target bridgeai_agent_test",
-        )
+    _validate_test_database_url(
+        url,
+        "BRIDGEAI_TEST_DATABASE_URL must target bridgeai_agent_test",
+    )
     return url
 
 
 def reset_test_tables(database_url: str) -> None:
-    if urlparse(database_url).path.lstrip("/") != EXPECTED_TEST_DATABASE:
-        raise RuntimeError(
-            "BRIDGEAI_TEST_DATABASE_URL must target bridgeai_agent_test",
-        )
+    _validate_test_database_url(
+        database_url,
+        "BRIDGEAI_TEST_DATABASE_URL must target bridgeai_agent_test",
+    )
     with psycopg.connect(database_url) as connection:
         connection.execute(
             "DROP TABLE IF EXISTS inspection_artifacts, inspection_task_runs, "
@@ -31,10 +31,21 @@ def reset_test_tables(database_url: str) -> None:
 
 
 def reset_langgraph_checkpoint_tables(database_url: str) -> None:
-    if urlparse(database_url).path.lstrip("/") != EXPECTED_TEST_DATABASE:
-        raise RuntimeError("Checkpoint reset is restricted to bridgeai_agent_test")
+    _validate_test_database_url(
+        database_url,
+        "Checkpoint reset is restricted to bridgeai_agent_test",
+    )
     with psycopg.connect(database_url) as connection:
         connection.execute(
             "DROP TABLE IF EXISTS checkpoint_writes, checkpoint_blobs, "
             "checkpoints, checkpoint_migrations CASCADE",
         )
+
+
+def _validate_test_database_url(database_url: str, message: str) -> None:
+    try:
+        database_name = conninfo_to_dict(database_url).get("dbname", "")
+    except psycopg.Error as error:
+        raise RuntimeError(message) from error
+    if database_name != EXPECTED_TEST_DATABASE:
+        raise RuntimeError(message)
