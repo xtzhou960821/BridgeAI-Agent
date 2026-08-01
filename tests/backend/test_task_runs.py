@@ -170,6 +170,110 @@ def test_run_inspection_task_translates_postgres_saver_failure_without_credentia
     assert open_calls == [database_url]
 
 
+def test_run_inspection_task_hands_opened_saver_to_runner_and_serializes_result(
+    monkeypatch,
+):
+    from agent.model_profile import AgentModelProfile
+    from agent.runner import AgentRunResult
+    from agent.workflow import WorkflowState, WorkflowStatus, WorkflowStep
+    from backend.app.services import task_runs
+    from tools.sdk import ToolResult
+
+    database_url = "postgresql://checkpoint_user@db.example/bridgeai"
+    run_id = "run_adapter_opened_saver"
+    saver = object()
+    calls = {"probe": [], "open": []}
+    profile = AgentModelProfile(
+        model_id="test-model",
+        model_version="test-version",
+        alias="test-alias",
+        provider="test-provider",
+        runtime="test-runtime",
+        api_base_url="https://model.example/v1",
+        is_stub=False,
+    )
+
+    @contextmanager
+    def opener(url):
+        calls["open"].append(url)
+        yield saver
+
+    class Runner:
+        def __init__(self, _registry, *, checkpointer, model_gateway):
+            calls["checkpointer"] = checkpointer
+            calls["model_gateway"] = model_gateway
+
+        def run(self, context, *, thread_id):
+            calls["context"] = context
+            calls["thread_id"] = thread_id
+            return AgentRunResult(
+                task_id=context.task_id,
+                status="completed",
+                model_profile=profile,
+                workflow=WorkflowState(
+                    task_id=context.task_id,
+                    status=WorkflowStatus.COMPLETED,
+                    current_step="completed",
+                    history=(
+                        WorkflowStep("completed", {"tool_id": "image_quality_check"}),
+                    ),
+                ),
+                tool_results=[
+                    ToolResult(
+                        tool_id="image_quality_check",
+                        version="0.1.0",
+                        ok=True,
+                        output={"quality_status": "pass", "artifact_id": "art_001"},
+                    ),
+                ],
+            )
+
+    def ready_probe(url):
+        calls["probe"].append(url)
+        return "ready"
+
+    monkeypatch.setattr(task_runs, "probe_langgraph_checkpointer", ready_probe)
+    monkeypatch.setattr(task_runs, "open_postgres_checkpointer", opener)
+    monkeypatch.setattr(task_runs, "AgentRunner", Runner)
+
+    result = task_runs.run_inspection_task(
+        run_id,
+        _payload(),
+        database_url=database_url,
+        model_gateway=_FakeModelGateway(),
+    )
+
+    assert calls["probe"] == [database_url]
+    assert calls["open"] == [database_url]
+    assert calls["checkpointer"] is saver
+    assert calls["thread_id"] == run_id
+    assert result == {
+        "task_id": "task_001",
+        "status": "completed",
+        "agent_model": profile.as_payload(),
+        "workflow": {
+            "task_id": "task_001",
+            "status": "completed",
+            "current_step": "completed",
+            "history": [
+                {"step_name": "completed", "output": {"tool_id": "image_quality_check"}},
+            ],
+            "error_step": None,
+            "error_message": None,
+        },
+        "tool_results": [
+            {
+                "tool_id": "image_quality_check",
+                "version": "0.1.0",
+                "ok": True,
+                "output": {"quality_status": "pass", "artifact_id": "art_001"},
+                "error_code": None,
+                "error_message": None,
+            },
+        ],
+    }
+
+
 def _payload():
     return {
         "task_id": "task_001",
