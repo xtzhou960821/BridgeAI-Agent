@@ -43,15 +43,15 @@ BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭�
 
 ## 开发状态
 
-当前已进入 V0.2 可运行工作台阶段，已完成：
+当前已进入 V0.2 可运行工作台阶段，并已交付第一段 V0.3 Artifact/图像质量切片；这不表示 V0.3 的全部 Tool 或完整巡检能力已经完成。当前已完成：
 
 - Tool SDK：Tool Manifest、注册表、执行器和必填输入校验；
 - Workflow：LangGraph 图包含 `task_understanding`、`data_check`、`image_quality_check`、`completed`、`failed` 五个命名节点，并在 Tool 执行后按结果条件路由到成功或失败节点；
 - Agent Runner：桥梁巡检示例任务的最小单 Agent 调用循环，并在任务理解阶段通过 Model Gateway 调用当前 Agent 模型；每次业务执行使用 `checkpoint_thread_id=run_id` 作为独立的 LangGraph checkpoint thread；
-- Backend：FastAPI 健康检查、任务创建、列表、详情、执行和历史接口；
+- Backend：FastAPI 健康检查、Artifact 上传/元数据/内容读取，以及任务创建、列表、详情、执行和历史接口；
 - Backend API：保留 `POST /api/v1/tasks/runs` 兼容接口，并将其纳入持久化执行链路；
-- Frontend：Vue + TypeScript 工作台支持创建任务、重复执行和切换历史快照；
-- Data：PostgreSQL 的 BridgeAI 业务表保存任务、运行历史，以及每次执行的模型、Workflow 和 Tool JSONB 快照；官方 LangGraph checkpoint 表单独保存图执行状态。
+- Frontend：Vue + TypeScript 工作台支持上传一张 JPEG/PNG、创建任务、重复执行、持久化预览、质量卡片和历史快照切换；
+- Data：PostgreSQL 的 BridgeAI 业务表保存 Artifact 元数据、任务、运行历史，以及每次执行的模型、Workflow 和 Tool JSONB 快照；Artifact 原始字节只保存在本地文件存储，官方 LangGraph checkpoint 表单独保存图执行状态。
 
 当前 LangGraph 切片仅覆盖同步执行和 PostgreSQL checkpoint 持久化。resume/retry、interrupts、异步 workers、streaming、Store、Memory 和 RAG 均不在本切片范围内。
 
@@ -74,12 +74,25 @@ set +a
 export LANGGRAPH_STRICT_MSGPACK=true
 ./.venv/bin/python -m backend.app.repositories.postgres.migrate
 ./.venv/bin/python -m backend.app.repositories.postgres.checkpoints
+export BRIDGEAI_ARTIFACT_STORAGE_ROOT="${BRIDGEAI_ARTIFACT_STORAGE_ROOT:-var/artifacts}"
 ./.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 
 业务迁移与 LangGraph Checkpointer setup 是两个独立、显式且可重复执行的命令；两者都完成后再启动后端。前端另开终端执行 `npm run dev --prefix frontend -- --host 127.0.0.1 --port 5173`。
 
 详细说明见 `docs/development/v0.2-local-runbook.md`。
+
+Artifact 最小 API 流程从上传开始，不能使用示例字符串代替真实图片：
+
+```text
+POST /api/v1/artifacts
+GET  /api/v1/artifacts/{artifact_id}
+GET  /api/v1/artifacts/{artifact_id}/content
+POST /api/v1/tasks
+POST /api/v1/tasks/{task_id}/runs
+```
+
+上传接口按内容解码，只接受 JPEG/PNG，单文件上限 20 MiB。`BRIDGEAI_ARTIFACT_STORAGE_ROOT` 配置本地字节存储根目录，缺省为 `var/artifacts`；数据库只保存不可变元数据。完整 curl 示例、质量字段语义和修复指引见本地运行说明。
 
 ## 后续工作
 
@@ -90,6 +103,6 @@ export LANGGRAPH_STRICT_MSGPACK=true
 - 建立样例项目、演示数据、评测集和部署 Runbook；
 - 根据实际研发进展修订 V1.1、V1.2 和 V2.0 规划。
 
-当前 `agent/`、`backend/`、`frontend/`、`tools/` 和 `examples/` 已承载 V0.2 可运行工程。后续将继续补齐 Artifact 对象存储、异步执行、病害复核、报告闭环和部署能力。
+当前 `agent/`、`backend/`、`frontend/`、`tools/` 和 `examples/` 已承载 V0.2 可运行工程及第一段 V0.3 Artifact/图像质量切片。后续仍需补齐对象存储适配、更多巡检 Tool、异步执行、病害复核、报告闭环和部署能力。
 
 当前 Agent 默认模型配置为 oMLX 的 `DeepSeek-V4-Flash-4bit`，API base URL 为 `https://omlx.cpolar.cn/v1`。当前 V0.2 已在任务理解阶段通过 OpenAI-compatible Model Gateway 调用该模型，并随 Workflow 返回模型理解结果、模型 Profile 和 usage。
