@@ -46,12 +46,14 @@ BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭�
 当前已进入 V0.2 可运行工作台阶段，已完成：
 
 - Tool SDK：Tool Manifest、注册表、执行器和必填输入校验；
-- Workflow：任务状态创建、推进、失败和恢复；
-- Agent Runner：桥梁巡检示例任务的最小单 Agent 调用循环，并在任务理解阶段通过 Model Gateway 调用当前 Agent 模型；
+- Workflow：LangGraph 图包含 `task_understanding`、`data_check`、`image_quality_check`、`completed`、`failed` 五个命名节点，并在 Tool 执行后按结果条件路由到成功或失败节点；
+- Agent Runner：桥梁巡检示例任务的最小单 Agent 调用循环，并在任务理解阶段通过 Model Gateway 调用当前 Agent 模型；每次业务执行使用 `checkpoint_thread_id=run_id` 作为独立的 LangGraph checkpoint thread；
 - Backend：FastAPI 健康检查、任务创建、列表、详情、执行和历史接口；
 - Backend API：保留 `POST /api/v1/tasks/runs` 兼容接口，并将其纳入持久化执行链路；
 - Frontend：Vue + TypeScript 工作台支持创建任务、重复执行和切换历史快照；
-- Data：PostgreSQL 保存任务主记录，以及每次执行的模型、Workflow 和 Tool JSONB 快照。
+- Data：PostgreSQL 的 BridgeAI 业务表保存任务、运行历史，以及每次执行的模型、Workflow 和 Tool JSONB 快照；官方 LangGraph checkpoint 表单独保存图执行状态。
+
+当前 LangGraph 切片仅覆盖同步执行和 PostgreSQL checkpoint 持久化。resume/retry、interrupts、异步 workers、streaming、Store、Memory 和 RAG 均不在本切片范围内。
 
 本地验证：
 
@@ -69,10 +71,13 @@ npm run build --prefix frontend
 set -a
 source .env
 set +a
+export LANGGRAPH_STRICT_MSGPACK=true
 ./.venv/bin/python -m backend.app.repositories.postgres.migrate
-./.venv/bin/python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
-npm run dev --prefix frontend -- --host 127.0.0.1 --port 5173
+./.venv/bin/python -m backend.app.repositories.postgres.checkpoints
+./.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
+
+业务迁移与 LangGraph Checkpointer setup 是两个独立、显式且可重复执行的命令；两者都完成后再启动后端。前端另开终端执行 `npm run dev --prefix frontend -- --host 127.0.0.1 --port 5173`。
 
 详细说明见 `docs/development/v0.2-local-runbook.md`。
 
