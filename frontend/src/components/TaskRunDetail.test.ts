@@ -147,6 +147,50 @@ describe('TaskRunDetail', () => {
     expect(wrapper.text()).toContain('quality_status')
     expect(wrapper.text()).not.toContain('质量通过')
   })
+
+  it.each([
+    [
+      'empty quality containers',
+      (output: Record<string, unknown>) => {
+        output.metrics = {}
+        output.thresholds = {}
+        output.checks = {}
+      },
+    ],
+    [
+      'missing row metrics, threshold group, and check',
+      (output: Record<string, unknown>) => {
+        delete (output.metrics as Record<string, number>).sharpness_rms
+        delete (output.thresholds as Record<string, Record<string, number>>).bright_clipping
+        delete (output.checks as Record<string, string>).exposure
+      },
+    ],
+    [
+      'a non-finite metric',
+      (output: Record<string, unknown>) => {
+        ;(output.metrics as Record<string, number>).mean_luminance = Number.NaN
+      },
+    ],
+  ])('falls back to the legacy tool snapshot for %s', (_caseName, corrupt) => {
+    const malformedRun = qualityRun('pass')
+    const output = malformedRun.tool_results[0]?.output as Record<string, unknown>
+    corrupt(output)
+
+    const wrapper = mount(TaskRunDetail, {
+      props: {
+        run: malformedRun,
+        artifact,
+        artifactLoading: false,
+        artifactError: '',
+      },
+    })
+
+    expect(wrapper.text()).toContain('image_quality_check')
+    expect(wrapper.text()).toContain('quality_status')
+    expect(wrapper.find('.quality-snapshot').exists()).toBe(false)
+    expect(wrapper.find('details').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('质量通过')
+  })
 })
 
 function qualityRun(

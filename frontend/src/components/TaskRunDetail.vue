@@ -79,9 +79,49 @@ function isQualityStatus(value: unknown): value is QualityStatus {
   return value === 'pass' || value === 'warn' || value === 'fail'
 }
 
-function isNumberRecord(value: unknown): value is Record<string, number> {
+function hasExactKeys(record: Record<string, unknown>, expected: readonly string[]): boolean {
+  return Object.keys(record).length === expected.length && expected.every((key) => key in record)
+}
+
+function hasExactFiniteNumberKeys(
+  value: unknown,
+  expected: readonly string[],
+): value is Record<string, number> {
   const record = asRecord(value)
-  return record !== null && Object.values(record).every((item) => typeof item === 'number')
+  return (
+    record !== null &&
+    hasExactKeys(record, expected) &&
+    expected.every((key) => typeof record[key] === 'number' && Number.isFinite(record[key]))
+  )
+}
+
+function hasExactQualityStatusKeys(value: unknown, expected: readonly string[]): boolean {
+  const record = asRecord(value)
+  return record !== null && hasExactKeys(record, expected) && expected.every((key) => isQualityStatus(record[key]))
+}
+
+function hasExactThresholds(value: unknown): boolean {
+  const thresholds = asRecord(value)
+  return (
+    thresholds !== null &&
+    hasExactKeys(thresholds, [
+      'resolution',
+      'exposure',
+      'dark_clipping',
+      'bright_clipping',
+      'sharpness',
+    ]) &&
+    hasExactFiniteNumberKeys(thresholds.resolution, ['min_short_side_px', 'min_total_pixels']) &&
+    hasExactFiniteNumberKeys(thresholds.exposure, [
+      'fail_low',
+      'warn_low',
+      'warn_high',
+      'fail_high',
+    ]) &&
+    hasExactFiniteNumberKeys(thresholds.dark_clipping, ['pixel_max', 'warn_ratio', 'fail_ratio']) &&
+    hasExactFiniteNumberKeys(thresholds.bright_clipping, ['pixel_min', 'warn_ratio', 'fail_ratio']) &&
+    hasExactFiniteNumberKeys(thresholds.sharpness, ['fail_below', 'warn_below'])
+  )
 }
 
 function isImageQualityOutput(value: unknown): value is ImageQualityOutput {
@@ -89,23 +129,33 @@ function isImageQualityOutput(value: unknown): value is ImageQualityOutput {
   if (
     record === null ||
     typeof record.artifact_id !== 'string' ||
+    record.artifact_id.length === 0 ||
     !isQualityStatus(record.quality_status) ||
     typeof record.analyzer_version !== 'string' ||
-    !isNumberRecord(record.metrics) ||
+    record.analyzer_version.length === 0 ||
+    !hasExactFiniteNumberKeys(record.metrics, [
+      'short_side_px',
+      'total_pixels',
+      'mean_luminance',
+      'dark_clip_ratio',
+      'bright_clip_ratio',
+      'sharpness_rms',
+    ]) ||
+    !hasExactThresholds(record.thresholds) ||
+    !hasExactQualityStatusKeys(record.checks, [
+      'resolution',
+      'exposure',
+      'dark_clipping',
+      'bright_clipping',
+      'sharpness',
+    ]) ||
     !Array.isArray(record.reasons) ||
     !record.reasons.every((reason) => typeof reason === 'string')
   ) {
     return false
   }
 
-  const thresholds = asRecord(record.thresholds)
-  const checks = asRecord(record.checks)
-  return (
-    thresholds !== null &&
-    Object.values(thresholds).every(isNumberRecord) &&
-    checks !== null &&
-    Object.values(checks).every(isQualityStatus)
-  )
+  return true
 }
 
 function metric(output: ImageQualityOutput, key: string): string {
