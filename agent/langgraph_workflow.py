@@ -5,7 +5,12 @@ from __future__ import annotations
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
-from agent.langgraph_state import BridgeInspectionState, WorkflowHistoryItem
+from agent.langgraph_state import (
+    BridgeInspectionState,
+    WorkflowHistoryItem,
+    model_result_payload,
+    normalize_checkpoint_value,
+)
 from agent.model_gateway import ModelGateway, TaskUnderstandingRequest
 from tools.sdk import ToolExecutor, ToolResult
 
@@ -27,6 +32,7 @@ def build_bridge_inspection_graph(
                 artifact_ids=state["artifact_ids"],
             ),
         ).as_payload()
+        model_result = model_result_payload(model_result)
         return {
             "current_step": "task_understanding",
             "model_result": model_result,
@@ -112,11 +118,17 @@ def _history_item(step_name: str, output: dict[str, object]) -> WorkflowHistoryI
 
 
 def _serialize_tool_result(tool_result: ToolResult) -> dict[str, object]:
-    return {
+    serialized_result = normalize_checkpoint_value(
+        {
         "tool_id": tool_result.tool_id,
         "version": tool_result.version,
         "ok": tool_result.ok,
-        "output": dict(tool_result.output),
+        "output": tool_result.output,
         "error_code": tool_result.error_code,
         "error_message": tool_result.error_message,
-    }
+        },
+        path="tool_result",
+    )
+    if not isinstance(serialized_result, dict):
+        raise TypeError("Tool result serialization must produce a dictionary")
+    return serialized_result

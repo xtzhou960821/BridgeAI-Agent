@@ -1,6 +1,8 @@
+import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-from agent.langgraph_state import initial_bridge_inspection_state
+from agent.langgraph_state import StateSerializationError, initial_bridge_inspection_state
 from agent.langgraph_workflow import build_bridge_inspection_graph
 from tools.sdk import ToolExecutor, ToolManifest, ToolRegistry
 
@@ -75,6 +77,71 @@ def test_initial_state_contains_only_serializer_safe_values():
     assert state["error_message"] is None
 
 
+def test_graph_redacts_sensitive_values_and_serializes_with_strict_msgpack():
+    saver = InMemorySaver()
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(
+            additional_payload={"api_key": "model-secret"},
+        ),
+        tool_executor=ToolExecutor(
+            _registry_with_output(
+                {
+                    "quality_status": "pass",
+                    "nested": {"access_token": "tool-secret", "score": 0.98},
+                },
+            ),
+        ),
+        checkpointer=saver,
+    )
+
+    result = graph.invoke(
+        initial_bridge_inspection_state(
+            task_id="task_001",
+            run_id="run_safe_msgpack",
+            task_type="bridge_inspection",
+            objective="检查桥梁无人机影像质量",
+            artifact_ids=["art_001"],
+            agent_model={
+                "model_id": "DeepSeek-V4-Flash-4bit",
+                "api_key": "profile-secret",
+                "metadata": {"binary": b"untrusted"},
+            },
+        ),
+        config={"configurable": {"thread_id": "run_safe_msgpack"}},
+    )
+
+    assert result["agent_model"] == {"model_id": "DeepSeek-V4-Flash-4bit"}
+    assert "api_key" not in result["model_result"]
+    assert result["tool_results"][0]["output"]["nested"] == {
+        "access_token": "[redacted]",
+        "score": 0.98,
+    }
+    value_type, _ = JsonPlusSerializer(pickle_fallback=False).dumps_typed(result)
+    assert value_type == "msgpack"
+
+
+def test_graph_rejects_binary_tool_output_before_checkpointing():
+    saver = InMemorySaver()
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        tool_executor=ToolExecutor(
+            _registry_with_output(
+                {"quality_status": "pass", "binary_artifact": b"untrusted"},
+            ),
+        ),
+        checkpointer=saver,
+    )
+
+    with pytest.raises(
+        StateSerializationError,
+        match="tool_result.output.binary_artifact",
+    ):
+        graph.invoke(
+            _initial_state("run_rejected_binary"),
+            config={"configurable": {"thread_id": "run_rejected_binary"}},
+        )
+
+
 def _initial_state(run_id: str):
     return initial_bridge_inspection_state(
         task_id="task_001",
@@ -104,18 +171,38 @@ def _registry(required: list[str]) -> ToolRegistry:
     return registry
 
 
+def _registry_with_output(output: dict[str, object]) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        ToolManifest(
+            tool_id="image_quality_check",
+            version="0.1.0",
+            name="Image quality check",
+            input_schema={"required": ["artifact_id"]},
+            output_schema={"required": ["quality_status"]},
+        ),
+        lambda payload: output,
+    )
+    return registry
+
+
 class _FakeModelGateway:
+    def __init__(self, additional_payload: dict[str, object] | None = None):
+        self._additional_payload = additional_payload or {}
+
     def understand_task(self, request):
+        payload = {
+            "ok": True,
+            "model_id": "DeepSeek-V4-Flash-4bit",
+            "provider": "omlx",
+            "runtime": "openai-compatible",
+            "content": f"任务理解完成：{request.objective}",
+            "usage": {"total_tokens": 12},
+            "error_message": None,
+        }
+        payload.update(self._additional_payload)
         return _FakeModelResult(
-            {
-                "ok": True,
-                "model_id": "DeepSeek-V4-Flash-4bit",
-                "provider": "omlx",
-                "runtime": "openai-compatible",
-                "content": f"任务理解完成：{request.objective}",
-                "usage": {"total_tokens": 12},
-                "error_message": None,
-            },
+            payload,
         )
 
 
