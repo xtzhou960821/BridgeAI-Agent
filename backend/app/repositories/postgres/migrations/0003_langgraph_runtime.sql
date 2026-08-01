@@ -48,9 +48,20 @@ BEGIN
         FROM pg_class AS index_relation
         JOIN pg_index AS index_definition
             ON index_definition.indexrelid = index_relation.oid
+        JOIN pg_attribute AS key_attribute
+            ON key_attribute.attrelid = index_definition.indrelid
+           AND key_attribute.attnum = index_definition.indkey[0]
         WHERE index_relation.relname = 'uq_inspection_task_runs_checkpoint_thread'
           AND index_relation.relnamespace = 'public'::regnamespace
           AND index_definition.indrelid = 'public.inspection_task_runs'::regclass
+          AND index_definition.indisunique
+          AND index_definition.indnkeyatts = 1
+          AND index_definition.indnatts = 1
+          AND key_attribute.attname = 'checkpoint_thread_id'
+          AND pg_get_expr(
+              index_definition.indpred,
+              index_definition.indrelid
+          ) = '(checkpoint_thread_id IS NOT NULL)'
     ) THEN
         IF EXISTS (
             SELECT 1
@@ -59,7 +70,7 @@ BEGIN
               AND index_relation.relnamespace = 'public'::regnamespace
         ) THEN
             RAISE EXCEPTION
-                'Index uq_inspection_task_runs_checkpoint_thread is already owned by another relation'
+                'Index uq_inspection_task_runs_checkpoint_thread is incompatible with the required unique partial index'
                 USING ERRCODE = '42P07';
         END IF;
         CREATE UNIQUE INDEX uq_inspection_task_runs_checkpoint_thread

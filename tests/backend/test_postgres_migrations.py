@@ -126,6 +126,25 @@ def test_runtime_migration_rejects_same_named_index_on_other_table(tmp_path):
         reset_test_tables(database_url)
 
 
+@pytest.mark.postgres
+def test_runtime_migration_rejects_same_named_index_with_wrong_definition(tmp_path):
+    database_url = require_test_database_url()
+    reset_test_tables(database_url)
+    _apply_history_migrations(database_url, tmp_path)
+
+    try:
+        with psycopg.connect(database_url) as connection:
+            connection.execute(
+                "CREATE UNIQUE INDEX uq_inspection_task_runs_checkpoint_thread "
+                "ON inspection_task_runs (run_id)",
+            )
+
+        with pytest.raises(psycopg.errors.DuplicateTable):
+            apply_migrations(database_url)
+    finally:
+        reset_test_tables(database_url)
+
+
 def _apply_history_migrations(database_url: str, tmp_path) -> None:
     history_directory = tmp_path / "history_migrations"
     history_directory.mkdir()
