@@ -1,0 +1,1 @@
+"""Artifact byte storage adapters."""
