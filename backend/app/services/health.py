@@ -10,6 +10,10 @@ from backend.app.repositories.postgres.connection import (
     get_database_url,
     probe_database,
 )
+from backend.app.repositories.postgres.checkpoints import (
+    CheckpointerStatus,
+    probe_langgraph_checkpointer,
+)
 
 
 def build_health_payload(
@@ -32,16 +36,22 @@ def build_health_payload(
 def build_local_health_payload(
     environ: Mapping[str, str] | None = None,
     database_probe: Callable[[str], bool] = probe_database,
+    checkpointer_probe: Callable[[str], CheckpointerStatus] = probe_langgraph_checkpointer,
 ) -> dict[str, object]:
     """Build the local API health payload from runtime configuration."""
 
     source = os.environ if environ is None else environ
+    database_url = get_database_url(source)
     return build_health_payload(
         service_name="bridgeai-api",
         version=source.get("BRIDGEAI_API_VERSION", "0.2.0"),
         environment=source.get("BRIDGEAI_ENV", "local_dev"),
         components={
-            "database": _database_status(source, database_probe),
+            "database": _database_status(database_url, database_probe),
+            "langgraph_checkpointer": _checkpointer_status(
+                database_url,
+                checkpointer_probe,
+            ),
             "model_gateway": _model_gateway_status(source),
             "tool_registry": "ready",
             "workflow": "ready",
@@ -50,15 +60,23 @@ def build_local_health_payload(
 
 
 def _database_status(
-    source: Mapping[str, str],
+    database_url: str | None,
     database_probe: Callable[[str], bool],
 ) -> str:
-    database_url = get_database_url(source)
     if not database_url:
         return "not_configured"
     if database_probe(database_url):
         return "ready"
     return "unavailable"
+
+
+def _checkpointer_status(
+    database_url: str | None,
+    checkpointer_probe: Callable[[str], CheckpointerStatus],
+) -> CheckpointerStatus:
+    if not database_url:
+        return "unavailable"
+    return checkpointer_probe(database_url)
 
 
 def _model_gateway_status(source: Mapping[str, str]) -> str:

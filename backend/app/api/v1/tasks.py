@@ -9,6 +9,7 @@ from agent.model_gateway import ModelGatewayConfigurationError
 from backend.app.domain.task_errors import (
     DatabaseUnavailableError,
     IdempotencyConflictError,
+    LangGraphCheckpointerNotReadyError,
     TaskExecutionError,
     TaskInputConflictError,
     TaskNotFoundError,
@@ -162,6 +163,7 @@ def _service_call(operation: Callable[[TaskService], _Result]) -> _Result:
         TaskInputConflictError,
         DatabaseUnavailableError,
         ModelGatewayConfigurationError,
+        LangGraphCheckpointerNotReadyError,
         TaskExecutionError,
     ) as exc:
         _raise_http_error(exc)
@@ -199,6 +201,15 @@ def _raise_http_error(exc: Exception) -> NoReturn:
                 "模型网关未配置：请在后端启动环境中设置 BRIDGEAI_AGENT_API_KEY，"
                 "或将 BRIDGEAI_AGENT_MODEL_IS_STUB=true 用于本地演示。"
             ),
+        }
+    elif isinstance(exc, LangGraphCheckpointerNotReadyError):
+        status_code = 503
+        detail = {
+            "code": "LANGGRAPH_CHECKPOINTER_NOT_READY",
+            "message": (
+                "LangGraph 检查点存储未就绪，请先执行显式初始化命令并检查 PostgreSQL。"
+            ),
+            "run_id": exc.run_id,
         }
     else:
         status_code = 502

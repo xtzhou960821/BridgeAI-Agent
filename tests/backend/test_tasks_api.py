@@ -13,6 +13,7 @@ from agent.model_gateway import ModelGatewayConfigurationError
 from backend.app.domain.task_errors import (
     DatabaseUnavailableError,
     IdempotencyConflictError,
+    LangGraphCheckpointerNotReadyError,
     TaskExecutionError,
     TaskInputConflictError,
     TaskNotFoundError,
@@ -116,6 +117,19 @@ def test_compatibility_route_maps_objective_to_title(monkeypatch):
             {
                 "code": "DATABASE_UNAVAILABLE",
                 "message": "PostgreSQL 任务存储当前不可用，请检查配置、连接和迁移状态。",
+            },
+        ),
+        (
+            "post",
+            "/api/v1/tasks/task_001/runs",
+            LangGraphCheckpointerNotReadyError("run_checkpoint", "tables missing"),
+            503,
+            {
+                "code": "LANGGRAPH_CHECKPOINTER_NOT_READY",
+                "message": (
+                    "LangGraph 检查点存储未就绪，请先执行显式初始化命令并检查 PostgreSQL。"
+                ),
+                "run_id": "run_checkpoint",
             },
         ),
         (

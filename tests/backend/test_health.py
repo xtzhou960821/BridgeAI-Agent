@@ -28,10 +28,12 @@ def test_local_health_marks_database_ready_and_model_gateway_configured():
             "BRIDGEAI_AGENT_API_KEY": "secret-token",
         },
         database_probe=lambda _url: True,
+        checkpointer_probe=lambda _url: "ready",
     )
 
     assert payload["components"] == {
         "database": "ready",
+        "langgraph_checkpointer": "ready",
         "model_gateway": "configured",
         "tool_registry": "ready",
         "workflow": "ready",
@@ -43,6 +45,7 @@ def test_local_health_keeps_database_and_model_gateway_not_configured_when_missi
 
     assert payload["components"] == {
         "database": "not_configured",
+        "langgraph_checkpointer": "unavailable",
         "model_gateway": "not_configured",
         "tool_registry": "ready",
         "workflow": "ready",
@@ -62,6 +65,27 @@ def test_local_health_marks_configured_but_unreachable_database_unavailable():
     payload = build_local_health_payload(
         {"BRIDGEAI_DATABASE_URL": "postgresql://db/bridgeai"},
         database_probe=lambda _url: False,
+        checkpointer_probe=lambda _url: "unavailable",
     )
 
     assert payload["components"]["database"] == "unavailable"
+
+
+def test_local_health_exposes_not_initialized_checkpointer_without_setup():
+    payload = build_local_health_payload(
+        environ={"BRIDGEAI_DATABASE_URL": "postgresql://local/bridgeai"},
+        database_probe=lambda _url: True,
+        checkpointer_probe=lambda _url: "not_initialized",
+    )
+
+    assert payload["components"]["langgraph_checkpointer"] == "not_initialized"
+
+
+def test_local_health_exposes_unavailable_checkpointer_without_setup():
+    payload = build_local_health_payload(
+        environ={"BRIDGEAI_DATABASE_URL": "postgresql://local/bridgeai"},
+        database_probe=lambda _url: True,
+        checkpointer_probe=lambda _url: "unavailable",
+    )
+
+    assert payload["components"]["langgraph_checkpointer"] == "unavailable"
