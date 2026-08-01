@@ -26,6 +26,18 @@ export type ArtifactRecord = {
   created_at: string
 }
 
+export type QualityStatus = 'pass' | 'warn' | 'fail'
+
+export type ImageQualityOutput = {
+  artifact_id: string
+  quality_status: QualityStatus
+  analyzer_version: string
+  metrics: Record<string, number>
+  thresholds: Record<string, Record<string, number>>
+  checks: Record<string, QualityStatus>
+  reasons: string[]
+}
+
 export type TaskRecord = TaskCreateInput & {
   task_id: string
   status: string

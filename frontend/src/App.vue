@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 
 import {
   createTask,
+  getArtifact,
   listTaskRuns,
   listTasks,
   loadHealth,
@@ -31,6 +32,7 @@ const isUploadingArtifact = ref(false)
 const runningTaskId = ref<string | null>(null)
 const isLoadingTasks = ref(false)
 const isLoadingRuns = ref(false)
+const isLoadingArtifact = ref(false)
 
 const healthError = ref('')
 const taskListError = ref('')
@@ -38,6 +40,8 @@ const createError = ref('')
 const artifactUploadError = ref('')
 const runError = ref('')
 const pendingArtifact = ref<ArtifactRecord | null>(null)
+const selectedArtifact = ref<ArtifactRecord | null>(null)
+const selectedArtifactError = ref('')
 
 const selectedTask = computed(
   () => tasks.value.find((task) => task.task_id === selectedTaskId.value) ?? null,
@@ -94,6 +98,9 @@ async function refreshTasks(preferredTaskId: string | null = selectedTaskId.valu
       selectedTaskId.value = null
       selectedRunId.value = null
       runs.value = []
+      selectedArtifact.value = null
+      selectedArtifactError.value = ''
+      isLoadingArtifact.value = false
     }
   } catch (error) {
     taskListError.value = messageOf(error, '无法读取任务列表')
@@ -106,7 +113,10 @@ async function selectTask(taskId: string) {
   selectedTaskId.value = taskId
   selectedRunId.value = null
   runs.value = []
-  await refreshRuns(taskId)
+  selectedArtifact.value = null
+  selectedArtifactError.value = ''
+  const artifactId = tasks.value.find((task) => task.task_id === taskId)?.artifact_ids[0] ?? null
+  await Promise.all([refreshRuns(taskId), refreshArtifact(taskId, artifactId)])
 }
 
 async function refreshRuns(taskId: string) {
@@ -124,6 +134,32 @@ async function refreshRuns(taskId: string) {
     }
   } finally {
     if (selectedTaskId.value === taskId) isLoadingRuns.value = false
+  }
+}
+
+async function refreshArtifact(taskId: string, artifactId: string | null) {
+  isLoadingArtifact.value = true
+  if (!artifactId) {
+    if (selectedTaskId.value === taskId) {
+      selectedArtifact.value = null
+      selectedArtifactError.value = '历史任务未关联真实图片'
+      isLoadingArtifact.value = false
+    }
+    return
+  }
+
+  try {
+    const loaded = await getArtifact(artifactId)
+    if (selectedTaskId.value !== taskId) return
+    selectedArtifact.value = loaded
+    selectedArtifactError.value = ''
+  } catch (error) {
+    if (selectedTaskId.value === taskId) {
+      selectedArtifact.value = null
+      selectedArtifactError.value = messageOf(error, '历史任务未关联真实图片')
+    }
+  } finally {
+    if (selectedTaskId.value === taskId) isLoadingArtifact.value = false
   }
 }
 
@@ -343,7 +379,12 @@ onMounted(() => {
             {{ selectedRun?.status ?? 'not_selected' }}
           </span>
         </div>
-        <TaskRunDetail :run="selectedRun" />
+        <TaskRunDetail
+          :run="selectedRun"
+          :artifact="selectedArtifact"
+          :artifact-loading="isLoadingArtifact"
+          :artifact-error="selectedArtifactError"
+        />
       </article>
     </section>
   </main>

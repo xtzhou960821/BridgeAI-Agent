@@ -9,6 +9,7 @@ const api = vi.hoisted(() => ({
     `http://127.0.0.1:8000/api/v1/artifacts/${encodeURIComponent(artifactId)}/content`,
   ),
   createTask: vi.fn(),
+  getArtifact: vi.fn(),
   getTask: vi.fn(),
   listTaskRuns: vi.fn(),
   listTasks: vi.fn(),
@@ -50,6 +51,12 @@ const uploadedArtifact: ArtifactRecord = {
   created_at: '2026-08-02T01:00:00+00:00',
 }
 
+const persistedArtifact: ArtifactRecord = {
+  ...uploadedArtifact,
+  artifact_id: 'art_001',
+  original_filename: 'persisted-bridge.jpg',
+}
+
 describe('persistent task workbench', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -67,6 +74,7 @@ describe('persistent task workbench', () => {
       return { items: taskTwoHistoryLoads === 1 ? [] : [newRun] }
     })
     api.createTask.mockResolvedValue(taskTwo)
+    api.getArtifact.mockResolvedValue(persistedArtifact)
     api.runTask.mockResolvedValue(newRun)
     api.uploadArtifact.mockResolvedValue(uploadedArtifact)
   })
@@ -137,6 +145,17 @@ describe('persistent task workbench', () => {
     await flushPromises()
 
     expect(wrapper.text()).toContain('LangGraph 检查点存储不可用，请检查 PostgreSQL 连接。')
+  })
+
+  it('loads the selected task artifact and treats an unavailable legacy artifact as detail state', async () => {
+    api.getArtifact.mockRejectedValueOnce(new Error('请求失败（404）'))
+
+    const wrapper = mount(App)
+    await flushPromises()
+
+    expect(api.getArtifact).toHaveBeenCalledWith('art_001')
+    expect(wrapper.text()).toContain('历史任务未关联真实图片')
+    expect(wrapper.text()).not.toContain('无法读取任务列表')
   })
 })
 
