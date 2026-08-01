@@ -106,7 +106,7 @@ def test_agent_runner_returns_failed_terminal_for_tool_failure():
     ).run(context, thread_id="run_agent_002")
 
     assert result.status == "failed"
-    assert result.workflow.error_code == "missing_required_input"
+    assert result.workflow.error_code == "MISSING_REQUIRED_INPUT"
     assert result.workflow.error_message == "Missing required input: camera_id"
     assert result.tool_results[0].ok is False
     assert [step.step_name for step in result.workflow.history] == [

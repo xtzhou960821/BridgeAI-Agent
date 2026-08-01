@@ -69,10 +69,21 @@ _KEYWORD_DSN_PASSWORD = re.compile(
 )
 _EXTERNAL_URI = re.compile(r"\b[a-z][a-z0-9+.-]*://", flags=re.IGNORECASE)
 _ABSOLUTE_PATH = re.compile(r"(?:^|\s)/(?:[^\s/]+/)+[^\s/]*")
+_IMAGE_FILENAME = re.compile(r"\b[^/\s\\]+\.(?:jpe?g|png)\b", flags=re.IGNORECASE)
 _SENSITIVE_ASSIGNMENT = re.compile(
     r"\b(?:api[_-]?key|authorization|credential|password|secret|token)\s*[:=]",
     flags=re.IGNORECASE,
 )
+_ARTIFACT_ID = re.compile(r"art_[A-Za-z0-9_-]+\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_SEMANTIC_VERSION = re.compile(
+    r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?\Z"
+)
+_TOOL_ID = re.compile(r"[a-z][a-z0-9_]*\Z")
+_ERROR_CODE = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
+_ARTIFACT_MIME_TYPES = frozenset({"image/jpeg", "image/png"})
+_ARTIFACT_STATUSES = frozenset({"ready"})
+_QUALITY_STATUSES = frozenset({"pass", "warn", "fail"})
 
 
 class StateSerializationError(ValueError):
@@ -168,9 +179,10 @@ def artifact_verifier_payload(payload: dict[str, object]) -> dict[str, object]:
             )
         result["ok"] = normalized["ok"]
     if "error_code" in normalized:
-        result["error_code"] = _required_payload_string(
+        result["error_code"] = safe_error_code_payload(
             normalized["error_code"],
-            "data_check_result.error_code",
+            path="data_check_result.error_code",
+            default="ARTIFACT_VERIFICATION_FAILED",
         )
     if "error_message" in normalized:
         result["error_message"] = external_text_payload(
@@ -184,16 +196,38 @@ def artifact_verifier_payload(payload: dict[str, object]) -> dict[str, object]:
                 "Unsupported checkpoint value at data_check_result.artifact: expected dict"
             )
         safe_artifact: dict[str, object] = {}
-        for key in ("artifact_id", "sha256", "mime_type", "status"):
-            if key in artifact:
-                safe_artifact[key] = _required_payload_string(
-                    artifact[key],
-                    f"data_check_result.artifact.{key}",
-                )
+        if "artifact_id" in artifact:
+            safe_artifact["artifact_id"] = artifact_id_payload(
+                artifact["artifact_id"],
+                path="data_check_result.artifact.artifact_id",
+            )
+        if "sha256" in artifact:
+            safe_artifact["sha256"] = _format_string_payload(
+                artifact["sha256"],
+                path="data_check_result.artifact.sha256",
+                pattern=_SHA256,
+                expected="lowercase SHA-256",
+            )
+        if "mime_type" in artifact:
+            safe_artifact["mime_type"] = _enum_string_payload(
+                artifact["mime_type"],
+                path="data_check_result.artifact.mime_type",
+                allowed=_ARTIFACT_MIME_TYPES,
+            )
+        if "status" in artifact:
+            safe_artifact["status"] = _enum_string_payload(
+                artifact["status"],
+                path="data_check_result.artifact.status",
+                allowed=_ARTIFACT_STATUSES,
+            )
         for key in ("size_bytes", "width_px", "height_px"):
             if key in artifact:
                 value = artifact[key]
-                if isinstance(value, bool) or not isinstance(value, int):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                ):
                     raise StateSerializationError(
                         "Unsupported checkpoint value at "
                         f"data_check_result.artifact.{key}: expected integer"
@@ -208,12 +242,22 @@ def image_quality_output_payload(payload: dict[str, object]) -> dict[str, object
 
     normalized = _normalized_dictionary(payload, path="tool_result.output")
     result: dict[str, object] = {}
-    for key in ("artifact_id", "quality_status", "analyzer_version"):
-        if key in normalized:
-            result[key] = _required_payload_string(
-                normalized[key],
-                f"tool_result.output.{key}",
-            )
+    if "artifact_id" in normalized:
+        result["artifact_id"] = artifact_id_payload(
+            normalized["artifact_id"],
+            path="tool_result.output.artifact_id",
+        )
+    if "quality_status" in normalized:
+        result["quality_status"] = _enum_string_payload(
+            normalized["quality_status"],
+            path="tool_result.output.quality_status",
+            allowed=_QUALITY_STATUSES,
+        )
+    if "analyzer_version" in normalized:
+        result["analyzer_version"] = version_payload(
+            normalized["analyzer_version"],
+            path="tool_result.output.analyzer_version",
+        )
     metrics = normalized.get("metrics")
     if metrics is not None:
         result["metrics"] = _numeric_payload(
@@ -243,9 +287,10 @@ def image_quality_output_payload(payload: dict[str, object]) -> dict[str, object
                 "Unsupported checkpoint value at tool_result.output.checks: expected dict"
             )
         result["checks"] = {
-            key: _required_payload_string(
+            key: _enum_string_payload(
                 checks[key],
-                f"tool_result.output.checks.{key}",
+                path=f"tool_result.output.checks.{key}",
+                allowed=_QUALITY_STATUSES,
             )
             for key in _IMAGE_QUALITY_CHECK_FIELDS
             if key in checks
@@ -273,10 +318,52 @@ def external_text_payload(value: object, *, path: str) -> str:
     if (
         _EXTERNAL_URI.search(text)
         or _ABSOLUTE_PATH.search(text)
+        or _IMAGE_FILENAME.search(text)
         or _SENSITIVE_ASSIGNMENT.search(text)
     ):
         return _REDACTED_VALUE
     return text
+
+
+def artifact_id_payload(value: object, *, path: str) -> str:
+    """Validate the stable Artifact identifier used by persisted state."""
+
+    return _format_string_payload(
+        value,
+        path=path,
+        pattern=_ARTIFACT_ID,
+        expected="Artifact ID",
+    )
+
+
+def version_payload(value: object, *, path: str) -> str:
+    """Validate a serializer-safe semantic component version."""
+
+    return _format_string_payload(
+        value,
+        path=path,
+        pattern=_SEMANTIC_VERSION,
+        expected="semantic version",
+    )
+
+
+def tool_id_payload(value: object, *, path: str) -> str:
+    """Validate a serializer-safe snake-case Tool identifier."""
+
+    return _format_string_payload(
+        value,
+        path=path,
+        pattern=_TOOL_ID,
+        expected="Tool ID",
+    )
+
+
+def safe_error_code_payload(value: object, *, path: str, default: str) -> str:
+    """Normalize safe identifiers and replace arbitrary external error codes."""
+
+    if not isinstance(value, str) or _ERROR_CODE.fullmatch(value) is None:
+        return default
+    return value.upper()
 
 
 def normalize_checkpoint_value(value: object, *, path: str) -> object:
@@ -363,11 +450,43 @@ def _required_payload_string(value: object, path: str) -> str:
     return value
 
 
+def _format_string_payload(
+    value: object,
+    *,
+    path: str,
+    pattern: re.Pattern[str],
+    expected: str,
+) -> str:
+    text = _required_payload_string(value, path)
+    if pattern.fullmatch(text) is None:
+        raise StateSerializationError(
+            f"Unsupported checkpoint value at {path}: expected {expected}"
+        )
+    return text
+
+
+def _enum_string_payload(
+    value: object,
+    *,
+    path: str,
+    allowed: frozenset[str],
+) -> str:
+    text = _required_payload_string(value, path)
+    if text not in allowed:
+        raise StateSerializationError(
+            f"Unsupported checkpoint value at {path}: unexpected value"
+        )
+    return text
+
+
 def _artifact_ids(artifact_ids: list[str]) -> list[str]:
     normalized = normalize_checkpoint_value(artifact_ids, path="artifact_ids")
     if not isinstance(normalized, list) or not all(isinstance(item, str) for item in normalized):
         raise StateSerializationError("Unsupported checkpoint value at artifact_ids: expected strings")
-    return normalized
+    return [
+        artifact_id_payload(item, path=f"artifact_ids[{index}]")
+        for index, item in enumerate(normalized)
+    ]
 
 
 def _required_string(value: str, path: str) -> str:

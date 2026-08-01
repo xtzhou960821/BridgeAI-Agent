@@ -15,6 +15,9 @@ from agent.langgraph_state import (
     image_quality_output_payload,
     model_result_payload,
     normalize_checkpoint_value,
+    safe_error_code_payload,
+    tool_id_payload,
+    version_payload,
 )
 from agent.model_gateway import ModelGateway, TaskUnderstandingRequest
 from tools.sdk import ToolExecutor, ToolResult
@@ -177,6 +180,19 @@ def _error_value(value: object, default: str) -> str:
 
 def _serialize_tool_result(tool_result: ToolResult) -> dict[str, object]:
     output = image_quality_output_payload(tool_result.output)
+    tool_id = tool_id_payload(tool_result.tool_id, path="tool_result.tool_id")
+    version = version_payload(tool_result.version, path="tool_result.version")
+    if not isinstance(tool_result.ok, bool):
+        raise TypeError("Tool result ok must be a boolean")
+    error_code = (
+        safe_error_code_payload(
+            tool_result.error_code,
+            path="tool_result.error_code",
+            default="TOOL_EXECUTION_FAILED",
+        )
+        if tool_result.error_code is not None
+        else None
+    )
     error_message = (
         external_text_payload(
             tool_result.error_message,
@@ -187,11 +203,11 @@ def _serialize_tool_result(tool_result: ToolResult) -> dict[str, object]:
     )
     serialized_result = normalize_checkpoint_value(
         {
-        "tool_id": tool_result.tool_id,
-        "version": tool_result.version,
+        "tool_id": tool_id,
+        "version": version,
         "ok": tool_result.ok,
         "output": output,
-        "error_code": tool_result.error_code,
+        "error_code": error_code,
         "error_message": error_message,
         },
         path="tool_result",

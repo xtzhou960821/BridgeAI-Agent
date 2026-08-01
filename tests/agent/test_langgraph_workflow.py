@@ -8,7 +8,13 @@ from agent.langgraph_state import (
     normalize_checkpoint_value,
 )
 from agent.langgraph_workflow import build_bridge_inspection_graph
-from tools.sdk import ToolExecutor, ToolHandlerError, ToolManifest, ToolRegistry
+from tools.sdk import (
+    ToolExecutor,
+    ToolHandlerError,
+    ToolManifest,
+    ToolRegistry,
+    ToolResult,
+)
 
 
 def test_graph_routes_success_through_all_named_nodes():
@@ -53,7 +59,7 @@ def test_graph_routes_unsuccessful_tool_to_failed():
     assert result["status"] == "failed"
     assert result["current_step"] == "failed"
     assert result["error_step"] == "image_quality_check"
-    assert result["error_code"] == "missing_required_input"
+    assert result["error_code"] == "MISSING_REQUIRED_INPUT"
     assert result["error_message"] == "Missing required input: camera_id"
     assert [item["step_name"] for item in result["workflow_history"]][-1] == "failed"
 
@@ -178,6 +184,37 @@ def test_graph_allowlists_verified_artifact_metadata_before_checkpointing():
         assert prohibited not in persisted
 
 
+@pytest.mark.parametrize(
+    ("field", "unsafe_value"),
+    [
+        ("artifact_id", "/private/tmp/sensitive-bridge.jpg"),
+        ("sha256", "redis://sha-user:sha-pass@cache.example/0"),
+        ("mime_type", "mongodb://mime-user:mime-pass@db.example/quality"),
+        ("status", "/var/artifacts/ready"),
+    ],
+)
+def test_graph_rejects_unsafe_values_in_approved_artifact_fields(
+    field,
+    unsafe_value,
+):
+    artifact = dict(_verified_artifact("art_001")["artifact"])
+    artifact[field] = unsafe_value
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=lambda _artifact_id: {"ok": True, "artifact": artifact},
+        tool_executor=ToolExecutor(_registry(required=["artifact_id"])),
+        checkpointer=InMemorySaver(),
+    )
+
+    with pytest.raises(StateSerializationError, match=field):
+        graph.invoke(
+            _initial_state(f"run_unsafe_artifact_{field}"),
+            config={
+                "configurable": {"thread_id": f"run_unsafe_artifact_{field}"}
+            },
+        )
+
+
 def test_graph_redacts_prohibited_verifier_error_details():
     saver = InMemorySaver()
     graph = build_bridge_inspection_graph(
@@ -203,6 +240,30 @@ def test_graph_redacts_prohibited_verifier_error_details():
     persisted = repr([item.checkpoint["channel_values"] for item in saver.list(None)])
     assert "sensitive-bridge.jpg" not in persisted
     assert "artifact-pass" not in persisted
+
+
+def test_graph_replaces_unsafe_verifier_error_code_with_safe_failure_code():
+    saver = InMemorySaver()
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=lambda _artifact_id: {
+            "ok": False,
+            "error_code": "redis://code-user:code-pass@cache.example/0",
+            "error_message": "Artifact verification failed",
+        },
+        tool_executor=ToolExecutor(_registry(required=["artifact_id"])),
+        checkpointer=saver,
+    )
+
+    result = graph.invoke(
+        _initial_state("run_safe_verifier_error_code"),
+        config={"configurable": {"thread_id": "run_safe_verifier_error_code"}},
+    )
+
+    assert result["error_code"] == "ARTIFACT_VERIFICATION_FAILED"
+    persisted = repr([item.checkpoint["channel_values"] for item in saver.list(None)])
+    assert "code-user" not in persisted
+    assert "code-pass" not in persisted
 
 
 def test_graph_allowlists_quality_output_and_preserves_approved_fields():
@@ -269,6 +330,66 @@ def test_graph_allowlists_quality_output_and_preserves_approved_fields():
         assert prohibited not in persisted
 
 
+@pytest.mark.parametrize(
+    ("field", "unsafe_value"),
+    [
+        ("artifact_id", "/private/tmp/quality-sensitive.png"),
+        ("quality_status", "redis://status-user:status-pass@cache.example/0"),
+        ("analyzer_version", "mongodb://version-user:version-pass@db.example/quality"),
+        ("checks", {"resolution": "/var/artifacts/pass"}),
+    ],
+)
+def test_graph_rejects_unsafe_values_in_approved_quality_fields(
+    field,
+    unsafe_value,
+):
+    output = {
+        "artifact_id": "art_001",
+        "quality_status": "pass",
+        "analyzer_version": "0.1.0",
+        "checks": {"resolution": "pass"},
+    }
+    output[field] = unsafe_value
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
+        tool_executor=ToolExecutor(_registry_with_output(output)),
+        checkpointer=InMemorySaver(),
+    )
+
+    with pytest.raises(StateSerializationError, match=field):
+        graph.invoke(
+            _initial_state(f"run_unsafe_quality_{field}"),
+            config={
+                "configurable": {"thread_id": f"run_unsafe_quality_{field}"}
+            },
+        )
+
+
+def test_graph_redacts_bare_filename_in_approved_quality_reason():
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
+        tool_executor=ToolExecutor(
+            _registry_with_output(
+                {
+                    "artifact_id": "art_001",
+                    "quality_status": "fail",
+                    "reasons": ["inspection-sensitive.png could not be analyzed"],
+                }
+            )
+        ),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        _initial_state("run_redacted_reason_filename"),
+        config={"configurable": {"thread_id": "run_redacted_reason_filename"}},
+    )
+
+    assert result["tool_results"][0]["output"]["reasons"] == ["[redacted]"]
+
+
 def test_graph_redacts_prohibited_tool_error_details():
     saver = InMemorySaver()
 
@@ -295,6 +416,55 @@ def test_graph_redacts_prohibited_tool_error_details():
     persisted = repr([item.checkpoint["channel_values"] for item in saver.list(None)])
     assert "sensitive.png" not in persisted
     assert "quality-pass" not in persisted
+
+
+def test_graph_replaces_unsafe_tool_error_code_with_safe_failure_code():
+    saver = InMemorySaver()
+
+    def unsafe_handler(_payload):
+        raise ToolHandlerError(
+            "mongodb://code-user:code-pass@db.example/quality",
+            "Artifact content is missing",
+        )
+
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
+        tool_executor=ToolExecutor(_registry_with_handler(unsafe_handler)),
+        checkpointer=saver,
+    )
+
+    result = graph.invoke(
+        _initial_state("run_safe_tool_error_code"),
+        config={"configurable": {"thread_id": "run_safe_tool_error_code"}},
+    )
+
+    assert result["error_code"] == "TOOL_EXECUTION_FAILED"
+    persisted = repr([item.checkpoint["channel_values"] for item in saver.list(None)])
+    assert "code-user" not in persisted
+    assert "code-pass" not in persisted
+
+
+def test_graph_rejects_unsafe_tool_wrapper_strings():
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
+        tool_executor=_StaticToolExecutor(
+            ToolResult(
+                tool_id="/private/tmp/image_quality_check",
+                version="redis://version-user:version-pass@cache.example/0",
+                ok=True,
+                output={"artifact_id": "art_001", "quality_status": "pass"},
+            )
+        ),
+        checkpointer=InMemorySaver(),
+    )
+
+    with pytest.raises(StateSerializationError, match="tool_result.tool_id"):
+        graph.invoke(
+            _initial_state("run_unsafe_tool_wrapper"),
+            config={"configurable": {"thread_id": "run_unsafe_tool_wrapper"}},
+        )
 
 
 def test_initial_state_redacts_connection_credentials_before_checkpointing():
@@ -530,3 +700,11 @@ class _FakeModelResult:
 
     def as_payload(self):
         return self._payload
+
+
+class _StaticToolExecutor:
+    def __init__(self, result):
+        self._result = result
+
+    def execute(self, _tool_id, _payload):
+        return self._result
