@@ -19,6 +19,7 @@ def test_main_app_fails_fast_when_fastapi_is_not_installed():
         (backend_package, "main"): backend_package.main,
         (api_package, "health"): api_package.health,
         (api_package, "tasks"): api_package.tasks,
+        (api_package, "artifacts"): api_package.artifacts,
     }
     module_names = [
         name
@@ -27,6 +28,7 @@ def test_main_app_fails_fast_when_fastapi_is_not_installed():
             "backend.app.main",
             "backend.app.api.v1.health",
             "backend.app.api.v1.tasks",
+            "backend.app.api.v1.artifacts",
             "fastapi",
         }
         or name.startswith("fastapi.")
@@ -49,3 +51,4 @@ def test_main_app_fails_fast_when_fastapi_is_not_installed():
     assert backend_package.main is sys.modules["backend.app.main"]
     assert api_package.health is sys.modules["backend.app.api.v1.health"]
     assert api_package.tasks is sys.modules["backend.app.api.v1.tasks"]
+    assert api_package.artifacts is sys.modules["backend.app.api.v1.artifacts"]

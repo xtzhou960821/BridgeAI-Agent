@@ -10,6 +10,7 @@ except ModuleNotFoundError:  # pragma: no cover - depends on optional runtime de
     CORSMiddleware = None  # type: ignore[assignment]
 
 from backend.app.api.v1.health import router as health_router
+from backend.app.api.v1.artifacts import router as artifacts_router
 from backend.app.api.v1.tasks import router as tasks_router
 
 
@@ -36,6 +37,8 @@ def create_app():
         )
     if health_router is not None:
         app.include_router(health_router, prefix="/api/v1")
+    if artifacts_router is not None:
+        app.include_router(artifacts_router, prefix="/api/v1")
     if tasks_router is not None:
         app.include_router(tasks_router, prefix="/api/v1")
     return app
