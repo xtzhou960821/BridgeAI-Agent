@@ -37,6 +37,15 @@ class ToolExecutionError(Exception):
     """Raised when a Tool cannot be executed by contract."""
 
 
+class ToolHandlerError(RuntimeError):
+    """A declared, safe-to-serialize failure raised by a Tool handler."""
+
+    def __init__(self, error_code: str, error_message: str) -> None:
+        super().__init__(error_message)
+        self.error_code = error_code
+        self.error_message = error_message
+
+
 class ToolRegistry:
     """In-memory Tool registry for the first engineering skeleton."""
 
@@ -76,7 +85,17 @@ class ToolExecutor:
                 error_message=f"Missing required input: {', '.join(missing)}",
             )
 
-        output = handler(payload)
+        try:
+            output = handler(payload)
+        except ToolHandlerError as error:
+            return ToolResult(
+                tool_id=manifest.tool_id,
+                version=manifest.version,
+                ok=False,
+                output={},
+                error_code=error.error_code,
+                error_message=error.error_message,
+            )
         return ToolResult(
             tool_id=manifest.tool_id,
             version=manifest.version,
