@@ -92,6 +92,30 @@ describe('persistent task workbench', () => {
     expect(api.listTaskRuns).toHaveBeenLastCalledWith('task_002')
     expect(wrapper.text()).toContain('新任务理解')
   })
+
+  it('explains how to initialize LangGraph checkpoints when the tables are not ready', async () => {
+    api.loadHealth.mockResolvedValue({
+      ...health,
+      components: { ...health.components, langgraph_checkpointer: 'not_initialized' },
+    })
+
+    const wrapper = mount(App)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('LangGraph 检查点表尚未初始化')
+  })
+
+  it('explains how to repair unavailable LangGraph checkpoint storage', async () => {
+    api.loadHealth.mockResolvedValue({
+      ...health,
+      components: { ...health.components, langgraph_checkpointer: 'unavailable' },
+    })
+
+    const wrapper = mount(App)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('LangGraph 检查点存储不可用，请检查 PostgreSQL 连接。')
+  })
 })
 
 function task(taskId: string, title: string, status: string): TaskRecord {
@@ -118,6 +142,8 @@ function run(
     task_id: taskId,
     run_number: runNumber,
     status: 'completed',
+    workflow_runtime: 'langgraph',
+    checkpoint_thread_id: runId,
     agent_model: {
       model_id: 'DeepSeek-V4-Flash-4bit',
       runtime: 'openai-compatible',

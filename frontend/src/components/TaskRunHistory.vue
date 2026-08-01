@@ -39,6 +39,8 @@ function formatTime(value: string | null): string {
           <em :data-status="run.status">{{ run.status }}</em>
         </span>
         <span>{{ run.agent_model.model_id ?? '未记录模型' }}</span>
+        <small>Workflow Runtime: {{ run.workflow_runtime === 'langgraph' ? 'LangGraph' : 'Legacy' }}</small>
+        <small v-if="run.checkpoint_thread_id">Checkpoint Thread: {{ run.checkpoint_thread_id }}</small>
         <small>开始：{{ formatTime(run.started_at) }}</small>
         <small>结束：{{ formatTime(run.completed_at) }}</small>
         <small v-if="run.error_message" class="failure">{{ run.error_message }}</small>

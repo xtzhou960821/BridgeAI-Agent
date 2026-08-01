@@ -28,6 +28,17 @@ function stepKey(step: WorkflowStep, index: number): string {
       <span>{{ run.agent_model.model_id ?? '未记录模型' }}</span>
     </div>
 
+    <dl class="runtime-meta">
+      <div>
+        <dt>Workflow Runtime</dt>
+        <dd>{{ run.workflow_runtime === 'langgraph' ? 'LangGraph' : 'Legacy' }}</dd>
+      </div>
+      <div>
+        <dt>Checkpoint Thread</dt>
+        <dd>{{ run.checkpoint_thread_id ?? '未记录' }}</dd>
+      </div>
+    </dl>
+
     <p v-if="run.error_message" class="error-text">{{ run.error_message }}</p>
 
     <section class="snapshot model-snapshot">
@@ -76,6 +87,36 @@ function stepKey(step: WorkflowStep, index: number): string {
   gap: 12px;
   color: #526058;
   font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.runtime-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.runtime-meta div {
+  min-width: 0;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #f1f5ef;
+}
+
+.runtime-meta dt {
+  color: #66716a;
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.runtime-meta dd {
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+  color: #26322b;
+  font-size: 0.9rem;
   font-weight: 700;
 }
 
@@ -156,6 +197,10 @@ code {
 @media (max-width: 720px) {
   .detail-meta {
     flex-direction: column;
+  }
+
+  .runtime-meta {
+    grid-template-columns: 1fr;
   }
 }
 </style>

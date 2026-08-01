@@ -61,6 +61,8 @@ export type TaskRunRecord = {
   task_id: string
   run_number: number
   status: string
+  workflow_runtime: 'legacy' | 'langgraph'
+  checkpoint_thread_id: string | null
   agent_model: AgentModelSnapshot
   workflow: WorkflowSnapshot
   tool_results: ToolResultSnapshot[]

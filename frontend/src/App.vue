@@ -36,6 +36,16 @@ const selectedRun = computed(
   () => runs.value.find((run) => run.run_id === selectedRunId.value) ?? null,
 )
 const modelGatewayStatus = computed(() => health.value?.components.model_gateway)
+const checkpointerStatus = computed(() => health.value?.components.langgraph_checkpointer)
+const checkpointerWarning = computed(() => {
+  if (checkpointerStatus.value === 'not_initialized') {
+    return 'LangGraph 检查点表尚未初始化，请先执行后端显式初始化命令。'
+  }
+  if (checkpointerStatus.value === 'unavailable') {
+    return 'LangGraph 检查点存储不可用，请检查 PostgreSQL 连接。'
+  }
+  return ''
+})
 const modelGatewayBadge = computed(() => {
   if (selectedRun.value?.agent_model.is_stub === false) return 'live'
   if (selectedRun.value?.agent_model.is_stub === true) return 'stub'
@@ -150,6 +160,7 @@ function statusTone(value: string | boolean | undefined) {
   }
   if (
     value === 'not_configured' ||
+    value === 'not_initialized' ||
     value === 'unavailable' ||
     value === 'missing' ||
     value === 'failed' ||
@@ -194,20 +205,23 @@ onMounted(() => {
           </span>
         </div>
         <p v-if="healthError" class="error-text">{{ healthError }}</p>
-        <dl v-else-if="health" class="meta-list">
-          <div>
-            <dt>Service</dt>
-            <dd>{{ health.service }} · {{ health.version }}</dd>
-          </div>
-          <div>
-            <dt>Environment</dt>
-            <dd>{{ health.environment }}</dd>
-          </div>
-          <div v-for="[name, value] in Object.entries(health.components)" :key="name">
-            <dt>{{ name }}</dt>
-            <dd><span class="badge" :data-tone="statusTone(value)">{{ value }}</span></dd>
-          </div>
-        </dl>
+        <template v-else-if="health">
+          <dl class="meta-list">
+            <div>
+              <dt>Service</dt>
+              <dd>{{ health.service }} · {{ health.version }}</dd>
+            </div>
+            <div>
+              <dt>Environment</dt>
+              <dd>{{ health.environment }}</dd>
+            </div>
+            <div v-for="[name, value] in Object.entries(health.components)" :key="name">
+              <dt>{{ name }}</dt>
+              <dd><span class="badge" :data-tone="statusTone(value)">{{ value }}</span></dd>
+            </div>
+          </dl>
+          <p v-if="checkpointerWarning" class="warning-text">{{ checkpointerWarning }}</p>
+        </template>
         <p v-else class="muted">正在读取后端健康状态...</p>
       </article>
 
