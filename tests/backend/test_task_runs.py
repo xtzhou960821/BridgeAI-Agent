@@ -1,4 +1,10 @@
+from contextlib import contextmanager
+
+import psycopg
+import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+
+from backend.app.domain.task_errors import LangGraphCheckpointerNotReadyError
 
 
 def test_run_inspection_task_returns_completed_workflow_and_tool_result():
@@ -85,6 +91,108 @@ def test_run_inspection_task_returns_completed_workflow_and_tool_result():
             },
         ],
     }
+
+
+@pytest.mark.parametrize(
+    ("database_url", "environment_url", "probe_status", "expected_url"),
+    [
+        (
+            "postgresql://explicit_user:explicit-secret@db.example/bridgeai",
+            "postgresql://environment_user:environment-secret@db.example/bridgeai",
+            "unavailable",
+            "postgresql://explicit_user:explicit-secret@db.example/bridgeai",
+        ),
+        (
+            None,
+            "postgresql://environment_user:environment-secret@db.example/bridgeai",
+            "not_initialized",
+            "postgresql://environment_user:environment-secret@db.example/bridgeai",
+        ),
+    ],
+)
+def test_run_inspection_task_rejects_unready_checkpointer_without_fallback(
+    monkeypatch,
+    database_url,
+    environment_url,
+    probe_status,
+    expected_url,
+):
+    from backend.app.services import task_runs
+
+    probe_calls = []
+    monkeypatch.setenv("BRIDGEAI_DATABASE_URL", environment_url)
+    monkeypatch.setattr(
+        task_runs,
+        "probe_langgraph_checkpointer",
+        lambda url: probe_calls.append(url) or probe_status,
+    )
+    monkeypatch.setattr(task_runs, "open_postgres_checkpointer", _unexpected_opener)
+
+    with pytest.raises(LangGraphCheckpointerNotReadyError) as error:
+        task_runs.run_inspection_task(
+            "run_adapter_not_ready",
+            _payload(),
+            database_url=database_url,
+            model_gateway=_FakeModelGateway(),
+        )
+
+    assert error.value.run_id == "run_adapter_not_ready"
+    assert "not ready" in str(error.value)
+    assert "secret" not in str(error.value)
+    assert probe_calls == [expected_url]
+
+
+def test_run_inspection_task_translates_postgres_saver_failure_without_credentials(
+    monkeypatch,
+):
+    from backend.app.services import task_runs
+
+    database_url = "postgresql://checkpoint_user:checkpoint-secret@db.example/bridgeai"
+    open_calls = []
+    monkeypatch.setattr(task_runs, "probe_langgraph_checkpointer", lambda _url: "ready")
+    monkeypatch.setattr(
+        task_runs,
+        "open_postgres_checkpointer",
+        _failing_opener(open_calls),
+    )
+
+    with pytest.raises(LangGraphCheckpointerNotReadyError) as error:
+        task_runs.run_inspection_task(
+            "run_adapter_psycopg",
+            _payload(),
+            database_url=database_url,
+            model_gateway=_FakeModelGateway(),
+        )
+
+    assert error.value.run_id == "run_adapter_psycopg"
+    assert "not ready" in str(error.value)
+    assert "checkpoint-secret" not in str(error.value)
+    assert open_calls == [database_url]
+
+
+def _payload():
+    return {
+        "task_id": "task_001",
+        "task_type": "bridge_inspection",
+        "objective": "检查桥梁无人机影像质量",
+        "artifact_ids": ["art_001"],
+    }
+
+
+def _unexpected_opener(_database_url):
+    raise AssertionError("unready checkpointer must not be opened or replaced")
+
+
+def _failing_opener(open_calls):
+    @contextmanager
+    def opener(database_url):
+        open_calls.append(database_url)
+        raise psycopg.OperationalError(
+            "connection rejected for checkpoint-secret",
+        )
+        yield None
+
+    return opener
 
 
 class _FakeModelGateway:
