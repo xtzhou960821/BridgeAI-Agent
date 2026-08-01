@@ -354,6 +354,29 @@ def _task_command() -> TaskCreate:
     )
 
 
+def test_environment_assembly_reuses_artifact_service_for_execution(monkeypatch):
+    from backend.app.services import tasks
+
+    class ArtifactServiceDouble:
+        def require_ready(self, _artifact_id):
+            return _artifact_record()
+
+    artifact_service = ArtifactServiceDouble()
+    repository = object()
+    monkeypatch.setattr(
+        tasks,
+        "build_artifact_service_from_environment",
+        lambda _env: artifact_service,
+    )
+    monkeypatch.setattr(tasks, "PostgresTaskRepository", lambda _url: repository)
+    monkeypatch.setattr(tasks, "get_database_url", lambda _env: "postgresql://db/bridgeai")
+
+    service = tasks.build_task_service_from_environment({})
+
+    assert service._repository is repository
+    assert service._run_inspection.keywords["artifact_service"] is artifact_service
+
+
 def _artifact_record() -> ArtifactRecord:
     return ArtifactRecord(
         artifact_id="art_001",

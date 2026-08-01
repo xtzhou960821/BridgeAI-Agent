@@ -73,8 +73,10 @@ class BridgeInspectionState(TypedDict):
     agent_model: dict[str, object]
     model_result: dict[str, object]
     workflow_history: Annotated[list[WorkflowHistoryItem], operator.add]
+    data_check_result: dict[str, object]
     tool_results: list[dict[str, object]]
     error_step: str | None
+    error_code: str | None
     error_message: str | None
 
 
@@ -100,8 +102,10 @@ def initial_bridge_inspection_state(
         "agent_model": model_metadata_payload(agent_model),
         "model_result": {},
         "workflow_history": [],
+        "data_check_result": {},
         "tool_results": [],
         "error_step": None,
+        "error_code": None,
         "error_message": None,
     }
 

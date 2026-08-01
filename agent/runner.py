@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from agent.langgraph_state import initial_bridge_inspection_state
-from agent.langgraph_workflow import build_bridge_inspection_graph
+from agent.langgraph_workflow import ArtifactVerifier, build_bridge_inspection_graph
 from agent.model_gateway import (
     ModelGateway,
     build_model_gateway_from_environment,
@@ -45,11 +45,13 @@ class AgentRunner:
         self,
         registry: ToolRegistry,
         *,
+        artifact_verifier: ArtifactVerifier,
         checkpointer: BaseCheckpointSaver,
         model_profile: AgentModelProfile | None = None,
         model_gateway: ModelGateway | None = None,
     ) -> None:
         self._tool_executor = ToolExecutor(registry)
+        self._artifact_verifier = artifact_verifier
         self._checkpointer = checkpointer
         self._model_profile = model_profile or default_model_profile()
         self._model_gateway = model_gateway or build_model_gateway_from_environment(
@@ -67,6 +69,7 @@ class AgentRunner:
         )
         graph = build_bridge_inspection_graph(
             model_gateway=self._model_gateway,
+            artifact_verifier=self._artifact_verifier,
             tool_executor=self._tool_executor,
             checkpointer=self._checkpointer,
         )
@@ -86,6 +89,7 @@ class AgentRunner:
                 for item in terminal["workflow_history"]
             ),
             error_step=_string_or_none(terminal["error_step"]),
+            error_code=_string_or_none(terminal["error_code"]),
             error_message=_string_or_none(terminal["error_message"]),
         )
         return AgentRunResult(

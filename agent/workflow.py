@@ -33,6 +33,7 @@ class WorkflowState:
     current_step: str | None = None
     history: tuple[WorkflowStep, ...] = field(default_factory=tuple)
     error_step: str | None = None
+    error_code: str | None = None
     error_message: str | None = None
 
     @classmethod
@@ -48,13 +49,19 @@ class WorkflowState:
             history=(*self.history, WorkflowStep(step_name=step_name, output=output)),
         )
 
-    def fail(self, step_name: str, error_message: str) -> WorkflowState:
+    def fail(
+        self,
+        step_name: str,
+        error_code: str,
+        error_message: str,
+    ) -> WorkflowState:
         return WorkflowState(
             task_id=self.task_id,
             status=WorkflowStatus.FAILED,
             current_step=self.current_step,
             history=self.history,
             error_step=step_name,
+            error_code=error_code,
             error_message=error_message,
         )
 

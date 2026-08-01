@@ -49,6 +49,7 @@ def test_agent_runner_executes_image_quality_tool_for_inspection_task():
     saver = InMemorySaver()
     result = AgentRunner(
         registry,
+        artifact_verifier=_verified_artifact,
         model_gateway=_FakeModelGateway(),
         checkpointer=saver,
     ).run(context, thread_id="run_agent_001")
@@ -99,11 +100,13 @@ def test_agent_runner_returns_failed_terminal_for_tool_failure():
 
     result = AgentRunner(
         registry,
+        artifact_verifier=_verified_artifact,
         model_gateway=_FakeModelGateway(),
         checkpointer=InMemorySaver(),
     ).run(context, thread_id="run_agent_002")
 
     assert result.status == "failed"
+    assert result.workflow.error_code == "missing_required_input"
     assert result.workflow.error_message == "Missing required input: camera_id"
     assert result.tool_results[0].ok is False
     assert [step.step_name for step in result.workflow.history] == [
@@ -112,3 +115,7 @@ def test_agent_runner_returns_failed_terminal_for_tool_failure():
         "image_quality_check",
         "failed",
     ]
+
+
+def _verified_artifact(artifact_id: str) -> dict[str, object]:
+    return {"ok": True, "artifact": {"artifact_id": artifact_id, "status": "ready"}}

@@ -18,10 +18,11 @@ def test_workflow_can_fail_and_recover_to_previous_step():
         {"artifact_id": "art_001"},
     )
 
-    failed = state.fail("tool_execution", "tool timeout")
+    failed = state.fail("tool_execution", "TOOL_TIMEOUT", "tool timeout")
     recovered = failed.recover("data_check")
 
     assert failed.status == WorkflowStatus.FAILED
+    assert failed.error_code == "TOOL_TIMEOUT"
     assert failed.error_message == "tool timeout"
     assert recovered.status == WorkflowStatus.RUNNING
     assert recovered.current_step == "data_check"

@@ -15,6 +15,7 @@ def test_graph_routes_success_through_all_named_nodes():
     saver = InMemorySaver()
     graph = build_bridge_inspection_graph(
         model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
         tool_executor=ToolExecutor(_registry(required=["artifact_id"])),
         checkpointer=saver,
     )
@@ -37,6 +38,7 @@ def test_graph_routes_unsuccessful_tool_to_failed():
     saver = InMemorySaver()
     graph = build_bridge_inspection_graph(
         model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
         tool_executor=ToolExecutor(
             _registry(required=["artifact_id", "camera_id"]),
         ),
@@ -51,6 +53,7 @@ def test_graph_routes_unsuccessful_tool_to_failed():
     assert result["status"] == "failed"
     assert result["current_step"] == "failed"
     assert result["error_step"] == "image_quality_check"
+    assert result["error_code"] == "missing_required_input"
     assert result["error_message"] == "Missing required input: camera_id"
     assert [item["step_name"] for item in result["workflow_history"]][-1] == "failed"
 
@@ -59,6 +62,7 @@ def test_graph_persists_multiple_checkpoints_for_one_thread():
     saver = InMemorySaver()
     graph = build_bridge_inspection_graph(
         model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
         tool_executor=ToolExecutor(_registry(required=["artifact_id"])),
         checkpointer=saver,
     )
@@ -76,9 +80,66 @@ def test_initial_state_contains_only_serializer_safe_values():
 
     assert state["run_id"] == "run_serializable"
     assert state["workflow_history"] == []
+    assert state["data_check_result"] == {}
     assert state["tool_results"] == []
     assert state["error_step"] is None
+    assert state["error_code"] is None
     assert state["error_message"] is None
+
+
+def test_graph_routes_failed_artifact_verification_without_running_tool():
+    calls = []
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=lambda _artifact_id: {
+            "ok": False,
+            "error_code": "ARTIFACT_NOT_FOUND",
+            "error_message": "Artifact does not exist",
+        },
+        tool_executor=ToolExecutor(
+            _registry_with_handler(lambda payload: calls.append(payload) or {})
+        ),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        _initial_state("run_missing"),
+        config={"configurable": {"thread_id": "run_missing"}},
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_step"] == "data_check"
+    assert result["error_code"] == "ARTIFACT_NOT_FOUND"
+    assert result["error_message"] == "Artifact does not exist"
+    assert result["data_check_result"] == {
+        "ok": False,
+        "error_code": "ARTIFACT_NOT_FOUND",
+        "error_message": "Artifact does not exist",
+    }
+    assert result["tool_results"] == []
+    assert calls == []
+
+
+def test_graph_completes_when_analysis_finds_low_quality():
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
+        tool_executor=ToolExecutor(
+            _registry_with_output(
+                {"quality_status": "fail", "artifact_id": "art_001"}
+            )
+        ),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        _initial_state("run_low_quality"),
+        config={"configurable": {"thread_id": "run_low_quality"}},
+    )
+
+    assert result["status"] == "completed"
+    assert result["tool_results"][0]["ok"] is True
+    assert result["tool_results"][0]["output"]["quality_status"] == "fail"
 
 
 def test_initial_state_redacts_connection_credentials_before_checkpointing():
@@ -138,6 +199,7 @@ def test_graph_redacts_sensitive_values_and_serializes_with_strict_msgpack():
         model_gateway=_FakeModelGateway(
             additional_payload={"api_key": "model-secret"},
         ),
+        artifact_verifier=_verified_artifact,
         tool_executor=ToolExecutor(
             _registry_with_output(
                 {
@@ -204,6 +266,7 @@ def test_graph_rejects_binary_tool_output_before_checkpointing():
     saver = InMemorySaver()
     graph = build_bridge_inspection_graph(
         model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
         tool_executor=ToolExecutor(
             _registry_with_output(
                 {"quality_status": "pass", "binary_artifact": b"untrusted"},
@@ -252,6 +315,10 @@ def _registry(required: list[str]) -> ToolRegistry:
 
 
 def _registry_with_output(output: dict[str, object]) -> ToolRegistry:
+    return _registry_with_handler(lambda _payload: output)
+
+
+def _registry_with_handler(handler) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
         ToolManifest(
@@ -261,9 +328,24 @@ def _registry_with_output(output: dict[str, object]) -> ToolRegistry:
             input_schema={"required": ["artifact_id"]},
             output_schema={"required": ["quality_status"]},
         ),
-        lambda payload: output,
+        handler,
     )
     return registry
+
+
+def _verified_artifact(artifact_id: str) -> dict[str, object]:
+    return {
+        "ok": True,
+        "artifact": {
+            "artifact_id": artifact_id,
+            "sha256": "0" * 64,
+            "size_bytes": 1024,
+            "mime_type": "image/jpeg",
+            "width_px": 1280,
+            "height_px": 800,
+            "status": "ready",
+        },
+    }
 
 
 class _FakeModelGateway:

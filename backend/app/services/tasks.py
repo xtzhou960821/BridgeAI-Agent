@@ -162,7 +162,11 @@ def build_task_service_from_environment(
     artifact_service = build_artifact_service_from_environment(environ)
     return TaskService(
         PostgresTaskRepository(database_url),
-        run_inspection=partial(run_inspection_task, database_url=database_url),
+        run_inspection=partial(
+            run_inspection_task,
+            database_url=database_url,
+            artifact_service=artifact_service,
+        ),
         require_ready_artifact=artifact_service.require_ready,
     )
 

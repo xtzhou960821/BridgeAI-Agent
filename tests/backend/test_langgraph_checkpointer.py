@@ -38,6 +38,7 @@ def test_postgres_saver_keeps_run_threads_isolated(monkeypatch):
     with PostgresSaver.from_conn_string(database_url) as saver:
         graph = build_bridge_inspection_graph(
             model_gateway=_FakeModelGateway(),
+            artifact_verifier=_verified_artifact,
             tool_executor=ToolExecutor(_successful_registry()),
             checkpointer=saver,
         )
@@ -83,6 +84,10 @@ def _successful_registry() -> ToolRegistry:
         },
     )
     return registry
+
+
+def _verified_artifact(artifact_id: str) -> dict[str, object]:
+    return {"ok": True, "artifact": {"artifact_id": artifact_id, "status": "ready"}}
 
 
 class _FakeModelGateway:

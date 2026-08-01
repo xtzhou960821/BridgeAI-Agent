@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
@@ -15,9 +17,13 @@ from agent.model_gateway import ModelGateway, TaskUnderstandingRequest
 from tools.sdk import ToolExecutor, ToolResult
 
 
+ArtifactVerifier = Callable[[str], dict[str, object]]
+
+
 def build_bridge_inspection_graph(
     *,
     model_gateway: ModelGateway,
+    artifact_verifier: ArtifactVerifier,
     tool_executor: ToolExecutor,
     checkpointer: BaseCheckpointSaver,
 ):
@@ -50,10 +56,37 @@ def build_bridge_inspection_graph(
 
     def data_check(state: BridgeInspectionState) -> dict[str, object]:
         artifact_id = state["artifact_ids"][0]
-        return {
+        normalized = normalize_checkpoint_value(
+            artifact_verifier(artifact_id),
+            path="data_check_result",
+        )
+        if not isinstance(normalized, dict):
+            raise TypeError("Artifact verifier result must produce a dictionary")
+        update: dict[str, object] = {
             "current_step": "data_check",
-            "workflow_history": [_history_item("data_check", {"artifact_id": artifact_id})],
+            "data_check_result": normalized,
+            "workflow_history": [_history_item("data_check", normalized)],
         }
+        if normalized.get("ok") is not True:
+            update.update(
+                {
+                    "error_step": "data_check",
+                    "error_code": _error_value(
+                        normalized.get("error_code"),
+                        "ARTIFACT_VERIFICATION_FAILED",
+                    ),
+                    "error_message": _error_value(
+                        normalized.get("error_message"),
+                        "Artifact verification failed",
+                    ),
+                }
+            )
+        return update
+
+    def route_after_data_check(state: BridgeInspectionState) -> str:
+        if state["data_check_result"].get("ok") is True:
+            return "image_quality_check"
+        return "failed"
 
     def image_quality_check(state: BridgeInspectionState) -> dict[str, object]:
         tool_result = tool_executor.execute(
@@ -61,13 +94,28 @@ def build_bridge_inspection_graph(
             {"artifact_id": state["artifact_ids"][0]},
         )
         serialized_result = _serialize_tool_result(tool_result)
-        return {
+        update: dict[str, object] = {
             "current_step": "image_quality_check",
             "tool_results": [serialized_result],
             "workflow_history": [
                 _history_item("image_quality_check", {"tool_result": serialized_result}),
             ],
         }
+        if serialized_result["ok"] is not True:
+            update.update(
+                {
+                    "error_step": "image_quality_check",
+                    "error_code": _error_value(
+                        serialized_result.get("error_code"),
+                        "TOOL_EXECUTION_FAILED",
+                    ),
+                    "error_message": _error_value(
+                        serialized_result.get("error_message"),
+                        "tool failed",
+                    ),
+                }
+            )
+        return update
 
     def route_after_tool(state: BridgeInspectionState) -> str:
         if state["tool_results"] and state["tool_results"][-1]["ok"] is True:
@@ -83,15 +131,19 @@ def build_bridge_inspection_graph(
         }
 
     def failed(state: BridgeInspectionState) -> dict[str, object]:
-        tool_result = state["tool_results"][-1]
-        tool_id = str(tool_result["tool_id"])
-        error_message = str(tool_result["error_message"] or "tool failed")
         return {
             "status": "failed",
             "current_step": "failed",
-            "error_step": "image_quality_check",
-            "error_message": error_message,
-            "workflow_history": [_history_item("failed", {"tool_id": tool_id})],
+            "workflow_history": [
+                _history_item(
+                    "failed",
+                    {
+                        "error_step": state["error_step"],
+                        "error_code": state["error_code"],
+                        "error_message": state["error_message"],
+                    },
+                )
+            ],
         }
 
     builder = StateGraph(BridgeInspectionState)
@@ -102,7 +154,11 @@ def build_bridge_inspection_graph(
     builder.add_node("failed", failed)
     builder.add_edge(START, "task_understanding")
     builder.add_edge("task_understanding", "data_check")
-    builder.add_edge("data_check", "image_quality_check")
+    builder.add_conditional_edges(
+        "data_check",
+        route_after_data_check,
+        {"image_quality_check": "image_quality_check", "failed": "failed"},
+    )
     builder.add_conditional_edges(
         "image_quality_check",
         route_after_tool,
@@ -115,6 +171,10 @@ def build_bridge_inspection_graph(
 
 def _history_item(step_name: str, output: dict[str, object]) -> WorkflowHistoryItem:
     return {"step_name": step_name, "output": output}
+
+
+def _error_value(value: object, default: str) -> str:
+    return str(value) if value is not None else default
 
 
 def _serialize_tool_result(tool_result: ToolResult) -> dict[str, object]:

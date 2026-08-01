@@ -5,92 +5,97 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from backend.app.domain.task_errors import LangGraphCheckpointerNotReadyError
+from tests.backend.artifact_test_support import (
+    artifact_path,
+    service_with_local_store,
+    upload_jpeg,
+)
 
 
-def test_run_inspection_task_returns_completed_workflow_and_tool_result():
+def test_run_inspection_task_analyzes_verified_artifact_bytes(tmp_path):
     from backend.app.services.task_runs import run_inspection_task
 
+    artifact_service, _repository = service_with_local_store(tmp_path)
+    artifact = upload_jpeg(artifact_service)
     result = run_inspection_task(
         "run_001",
         {
             "task_id": "task_001",
             "task_type": "bridge_inspection",
             "objective": "检查桥梁无人机影像质量",
-            "artifact_ids": ["art_001"],
+            "artifact_ids": [artifact.artifact_id],
         },
         model_gateway=_FakeModelGateway(),
         checkpointer=InMemorySaver(),
+        artifact_service=artifact_service,
     )
 
-    assert result == {
-        "task_id": "task_001",
-        "status": "completed",
-        "agent_model": {
-            "model_id": "DeepSeek-V4-Flash-4bit",
-            "model_version": "omlx-current",
-            "alias": "omlx-deepseek-v4-flash",
-            "provider": "omlx",
-            "runtime": "openai-compatible",
-            "api_base_url": "https://omlx.cpolar.cn/v1",
-            "is_stub": False,
-        },
-        "workflow": {
-            "task_id": "task_001",
-            "status": "completed",
-            "current_step": "completed",
-            "history": [
-                {
-                    "step_name": "task_understanding",
-                    "output": {
-                        "task_type": "bridge_inspection",
-                        "objective": "检查桥梁无人机影像质量",
-                        "model_result": {
-                            "ok": True,
-                            "model_id": "DeepSeek-V4-Flash-4bit",
-                            "provider": "omlx",
-                            "runtime": "openai-compatible",
-                            "content": "任务理解完成：检查桥梁无人机影像质量",
-                            "usage": {"total_tokens": 12},
-                            "error_message": None,
-                        },
-                    },
-                },
-                {
-                    "step_name": "data_check",
-                    "output": {"artifact_id": "art_001"},
-                },
-                {
-                    "step_name": "image_quality_check",
-                    "output": {
-                        "tool_result": {
-                            "tool_id": "image_quality_check",
-                            "version": "0.1.0",
-                            "ok": True,
-                            "output": {"quality_status": "pass", "artifact_id": "art_001"},
-                            "error_code": None,
-                            "error_message": None,
-                        },
-                    },
-                },
-                {
-                    "step_name": "completed",
-                    "output": {"tool_id": "image_quality_check"},
-                },
-            ],
-            "error_step": None,
-            "error_message": None,
-        },
-        "tool_results": [
-            {
-                "tool_id": "image_quality_check",
-                "version": "0.1.0",
-                "ok": True,
-                "output": {"quality_status": "pass", "artifact_id": "art_001"},
-                "error_code": None,
-                "error_message": None,
-            },
-        ],
+    assert result["status"] == "completed"
+    assert result["workflow"]["error_code"] is None
+    data_check = result["workflow"]["history"][1]["output"]
+    assert data_check == {
+        "ok": True,
+        "artifact": artifact.as_checkpoint_payload(),
     }
+    tool_result = result["tool_results"][0]
+    assert tool_result["ok"] is True
+    assert tool_result["output"]["artifact_id"] == artifact.artifact_id
+    assert tool_result["output"]["quality_status"] == "fail"
+    assert tool_result["output"]["metrics"]["short_side_px"] == 800.0
+    assert tool_result["output"]["metrics"]["total_pixels"] == 1_024_000.0
+    assert tool_result["output"]["thresholds"]["resolution"] == {
+        "min_short_side_px": 720,
+        "min_total_pixels": 1_000_000,
+    }
+    persisted = repr(result)
+    assert artifact.storage_key not in persisted
+    assert artifact.original_filename not in persisted
+
+
+def test_run_inspection_task_fails_data_check_for_tampered_artifact(tmp_path):
+    from backend.app.services.task_runs import run_inspection_task
+
+    artifact_service, _repository = service_with_local_store(tmp_path)
+    artifact = upload_jpeg(artifact_service)
+    artifact_path(tmp_path, artifact.storage_key).write_bytes(b"tampered")
+
+    result = run_inspection_task(
+        "run_tampered",
+        {**_payload(), "artifact_ids": [artifact.artifact_id]},
+        model_gateway=_FakeModelGateway(),
+        checkpointer=InMemorySaver(),
+        artifact_service=artifact_service,
+    )
+
+    assert result["status"] == "failed"
+    assert result["workflow"]["error_step"] == "data_check"
+    assert result["workflow"]["error_code"] == "ARTIFACT_INTEGRITY_MISMATCH"
+    assert result["tool_results"] == []
+
+
+def test_run_inspection_task_maps_artifact_loss_during_tool_execution(tmp_path):
+    from backend.app.services.task_runs import run_inspection_task
+
+    artifact_service, _repository = service_with_local_store(tmp_path)
+    artifact = upload_jpeg(artifact_service)
+    service = _RemoveContentAfterVerify(
+        artifact_service,
+        artifact_path(tmp_path, artifact.storage_key),
+    )
+
+    result = run_inspection_task(
+        "run_tool_storage_failure",
+        {**_payload(), "artifact_ids": [artifact.artifact_id]},
+        model_gateway=_FakeModelGateway(),
+        checkpointer=InMemorySaver(),
+        artifact_service=service,
+    )
+
+    assert result["status"] == "failed"
+    assert result["workflow"]["error_step"] == "image_quality_check"
+    assert result["workflow"]["error_code"] == "ARTIFACT_CONTENT_MISSING"
+    assert result["tool_results"][0]["ok"] is False
+    assert result["tool_results"][0]["error_code"] == "ARTIFACT_CONTENT_MISSING"
 
 
 @pytest.mark.parametrize(
@@ -199,9 +204,17 @@ def test_run_inspection_task_hands_opened_saver_to_runner_and_serializes_result(
         yield saver
 
     class Runner:
-        def __init__(self, _registry, *, checkpointer, model_gateway):
+        def __init__(
+            self,
+            _registry,
+            *,
+            artifact_verifier,
+            checkpointer,
+            model_gateway,
+        ):
             calls["checkpointer"] = checkpointer
             calls["model_gateway"] = model_gateway
+            calls["artifact_verifier"] = artifact_verifier
 
         def run(self, context, *, thread_id):
             calls["context"] = context
@@ -241,11 +254,16 @@ def test_run_inspection_task_hands_opened_saver_to_runner_and_serializes_result(
         _payload(),
         database_url=database_url,
         model_gateway=_FakeModelGateway(),
+        artifact_service=_FakeArtifactService(),
     )
 
     assert calls["probe"] == [database_url]
     assert calls["open"] == [database_url]
     assert calls["checkpointer"] is saver
+    assert calls["artifact_verifier"]("art_001") == {
+        "ok": True,
+        "artifact": {"artifact_id": "art_001", "status": "ready"},
+    }
     assert calls["thread_id"] == run_id
     assert result == {
         "task_id": "task_001",
@@ -259,6 +277,7 @@ def test_run_inspection_task_hands_opened_saver_to_runner_and_serializes_result(
                 {"step_name": "completed", "output": {"tool_id": "image_quality_check"}},
             ],
             "error_step": None,
+            "error_code": None,
             "error_message": None,
         },
         "tool_results": [
@@ -320,3 +339,27 @@ class _FakeModelResult:
 
     def as_payload(self):
         return self._payload
+
+
+class _FakeArtifactRecord:
+    def as_checkpoint_payload(self):
+        return {"artifact_id": "art_001", "status": "ready"}
+
+
+class _FakeArtifactService:
+    def verify(self, _artifact_id):
+        return _FakeArtifactRecord()
+
+
+class _RemoveContentAfterVerify:
+    def __init__(self, service, path):
+        self._service = service
+        self._path = path
+
+    def verify(self, artifact_id):
+        record = self._service.verify(artifact_id)
+        self._path.unlink()
+        return record
+
+    def open_verified(self, artifact_id):
+        return self._service.open_verified(artifact_id)
