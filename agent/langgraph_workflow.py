@@ -10,6 +10,9 @@ from langgraph.graph import END, START, StateGraph
 from agent.langgraph_state import (
     BridgeInspectionState,
     WorkflowHistoryItem,
+    artifact_verifier_payload,
+    external_text_payload,
+    image_quality_output_payload,
     model_result_payload,
     normalize_checkpoint_value,
 )
@@ -56,12 +59,7 @@ def build_bridge_inspection_graph(
 
     def data_check(state: BridgeInspectionState) -> dict[str, object]:
         artifact_id = state["artifact_ids"][0]
-        normalized = normalize_checkpoint_value(
-            artifact_verifier(artifact_id),
-            path="data_check_result",
-        )
-        if not isinstance(normalized, dict):
-            raise TypeError("Artifact verifier result must produce a dictionary")
+        normalized = artifact_verifier_payload(artifact_verifier(artifact_id))
         update: dict[str, object] = {
             "current_step": "data_check",
             "data_check_result": normalized,
@@ -178,14 +176,23 @@ def _error_value(value: object, default: str) -> str:
 
 
 def _serialize_tool_result(tool_result: ToolResult) -> dict[str, object]:
+    output = image_quality_output_payload(tool_result.output)
+    error_message = (
+        external_text_payload(
+            tool_result.error_message,
+            path="tool_result.error_message",
+        )
+        if tool_result.error_message is not None
+        else None
+    )
     serialized_result = normalize_checkpoint_value(
         {
         "tool_id": tool_result.tool_id,
         "version": tool_result.version,
         "ok": tool_result.ok,
-        "output": tool_result.output,
+        "output": output,
         "error_code": tool_result.error_code,
-        "error_message": tool_result.error_message,
+        "error_message": error_message,
         },
         path="tool_result",
     )

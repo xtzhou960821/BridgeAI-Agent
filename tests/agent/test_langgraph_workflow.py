@@ -8,7 +8,7 @@ from agent.langgraph_state import (
     normalize_checkpoint_value,
 )
 from agent.langgraph_workflow import build_bridge_inspection_graph
-from tools.sdk import ToolExecutor, ToolManifest, ToolRegistry
+from tools.sdk import ToolExecutor, ToolHandlerError, ToolManifest, ToolRegistry
 
 
 def test_graph_routes_success_through_all_named_nodes():
@@ -142,6 +142,161 @@ def test_graph_completes_when_analysis_finds_low_quality():
     assert result["tool_results"][0]["output"]["quality_status"] == "fail"
 
 
+def test_graph_allowlists_verified_artifact_metadata_before_checkpointing():
+    saver = InMemorySaver()
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=lambda artifact_id: {
+            "ok": True,
+            "artifact": {
+                **_verified_artifact(artifact_id)["artifact"],
+                "original_filename": "sensitive-bridge.jpg",
+                "storage_key": "ab/art_001.jpg",
+                "absolute_path": "/private/tmp/sensitive-bridge.jpg",
+            },
+            "connection_string": "redis://artifact-user:artifact-pass@cache.example/0",
+        },
+        tool_executor=ToolExecutor(_registry(required=["artifact_id"])),
+        checkpointer=saver,
+    )
+
+    result = graph.invoke(
+        _initial_state("run_artifact_allowlist"),
+        config={"configurable": {"thread_id": "run_artifact_allowlist"}},
+    )
+
+    assert result["data_check_result"] == _verified_artifact("art_001")
+    persisted = repr([item.checkpoint["channel_values"] for item in saver.list(None)])
+    for prohibited in (
+        "sensitive-bridge.jpg",
+        "ab/art_001.jpg",
+        "/private/tmp",
+        "artifact-user",
+        "artifact-pass",
+        "cache.example",
+    ):
+        assert prohibited not in persisted
+
+
+def test_graph_redacts_prohibited_verifier_error_details():
+    saver = InMemorySaver()
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=lambda _artifact_id: {
+            "ok": False,
+            "error_code": "ARTIFACT_STORAGE_UNAVAILABLE",
+            "error_message": (
+                "failed /private/tmp/sensitive-bridge.jpg via "
+                "redis://artifact-user:artifact-pass@cache.example/0"
+            ),
+        },
+        tool_executor=ToolExecutor(_registry(required=["artifact_id"])),
+        checkpointer=saver,
+    )
+
+    result = graph.invoke(
+        _initial_state("run_redacted_verifier_error"),
+        config={"configurable": {"thread_id": "run_redacted_verifier_error"}},
+    )
+
+    assert result["error_message"] == "[redacted]"
+    persisted = repr([item.checkpoint["channel_values"] for item in saver.list(None)])
+    assert "sensitive-bridge.jpg" not in persisted
+    assert "artifact-pass" not in persisted
+
+
+def test_graph_allowlists_quality_output_and_preserves_approved_fields():
+    saver = InMemorySaver()
+    approved_output = {
+        "artifact_id": "art_001",
+        "quality_status": "warn",
+        "analyzer_version": "0.1.0",
+        "metrics": {
+            "short_side_px": 800.0,
+            "total_pixels": 1_024_000.0,
+            "mean_luminance": 128.0,
+            "dark_clip_ratio": 0.0,
+            "bright_clip_ratio": 0.0,
+            "sharpness_rms": 4.5,
+        },
+        "thresholds": {
+            "resolution": {
+                "min_short_side_px": 720,
+                "min_total_pixels": 1_000_000,
+            },
+            "sharpness": {"fail_below": 2.0, "warn_below": 5.0},
+        },
+        "checks": {
+            "resolution": "pass",
+            "sharpness": "warn",
+        },
+        "reasons": ["清晰度低于 5"],
+    }
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
+        tool_executor=ToolExecutor(
+            _registry_with_output(
+                {
+                    **approved_output,
+                    "original_filename": "inspection-sensitive.png",
+                    "storage_key": "ab/art_001.png",
+                    "absolute_path": "/var/artifacts/ab/art_001.png",
+                    "connection_string": (
+                        "mongodb://quality-user:quality-pass@db.example/quality"
+                    ),
+                }
+            )
+        ),
+        checkpointer=saver,
+    )
+
+    result = graph.invoke(
+        _initial_state("run_quality_allowlist"),
+        config={"configurable": {"thread_id": "run_quality_allowlist"}},
+    )
+
+    assert result["tool_results"][0]["output"] == approved_output
+    persisted = repr([item.checkpoint["channel_values"] for item in saver.list(None)])
+    for prohibited in (
+        "inspection-sensitive.png",
+        "ab/art_001.png",
+        "/var/artifacts",
+        "quality-user",
+        "quality-pass",
+        "db.example",
+    ):
+        assert prohibited not in persisted
+
+
+def test_graph_redacts_prohibited_tool_error_details():
+    saver = InMemorySaver()
+
+    def unsafe_handler(_payload):
+        raise ToolHandlerError(
+            "ARTIFACT_CONTENT_MISSING",
+            "missing /var/artifacts/sensitive.png from "
+            "mongodb://quality-user:quality-pass@db.example/quality",
+        )
+
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
+        tool_executor=ToolExecutor(_registry_with_handler(unsafe_handler)),
+        checkpointer=saver,
+    )
+
+    result = graph.invoke(
+        _initial_state("run_redacted_tool_error"),
+        config={"configurable": {"thread_id": "run_redacted_tool_error"}},
+    )
+
+    assert result["error_message"] == "[redacted]"
+    persisted = repr([item.checkpoint["channel_values"] for item in saver.list(None)])
+    assert "sensitive.png" not in persisted
+    assert "quality-pass" not in persisted
+
+
 def test_initial_state_redacts_connection_credentials_before_checkpointing():
     state = initial_bridge_inspection_state(
         task_id="task_001",
@@ -193,7 +348,7 @@ def test_checkpoint_value_redacts_key_variants_and_connection_credentials():
     }
 
 
-def test_graph_redacts_sensitive_values_and_serializes_with_strict_msgpack():
+def test_graph_drops_unapproved_tool_fields_and_serializes_with_strict_msgpack():
     saver = InMemorySaver()
     graph = build_bridge_inspection_graph(
         model_gateway=_FakeModelGateway(
@@ -212,6 +367,10 @@ def test_graph_redacts_sensitive_values_and_serializes_with_strict_msgpack():
                         "dsn": (
                             "host=db.example user=bridgeai password=dsn-sensitive "
                             "dbname=bridgeai"
+                        ),
+                        "absolute_path": "/private/tmp/tool-sensitive.jpg",
+                        "connection_string": (
+                            "mysql://tool-user:tool-pass@mysql.example/bridgeai"
                         ),
                         "score": 0.98,
                     },
@@ -239,14 +398,7 @@ def test_graph_redacts_sensitive_values_and_serializes_with_strict_msgpack():
 
     assert result["agent_model"] == {"model_id": "DeepSeek-V4-Flash-4bit"}
     assert "api_key" not in result["model_result"]
-    assert result["tool_results"][0]["output"]["nested"] == {
-        "accessToken": "[redacted]",
-        "authToken": "[redacted]",
-        "databaseUrl": "[redacted]",
-        "connection": "postgres://***@db.example/bridgeai",
-        "dsn": "host=db.example user=bridgeai password=*** dbname=bridgeai",
-        "score": 0.98,
-    }
+    assert result["tool_results"][0]["output"] == {"quality_status": "pass"}
     persisted = repr([item.checkpoint["channel_values"] for item in saver.list(None)])
     for sensitive_value in (
         "tool-access-sensitive",
@@ -256,6 +408,10 @@ def test_graph_redacts_sensitive_values_and_serializes_with_strict_msgpack():
         "uri-user",
         "uri-sensitive",
         "dsn-sensitive",
+        "/private/tmp/tool-sensitive.jpg",
+        "tool-user",
+        "tool-pass",
+        "mysql.example",
     ):
         assert sensitive_value not in persisted
     value_type, _ = JsonPlusSerializer(pickle_fallback=False).dumps_typed(result)
