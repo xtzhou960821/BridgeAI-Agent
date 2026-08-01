@@ -99,6 +99,41 @@ def test_service_persists_failed_run_before_raising(repository):
 
 
 @pytest.mark.postgres
+def test_service_redacts_postgres_credentials_from_persisted_unexpected_error(repository):
+    repository.create_task("task_001", _task_command(), None)
+
+    def fail(_run_id, _payload):
+        raise RuntimeError(
+            "connection refused for "
+            "postgres://uri-user:uri-sensitive@db.example/bridgeai and "
+            "postgresql://pgsql-user:pgsql-sensitive@replica.example/bridgeai; "
+            "fallback host=db.example user=bridgeai password='dsn sensitive' "
+            "dbname=bridgeai; timeout after 5s",
+        )
+
+    service = TaskService(repository, run_inspection=fail)
+
+    with pytest.raises(TaskExecutionError) as error:
+        service.execute_task("task_001")
+
+    saved = repository.list_runs("task_001")[0]
+    for exposed_message in (str(error.value), saved.error_message or ""):
+        for sensitive_value in (
+            "uri-user",
+            "uri-sensitive",
+            "pgsql-user",
+            "pgsql-sensitive",
+            "dsn sensitive",
+        ):
+            assert sensitive_value not in exposed_message
+        assert "db.example" in exposed_message
+        assert "replica.example" in exposed_message
+        assert "user=bridgeai" in exposed_message
+        assert "dbname=bridgeai" in exposed_message
+        assert "timeout after 5s" in exposed_message
+
+
+@pytest.mark.postgres
 def test_service_persists_model_configuration_failure_and_preserves_error_type(
     repository,
 ):

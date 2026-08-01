@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import operator
+import re
 from typing import Annotated, TypedDict
 
 
@@ -37,6 +38,15 @@ _SENSITIVE_KEY_FRAGMENTS = (
 )
 _SENSITIVE_KEY_SUFFIXES = ("_key", "_token")
 _REDACTED_VALUE = "[redacted]"
+_POSTGRES_URI_CREDENTIALS = re.compile(
+    r"\b(postgres(?:ql)?(?:\+[a-z0-9_.-]+)?://)[^/@\s?#]+@",
+    flags=re.IGNORECASE,
+)
+_KEYWORD_DSN_PASSWORD = re.compile(
+    r"(?<![a-z0-9_])(password\s*=\s*)"
+    r"(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|(?:\\.|[^\s])+)",
+    flags=re.IGNORECASE,
+)
 
 
 class StateSerializationError(ValueError):
@@ -119,7 +129,9 @@ def model_result_payload(model_result: dict[str, object]) -> dict[str, object]:
 def normalize_checkpoint_value(value: object, *, path: str) -> object:
     """Recursively copy checkpoint values, rejecting unsupported runtime objects."""
 
-    if value is None or isinstance(value, str | int | float | bool):
+    if isinstance(value, str):
+        return _redact_connection_credentials(value)
+    if value is None or isinstance(value, int | float | bool):
         return value
     if isinstance(value, list):
         return [
@@ -168,13 +180,20 @@ def _artifact_ids(artifact_ids: list[str]) -> list[str]:
 def _required_string(value: str, path: str) -> str:
     if not isinstance(value, str):
         raise StateSerializationError(f"Unsupported checkpoint value at {path}: expected string")
-    return value
+    return _redact_connection_credentials(value)
 
 
 def _is_sensitive_key(key: str) -> bool:
-    normalized_key = key.lower().replace("-", "_")
+    normalized_key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+    normalized_key = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", normalized_key)
+    normalized_key = re.sub(r"[^a-zA-Z0-9]+", "_", normalized_key).strip("_").lower()
     return (
-        normalized_key in {"api_key", "apikey", "token"}
+        normalized_key in {"api_key", "apikey", "database_url", "token"}
         or normalized_key.endswith(_SENSITIVE_KEY_SUFFIXES)
         or any(fragment in normalized_key for fragment in _SENSITIVE_KEY_FRAGMENTS)
     )
+
+
+def _redact_connection_credentials(value: str) -> str:
+    value = _POSTGRES_URI_CREDENTIALS.sub(r"\1***@", value)
+    return _KEYWORD_DSN_PASSWORD.sub(r"\1***", value)

@@ -2,7 +2,11 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-from agent.langgraph_state import StateSerializationError, initial_bridge_inspection_state
+from agent.langgraph_state import (
+    StateSerializationError,
+    initial_bridge_inspection_state,
+    normalize_checkpoint_value,
+)
 from agent.langgraph_workflow import build_bridge_inspection_graph
 from tools.sdk import ToolExecutor, ToolManifest, ToolRegistry
 
@@ -77,6 +81,57 @@ def test_initial_state_contains_only_serializer_safe_values():
     assert state["error_message"] is None
 
 
+def test_initial_state_redacts_connection_credentials_before_checkpointing():
+    state = initial_bridge_inspection_state(
+        task_id="task_001",
+        run_id="run_initial_redaction",
+        task_type="bridge_inspection",
+        objective=(
+            "inspect postgres://uri-user:uri-sensitive@db.example/bridgeai with "
+            "host=db.example user=bridgeai password=dsn-sensitive dbname=bridgeai"
+        ),
+        artifact_ids=["art_001"],
+        agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+    )
+
+    assert state["objective"] == (
+        "inspect postgres://***@db.example/bridgeai with "
+        "host=db.example user=bridgeai password=*** dbname=bridgeai"
+    )
+
+
+def test_checkpoint_value_redacts_key_variants_and_connection_credentials():
+    value = {
+        "accessToken": "access-sensitive",
+        "nested": {
+            "auth-token": "auth-sensitive",
+            "database_url": "postgresql://db-user:db-sensitive@db.example/bridgeai",
+            "connection": "postgres://uri-user:uri-sensitive@db.example/bridgeai",
+            "dsn": (
+                "host=db.example user=bridgeai password='dsn sensitive' "
+                "dbname=bridgeai connect_timeout=5"
+            ),
+            "safe": [True, 7, 0.98, None, {"quality_status": "pass"}],
+        },
+    }
+
+    normalized = normalize_checkpoint_value(value, path="tool_result.output")
+
+    assert normalized == {
+        "accessToken": "[redacted]",
+        "nested": {
+            "auth-token": "[redacted]",
+            "database_url": "[redacted]",
+            "connection": "postgres://***@db.example/bridgeai",
+            "dsn": (
+                "host=db.example user=bridgeai password=*** "
+                "dbname=bridgeai connect_timeout=5"
+            ),
+            "safe": [True, 7, 0.98, None, {"quality_status": "pass"}],
+        },
+    }
+
+
 def test_graph_redacts_sensitive_values_and_serializes_with_strict_msgpack():
     saver = InMemorySaver()
     graph = build_bridge_inspection_graph(
@@ -87,7 +142,17 @@ def test_graph_redacts_sensitive_values_and_serializes_with_strict_msgpack():
             _registry_with_output(
                 {
                     "quality_status": "pass",
-                    "nested": {"access_token": "tool-secret", "score": 0.98},
+                    "nested": {
+                        "accessToken": "tool-access-sensitive",
+                        "authToken": "tool-auth-sensitive",
+                        "databaseUrl": "postgresql://db-user:db-sensitive@db.example/bridgeai",
+                        "connection": "postgres://uri-user:uri-sensitive@db.example/bridgeai",
+                        "dsn": (
+                            "host=db.example user=bridgeai password=dsn-sensitive "
+                            "dbname=bridgeai"
+                        ),
+                        "score": 0.98,
+                    },
                 },
             ),
         ),
@@ -113,9 +178,24 @@ def test_graph_redacts_sensitive_values_and_serializes_with_strict_msgpack():
     assert result["agent_model"] == {"model_id": "DeepSeek-V4-Flash-4bit"}
     assert "api_key" not in result["model_result"]
     assert result["tool_results"][0]["output"]["nested"] == {
-        "access_token": "[redacted]",
+        "accessToken": "[redacted]",
+        "authToken": "[redacted]",
+        "databaseUrl": "[redacted]",
+        "connection": "postgres://***@db.example/bridgeai",
+        "dsn": "host=db.example user=bridgeai password=*** dbname=bridgeai",
         "score": 0.98,
     }
+    persisted = repr([item.checkpoint["channel_values"] for item in saver.list(None)])
+    for sensitive_value in (
+        "tool-access-sensitive",
+        "tool-auth-sensitive",
+        "db-user",
+        "db-sensitive",
+        "uri-user",
+        "uri-sensitive",
+        "dsn-sensitive",
+    ):
+        assert sensitive_value not in persisted
     value_type, _ = JsonPlusSerializer(pickle_fallback=False).dumps_typed(result)
     assert value_type == "msgpack"
 

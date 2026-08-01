@@ -146,7 +146,7 @@ def test_repository_rejects_missing_task_detail_and_run(repository):
 
 
 @pytest.mark.postgres
-def test_repository_rejects_reused_checkpoint_thread_id(repository):
+def test_database_rejects_reused_checkpoint_thread_id(repository):
     repository.create_task(
         "task_alpha",
         TaskCreate(
@@ -161,18 +161,42 @@ def test_repository_rejects_reused_checkpoint_thread_id(repository):
         "task_alpha",
         "run_001",
         workflow_runtime="langgraph",
-        checkpoint_thread_id="thread_001",
+        checkpoint_thread_id="run_001",
     )
 
-    with pytest.raises(psycopg.errors.UniqueViolation):
-        # This direct write verifies the partial unique index itself, rather
-        # than the repository's translation of a database error.
+    with pytest.raises(psycopg.errors.CheckViolation):
+        # Reusing the first run's checkpoint identity necessarily violates the
+        # LangGraph run/thread identity invariant for this second run.
         database_url = require_test_database_url()
         with psycopg.connect(database_url) as connection:
             connection.execute(
                 "INSERT INTO inspection_task_runs "
                 "(run_id, task_id, run_number, status, workflow_runtime, checkpoint_thread_id) "
-                "VALUES ('run_002', 'task_alpha', 2, 'running', 'langgraph', 'thread_001')",
+                "VALUES ('run_002', 'task_alpha', 2, 'running', 'langgraph', 'run_001')",
+            )
+
+
+@pytest.mark.postgres
+def test_database_rejects_langgraph_checkpoint_thread_mismatch(repository):
+    repository.create_task(
+        "task_alpha",
+        TaskCreate(
+            title="桥梁巡检",
+            task_type="bridge_inspection",
+            objective="检查影像",
+            artifact_ids=["art_001"],
+        ),
+        None,
+    )
+
+    database_url = require_test_database_url()
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with psycopg.connect(database_url) as connection:
+            connection.execute(
+                "INSERT INTO inspection_task_runs "
+                "(run_id, task_id, run_number, status, workflow_runtime, checkpoint_thread_id) "
+                "VALUES ('run_mismatch', 'task_alpha', 1, 'running', "
+                "'langgraph', 'thread_mismatch')",
             )
 
 

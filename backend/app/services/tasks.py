@@ -27,6 +27,15 @@ from backend.app.services.task_runs import run_inspection_task
 
 
 RunInspection = Callable[[str, dict[str, object]], dict[str, object]]
+_POSTGRES_URI_CREDENTIALS = re.compile(
+    r"\b(postgres(?:ql)?(?:\+[a-z0-9_.-]+)?://)[^/@\s?#]+@",
+    flags=re.IGNORECASE,
+)
+_KEYWORD_DSN_PASSWORD = re.compile(
+    r"(?<![a-z0-9_])(password\s*=\s*)"
+    r"(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|(?:\\.|[^\s])+)",
+    flags=re.IGNORECASE,
+)
 
 
 class TaskService:
@@ -158,12 +167,8 @@ def _execution_input_matches(task: TaskRecord, command: TaskCreate) -> bool:
 def _sanitize_error(exc: Exception) -> str:
     message = str(exc).strip() or exc.__class__.__name__
     message = re.sub(r"Bearer\s+\S+", "Bearer ***", message, flags=re.IGNORECASE)
-    message = re.sub(
-        r"(postgresql(?:\+\w+)?://)[^@\s]+@",
-        r"\1***@",
-        message,
-        flags=re.IGNORECASE,
-    )
+    message = _POSTGRES_URI_CREDENTIALS.sub(r"\1***@", message)
+    message = _KEYWORD_DSN_PASSWORD.sub(r"\1***", message)
     return message[:500]
 
 

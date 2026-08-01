@@ -22,6 +22,7 @@ def test_migrations_apply_in_order_and_are_repeatable():
         "0001_v0_2_skeleton.sql",
         "0002_task_history.sql",
         "0003_langgraph_runtime.sql",
+        "0004_langgraph_thread_identity.sql",
     ]
     assert second == []
     with psycopg.connect(database_url) as connection:
@@ -60,6 +61,45 @@ def test_migrations_apply_in_order_and_are_repeatable():
         ).fetchone()
     assert legacy_run == ("legacy", None)
 
+    with psycopg.connect(database_url) as connection:
+        identity_constraint = connection.execute(
+            "SELECT convalidated FROM pg_constraint "
+            "WHERE conname = 'ck_inspection_task_runs_langgraph_thread_identity' "
+            "AND conrelid = 'public.inspection_task_runs'::regclass",
+        ).fetchone()
+    assert identity_constraint == (True,)
+
+
+@pytest.mark.postgres
+def test_identity_migration_ignores_same_named_constraint_on_other_table(tmp_path):
+    database_url = require_test_database_url()
+    reset_test_tables(database_url)
+    _apply_runtime_migrations(database_url, tmp_path)
+
+    try:
+        with psycopg.connect(database_url) as connection:
+            connection.execute(
+                "CREATE TABLE identity_constraint_name_collision (value TEXT)",
+            )
+            connection.execute(
+                "ALTER TABLE identity_constraint_name_collision "
+                "ADD CONSTRAINT ck_inspection_task_runs_langgraph_thread_identity "
+                "CHECK (value IS NOT NULL)",
+            )
+
+        assert apply_migrations(database_url) == ["0004_langgraph_thread_identity.sql"]
+        with psycopg.connect(database_url) as connection:
+            target_constraint = connection.execute(
+                "SELECT convalidated FROM pg_constraint "
+                "WHERE conname = 'ck_inspection_task_runs_langgraph_thread_identity' "
+                "AND conrelid = 'public.inspection_task_runs'::regclass",
+            ).fetchone()
+        assert target_constraint == (True,)
+    finally:
+        with psycopg.connect(database_url) as connection:
+            connection.execute("DROP TABLE IF EXISTS identity_constraint_name_collision")
+        reset_test_tables(database_url)
+
 
 @pytest.mark.postgres
 def test_runtime_migration_ignores_same_named_constraints_on_other_tables(tmp_path):
@@ -82,7 +122,10 @@ def test_runtime_migration_ignores_same_named_constraints_on_other_tables(tmp_pa
                     f"ADD CONSTRAINT {constraint_name} CHECK (value IS NOT NULL)",
                 )
 
-        assert apply_migrations(database_url) == ["0003_langgraph_runtime.sql"]
+        assert apply_migrations(database_url) == [
+            "0003_langgraph_runtime.sql",
+            "0004_langgraph_thread_identity.sql",
+        ]
         with psycopg.connect(database_url) as connection:
             target_constraints = {
                 row[0]
@@ -95,6 +138,7 @@ def test_runtime_migration_ignores_same_named_constraints_on_other_tables(tmp_pa
             "ck_inspection_task_runs_workflow_runtime",
             "ck_inspection_task_runs_checkpoint_thread_nonblank",
             "ck_inspection_task_runs_runtime_thread",
+            "ck_inspection_task_runs_langgraph_thread_identity",
         }
     finally:
         with psycopg.connect(database_url) as connection:
@@ -152,3 +196,16 @@ def _apply_history_migrations(database_url: str, tmp_path) -> None:
         source = MIGRATIONS_DIR / filename
         (history_directory / filename).write_text(source.read_text(encoding="utf-8"))
     apply_migrations(database_url, history_directory)
+
+
+def _apply_runtime_migrations(database_url: str, tmp_path) -> None:
+    runtime_directory = tmp_path / "runtime_migrations"
+    runtime_directory.mkdir()
+    for filename in (
+        "0001_v0_2_skeleton.sql",
+        "0002_task_history.sql",
+        "0003_langgraph_runtime.sql",
+    ):
+        source = MIGRATIONS_DIR / filename
+        (runtime_directory / filename).write_text(source.read_text(encoding="utf-8"))
+    apply_migrations(database_url, runtime_directory)
