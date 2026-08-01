@@ -54,6 +54,8 @@ def test_create_list_detail_run_and_history_routes(monkeypatch):
     assert detail.json()["objective"] == "检查无人机影像"
     assert run.status_code == 201
     assert run.json()["run_number"] == 1
+    assert run.json()["workflow_runtime"] == "langgraph"
+    assert run.json()["checkpoint_thread_id"] == "run_001"
     assert history.json()["items"][0]["run_id"] == "run_001"
 
 
@@ -256,6 +258,8 @@ class _FakeTaskService:
             workflow={"current_step": "completed", "history": []},
             tool_results=[{"tool_id": "image_quality_check", "ok": True}],
             error_message=None,
+            workflow_runtime="langgraph",
+            checkpoint_thread_id="run_001",
             started_at=timestamp,
             completed_at=timestamp,
         )

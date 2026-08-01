@@ -18,7 +18,11 @@ def test_migrations_apply_in_order_and_are_repeatable():
     first = apply_migrations(database_url)
     second = apply_migrations(database_url)
 
-    assert first == ["0001_v0_2_skeleton.sql", "0002_task_history.sql"]
+    assert first == [
+        "0001_v0_2_skeleton.sql",
+        "0002_task_history.sql",
+        "0003_langgraph_runtime.sql",
+    ]
     assert second == []
     with psycopg.connect(database_url) as connection:
         columns = connection.execute(
@@ -37,4 +41,21 @@ def test_migrations_apply_in_order_and_are_repeatable():
         "error_message",
         "started_at",
         "completed_at",
+        "workflow_runtime",
+        "checkpoint_thread_id",
     }
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            "INSERT INTO inspection_tasks "
+            "(task_id, task_type, objective, title, status) "
+            "VALUES ('task_legacy', 'bridge_inspection', '检查影像', '桥梁巡检', 'draft')",
+        )
+        connection.execute(
+            "INSERT INTO inspection_task_runs (run_id, task_id, run_number, status) "
+            "VALUES ('run_legacy', 'task_legacy', 1, 'running')",
+        )
+        legacy_run = connection.execute(
+            "SELECT workflow_runtime, checkpoint_thread_id "
+            "FROM inspection_task_runs WHERE run_id = 'run_legacy'",
+        ).fetchone()
+    assert legacy_run == ("legacy", None)

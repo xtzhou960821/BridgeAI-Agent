@@ -51,6 +51,8 @@ class TaskRunRecord:
     task_id: str
     run_number: int
     status: str
+    workflow_runtime: str
+    checkpoint_thread_id: str | None
     agent_model: dict[str, object]
     workflow: dict[str, object]
     tool_results: list[dict[str, object]]
@@ -64,6 +66,8 @@ class TaskRunRecord:
             "task_id": self.task_id,
             "run_number": self.run_number,
             "status": self.status,
+            "workflow_runtime": self.workflow_runtime,
+            "checkpoint_thread_id": self.checkpoint_thread_id,
             "agent_model": self.agent_model,
             "workflow": self.workflow,
             "tool_results": self.tool_results,
@@ -89,7 +93,14 @@ class TaskRepository(Protocol):
 
     def get_task(self, task_id: str) -> TaskRecord: ...
 
-    def start_run(self, task_id: str, run_id: str) -> TaskRunRecord: ...
+    def start_run(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        workflow_runtime: str = "legacy",
+        checkpoint_thread_id: str | None = None,
+    ) -> TaskRunRecord: ...
 
     def complete_run(
         self,
@@ -99,6 +110,14 @@ class TaskRepository(Protocol):
         tool_results: list[dict[str, object]],
     ) -> TaskRunRecord: ...
 
-    def fail_run(self, run_id: str, error_message: str) -> TaskRunRecord: ...
+    def fail_run(
+        self,
+        run_id: str,
+        error_message: str,
+        *,
+        agent_model: dict[str, object] | None = None,
+        workflow: dict[str, object] | None = None,
+        tool_results: list[dict[str, object]] | None = None,
+    ) -> TaskRunRecord: ...
 
     def list_runs(self, task_id: str) -> list[TaskRunRecord]: ...

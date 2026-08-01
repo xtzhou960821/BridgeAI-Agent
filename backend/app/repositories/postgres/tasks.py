@@ -23,8 +23,8 @@ _TASK_COLUMNS = (
     "created_at, updated_at"
 )
 _RUN_COLUMNS = (
-    "run_id, task_id, run_number, status, agent_model, workflow, "
-    "tool_results, error_message, started_at, completed_at"
+    "run_id, task_id, run_number, status, workflow_runtime, checkpoint_thread_id, "
+    "agent_model, workflow, tool_results, error_message, started_at, completed_at"
 )
 
 
@@ -106,7 +106,14 @@ class PostgresTaskRepository:
         except psycopg.Error as exc:
             raise _database_unavailable() from exc
 
-    def start_run(self, task_id: str, run_id: str) -> TaskRunRecord:
+    def start_run(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        workflow_runtime: str = "legacy",
+        checkpoint_thread_id: str | None = None,
+    ) -> TaskRunRecord:
         try:
             with connect(self._database_url) as connection:
                 with connection.cursor(row_factory=dict_row) as cursor:
@@ -125,10 +132,17 @@ class PostgresTaskRepository:
                     run_number = int(cursor.fetchone()["run_number"])
                     cursor.execute(
                         "INSERT INTO inspection_task_runs ("
-                        "run_id, task_id, run_number, status"
-                        ") VALUES (%s, %s, %s, 'running') "
+                        "run_id, task_id, run_number, status, workflow_runtime, "
+                        "checkpoint_thread_id"
+                        ") VALUES (%s, %s, %s, 'running', %s, %s) "
                         f"RETURNING {_RUN_COLUMNS}",
-                        (run_id, task_id, run_number),
+                        (
+                            run_id,
+                            task_id,
+                            run_number,
+                            workflow_runtime,
+                            checkpoint_thread_id,
+                        ),
                     )
                     run = _run_from_row(cursor.fetchone())
                     cursor.execute(
@@ -178,16 +192,33 @@ class PostgresTaskRepository:
         except psycopg.Error as exc:
             raise _database_unavailable() from exc
 
-    def fail_run(self, run_id: str, error_message: str) -> TaskRunRecord:
+    def fail_run(
+        self,
+        run_id: str,
+        error_message: str,
+        *,
+        agent_model: dict[str, object] | None = None,
+        workflow: dict[str, object] | None = None,
+        tool_results: list[dict[str, object]] | None = None,
+    ) -> TaskRunRecord:
         try:
             with connect(self._database_url) as connection:
                 with connection.cursor(row_factory=dict_row) as cursor:
                     cursor.execute(
                         "UPDATE inspection_task_runs SET "
-                        "status = 'failed', error_message = %s, completed_at = NOW() "
+                        "status = 'failed', agent_model = COALESCE(%s, agent_model), "
+                        "workflow = COALESCE(%s, workflow), "
+                        "tool_results = COALESCE(%s, tool_results), "
+                        "error_message = %s, completed_at = NOW() "
                         "WHERE run_id = %s "
                         f"RETURNING {_RUN_COLUMNS}",
-                        (error_message, run_id),
+                        (
+                            Jsonb(agent_model) if agent_model is not None else None,
+                            Jsonb(workflow) if workflow is not None else None,
+                            Jsonb(tool_results) if tool_results is not None else None,
+                            error_message,
+                            run_id,
+                        ),
                     )
                     row = cursor.fetchone()
                     if row is None:
@@ -251,6 +282,12 @@ def _run_from_row(row: Mapping[str, Any]) -> TaskRunRecord:
         task_id=str(row["task_id"]),
         run_number=int(row["run_number"]),
         status=str(row["status"]),
+        workflow_runtime=str(row["workflow_runtime"]),
+        checkpoint_thread_id=(
+            str(row["checkpoint_thread_id"])
+            if row["checkpoint_thread_id"] is not None
+            else None
+        ),
         agent_model=dict(row["agent_model"]),
         workflow=dict(row["workflow"]),
         tool_results=[dict(item) for item in row["tool_results"]],
