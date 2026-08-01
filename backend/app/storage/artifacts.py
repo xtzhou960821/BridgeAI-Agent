@@ -130,12 +130,22 @@ class LocalArtifactStore:
         return candidate
 
     def _ensure_root(self) -> None:
+        self._assert_root_has_no_symlink_ancestors()
         try:
             self._root.mkdir(parents=True, exist_ok=True)
         except OSError as error:
             raise ArtifactStorageUnavailableError("Artifact storage is unavailable") from error
         if not self._root.is_dir() or self._root.is_symlink():
             raise ArtifactStorageUnavailableError("Artifact storage root is invalid")
+
+    def _assert_root_has_no_symlink_ancestors(self) -> None:
+        current = Path(self._root.anchor)
+        for part in self._root.parts[1:]:
+            current = current / part
+            if current.is_symlink():
+                raise ArtifactStorageUnavailableError(
+                    "Artifact storage root must not contain symlinks"
+                )
 
     def _assert_no_symlinks(self, path: Path) -> None:
         current = self._root

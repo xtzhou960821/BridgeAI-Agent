@@ -62,6 +62,19 @@ def test_local_store_refuses_a_symlinked_storage_path(tmp_path):
         store.open("ab/artifact.jpg")
 
 
+def test_local_store_refuses_a_root_with_a_symlinked_ancestor(tmp_path):
+    physical_parent = tmp_path / "physical-parent"
+    physical_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(physical_parent, target_is_directory=True)
+    store = LocalArtifactStore(linked_parent / "artifacts")
+
+    with pytest.raises(ArtifactStorageUnavailableError):
+        store.stage(BytesIO(b"bridge-image"), max_bytes=20 * 1024 * 1024)
+
+    assert not (physical_parent / "artifacts").exists()
+
+
 def test_local_store_deletes_only_a_root_contained_key(tmp_path):
     root = tmp_path / "artifacts"
     store = LocalArtifactStore(root)
