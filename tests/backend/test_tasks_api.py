@@ -10,6 +10,10 @@ except (ModuleNotFoundError, RuntimeError) as exc:
     pytest.skip(f"FastAPI test client is not available: {exc}", allow_module_level=True)
 
 from agent.model_gateway import ModelGatewayConfigurationError
+from backend.app.domain.artifact_errors import (
+    ArtifactNotFoundError,
+    ArtifactNotReadyError,
+)
 from backend.app.domain.task_errors import (
     DatabaseUnavailableError,
     IdempotencyConflictError,
@@ -166,6 +170,26 @@ def test_compatibility_route_maps_objective_to_title(monkeypatch):
                 "message": "该任务 ID 已存在，但执行输入不一致。",
             },
         ),
+        (
+            "post",
+            "/api/v1/tasks",
+            ArtifactNotFoundError("missing"),
+            422,
+            {
+                "code": "ARTIFACT_NOT_READY",
+                "message": "请先上传一张有效且已就绪的图片。",
+            },
+        ),
+        (
+            "post",
+            "/api/v1/tasks/runs",
+            ArtifactNotReadyError("not ready"),
+            422,
+            {
+                "code": "ARTIFACT_NOT_READY",
+                "message": "请先上传一张有效且已就绪的图片。",
+            },
+        ),
     ],
 )
 def test_task_routes_translate_known_errors(
@@ -225,6 +249,32 @@ def test_task_create_rejects_blank_artifact_id(monkeypatch):
             "artifact_ids": ["   "],
         },
     )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("path", ["/api/v1/tasks", "/api/v1/tasks/runs"])
+@pytest.mark.parametrize("artifact_ids", [[], ["art_001", "art_002"]])
+def test_task_requests_require_exactly_one_artifact_id(monkeypatch, path, artifact_ids):
+    from backend.app.api.v1 import tasks
+
+    monkeypatch.setattr(
+        tasks,
+        "build_task_service_from_environment",
+        lambda: _FakeTaskService(),
+    )
+    client = TestClient(create_app())
+    payload = {
+        "task_type": "bridge_inspection",
+        "objective": "检查影像",
+        "artifact_ids": artifact_ids,
+    }
+    if path == "/api/v1/tasks":
+        payload["title"] = "桥梁巡检"
+    else:
+        payload["task_id"] = "task_001"
+
+    response = client.post(path, json=payload)
 
     assert response.status_code == 422
 

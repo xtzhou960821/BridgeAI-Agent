@@ -8,6 +8,8 @@ from collections.abc import Callable, Mapping
 from functools import partial
 
 from agent.model_gateway import ModelGatewayConfigurationError
+from backend.app.domain.artifact_errors import ArtifactNotReadyError
+from backend.app.domain.artifacts import ArtifactRecord
 from backend.app.domain.task_errors import (
     DatabaseUnavailableError,
     LangGraphCheckpointerNotReadyError,
@@ -23,10 +25,12 @@ from backend.app.domain.tasks import (
 )
 from backend.app.repositories.postgres.connection import get_database_url
 from backend.app.repositories.postgres.tasks import PostgresTaskRepository
+from backend.app.services.artifacts import build_artifact_service_from_environment
 from backend.app.services.task_runs import run_inspection_task
 
 
 RunInspection = Callable[[str, dict[str, object]], dict[str, object]]
+RequireReadyArtifact = Callable[[str], ArtifactRecord]
 _POSTGRES_URI_CREDENTIALS = re.compile(
     r"\b(postgres(?:ql)?(?:\+[a-z0-9_.-]+)?://)[^/@\s?#]+@",
     flags=re.IGNORECASE,
@@ -45,15 +49,18 @@ class TaskService:
         self,
         repository: TaskRepository,
         run_inspection: RunInspection,
+        require_ready_artifact: RequireReadyArtifact,
     ) -> None:
         self._repository = repository
         self._run_inspection = run_inspection
+        self._require_ready_artifact = require_ready_artifact
 
     def create_task(
         self,
         command: TaskCreate,
         idempotency_key: str | None = None,
     ) -> TaskRecord:
+        self._validate_new_task_artifact(command)
         return self._repository.create_task(
             _new_id("task"),
             command,
@@ -130,12 +137,18 @@ class TaskService:
         try:
             task = self._repository.get_task(task_id)
         except TaskNotFoundError:
+            self._validate_new_task_artifact(command)
             task = self._repository.create_task(task_id, command, None)
         if not _execution_input_matches(task, command):
             raise TaskInputConflictError(
                 "Persisted task input differs from the compatibility request",
             )
         return self.execute_task(task.task_id)
+
+    def _validate_new_task_artifact(self, command: TaskCreate) -> None:
+        if len(command.artifact_ids) != 1:
+            raise ArtifactNotReadyError("Exactly one ready Artifact is required")
+        self._require_ready_artifact(command.artifact_ids[0])
 
 
 def build_task_service_from_environment(
@@ -146,9 +159,11 @@ def build_task_service_from_environment(
     database_url = get_database_url(environ)
     if not database_url:
         raise DatabaseUnavailableError("PostgreSQL task store is unavailable")
+    artifact_service = build_artifact_service_from_environment(environ)
     return TaskService(
         PostgresTaskRepository(database_url),
         run_inspection=partial(run_inspection_task, database_url=database_url),
+        require_ready_artifact=artifact_service.require_ready,
     )
 
 

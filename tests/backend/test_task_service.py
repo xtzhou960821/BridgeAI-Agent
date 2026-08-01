@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from agent.model_gateway import ModelGatewayConfigurationError
+from backend.app.domain.artifact_errors import (
+    ArtifactNotFoundError,
+    ArtifactNotReadyError,
+)
+from backend.app.domain.artifacts import ArtifactRecord
 from backend.app.domain.task_errors import (
     LangGraphCheckpointerNotReadyError,
     TaskExecutionError,
@@ -30,7 +37,11 @@ def repository():
 
 @pytest.mark.postgres
 def test_service_creates_task_with_generated_id(repository):
-    service = TaskService(repository, run_inspection=_successful_run)
+    service = TaskService(
+        repository,
+        run_inspection=_successful_run,
+        require_ready_artifact=_ready_artifact,
+    )
 
     task = service.create_task(
         TaskCreate(
@@ -47,6 +58,103 @@ def test_service_creates_task_with_generated_id(repository):
 
 
 @pytest.mark.postgres
+def test_service_requires_one_ready_artifact_before_create(repository):
+    calls = []
+    service = TaskService(
+        repository,
+        run_inspection=_successful_run,
+        require_ready_artifact=lambda artifact_id: calls.append(artifact_id)
+        or _artifact_record(),
+    )
+
+    task = service.create_task(_task_command())
+
+    assert calls == ["art_001"]
+    assert task.artifact_ids == ["art_001"]
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("artifact_ids", [[], ["art_001", "art_002"]])
+def test_service_rejects_zero_or_multiple_artifacts_before_create(
+    repository,
+    artifact_ids,
+):
+    calls = []
+    service = TaskService(
+        repository,
+        run_inspection=_successful_run,
+        require_ready_artifact=lambda artifact_id: calls.append(artifact_id)
+        or _artifact_record(),
+    )
+    command = TaskCreate(
+        title="桥梁巡检",
+        task_type="bridge_inspection",
+        objective="检查影像",
+        artifact_ids=artifact_ids,
+    )
+
+    with pytest.raises(ArtifactNotReadyError, match="Exactly one ready Artifact"):
+        service.create_task(command)
+
+    assert calls == []
+    assert repository.list_tasks() == []
+
+
+@pytest.mark.postgres
+def test_service_does_not_create_task_for_missing_artifact(repository):
+    def missing(_artifact_id):
+        raise ArtifactNotFoundError("missing")
+
+    service = TaskService(
+        repository,
+        _successful_run,
+        require_ready_artifact=missing,
+    )
+
+    with pytest.raises(ArtifactNotFoundError):
+        service.create_task(_task_command())
+
+    assert repository.list_tasks() == []
+
+
+@pytest.mark.postgres
+def test_new_legacy_task_requires_ready_artifact_before_creation(repository):
+    calls = []
+    service = TaskService(
+        repository,
+        run_inspection=_successful_run,
+        require_ready_artifact=lambda artifact_id: calls.append(artifact_id)
+        or _artifact_record(),
+    )
+
+    run = service.execute_legacy_task("task_legacy", _task_command())
+
+    assert calls == ["art_001"]
+    assert run.status == "completed"
+
+
+@pytest.mark.postgres
+def test_persisted_legacy_task_bypasses_artifact_validation_and_persists_run_failure(
+    repository,
+):
+    repository.create_task("task_legacy", _task_command(), None)
+
+    def unavailable_artifact(_artifact_id):
+        raise ArtifactNotReadyError("not ready")
+
+    service = TaskService(
+        repository,
+        run_inspection=_failed_graph_run,
+        require_ready_artifact=unavailable_artifact,
+    )
+
+    run = service.execute_legacy_task("task_legacy", _task_command())
+
+    assert run.status == "failed"
+    assert repository.list_runs("task_legacy") == [run]
+
+
+@pytest.mark.postgres
 def test_service_executes_saved_task_and_completes_run(repository):
     task = repository.create_task(
         "task_001",
@@ -59,7 +167,11 @@ def test_service_executes_saved_task_and_completes_run(repository):
         calls.append((run_id, payload))
         return _successful_run(run_id, payload)
 
-    service = TaskService(repository, run_inspection=run_inspection)
+    service = TaskService(
+        repository,
+        run_inspection=run_inspection,
+        require_ready_artifact=_ready_artifact,
+    )
 
     run = service.execute_task(task.task_id)
 
@@ -86,7 +198,11 @@ def test_service_persists_failed_run_before_raising(repository):
     def fail(_run_id, _payload):
         raise RuntimeError("gateway timeout")
 
-    service = TaskService(repository, run_inspection=fail)
+    service = TaskService(
+        repository,
+        run_inspection=fail,
+        require_ready_artifact=_ready_artifact,
+    )
 
     with pytest.raises(TaskExecutionError, match="gateway timeout") as error:
         service.execute_task("task_001")
@@ -111,7 +227,11 @@ def test_service_redacts_postgres_credentials_from_persisted_unexpected_error(re
             "dbname=bridgeai; timeout after 5s",
         )
 
-    service = TaskService(repository, run_inspection=fail)
+    service = TaskService(
+        repository,
+        run_inspection=fail,
+        require_ready_artifact=_ready_artifact,
+    )
 
     with pytest.raises(TaskExecutionError) as error:
         service.execute_task("task_001")
@@ -142,7 +262,11 @@ def test_service_persists_model_configuration_failure_and_preserves_error_type(
     def fail(_run_id, _payload):
         raise ModelGatewayConfigurationError("API key is required")
 
-    service = TaskService(repository, run_inspection=fail)
+    service = TaskService(
+        repository,
+        run_inspection=fail,
+        require_ready_artifact=_ready_artifact,
+    )
 
     with pytest.raises(ModelGatewayConfigurationError, match="API key is required"):
         service.execute_task("task_001")
@@ -155,7 +279,11 @@ def test_service_persists_model_configuration_failure_and_preserves_error_type(
 
 @pytest.mark.postgres
 def test_legacy_execution_reuses_matching_task_and_rejects_input_conflict(repository):
-    service = TaskService(repository, run_inspection=_successful_run)
+    service = TaskService(
+        repository,
+        run_inspection=_successful_run,
+        require_ready_artifact=_ready_artifact,
+    )
     command = _task_command()
 
     first_run = service.execute_legacy_task("task_legacy", command)
@@ -181,7 +309,11 @@ def test_service_persists_graph_terminal_tool_failure_without_raising(repository
     def graph_failure(run_id, payload):
         return _failed_graph_run(run_id, payload)
 
-    run = TaskService(repository, run_inspection=graph_failure).execute_task("task_001")
+    run = TaskService(
+        repository,
+        run_inspection=graph_failure,
+        require_ready_artifact=_ready_artifact,
+    ).execute_task("task_001")
 
     assert run.status == "failed"
     assert run.error_message == "inspection failed"
@@ -198,7 +330,11 @@ def test_service_persists_checkpointer_failure_and_preserves_error_type(reposito
     def unavailable(run_id, _payload):
         raise LangGraphCheckpointerNotReadyError(run_id, "checkpoint tables missing")
 
-    service = TaskService(repository, run_inspection=unavailable)
+    service = TaskService(
+        repository,
+        run_inspection=unavailable,
+        require_ready_artifact=_ready_artifact,
+    )
 
     with pytest.raises(LangGraphCheckpointerNotReadyError) as error:
         service.execute_task("task_001")
@@ -216,6 +352,25 @@ def _task_command() -> TaskCreate:
         objective="检查影像",
         artifact_ids=["art_001"],
     )
+
+
+def _artifact_record() -> ArtifactRecord:
+    return ArtifactRecord(
+        artifact_id="art_001",
+        original_filename="bridge.jpg",
+        storage_key="art_001.jpg",
+        sha256="0" * 64,
+        size_bytes=1,
+        mime_type="image/jpeg",
+        width_px=1,
+        height_px=1,
+        status="ready",
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+
+def _ready_artifact(_artifact_id: str) -> ArtifactRecord:
+    return _artifact_record()
 
 
 def _successful_run(_run_id, payload):

@@ -6,6 +6,10 @@ from collections.abc import Callable
 from typing import NoReturn, TypeVar
 
 from agent.model_gateway import ModelGatewayConfigurationError
+from backend.app.domain.artifact_errors import (
+    ArtifactNotFoundError,
+    ArtifactNotReadyError,
+)
 from backend.app.domain.task_errors import (
     DatabaseUnavailableError,
     IdempotencyConflictError,
@@ -39,7 +43,7 @@ if APIRouter is not None:
         title: str = Field(min_length=1, max_length=200)
         task_type: str = Field(min_length=1, max_length=100)
         objective: str = Field(min_length=1, max_length=2000)
-        artifact_ids: list[str] = Field(min_length=1, max_length=100)
+        artifact_ids: list[str] = Field(min_length=1, max_length=1)
 
         @field_validator("title", "task_type", "objective")
         @classmethod
@@ -69,7 +73,7 @@ if APIRouter is not None:
         task_id: str = Field(min_length=1, max_length=200)
         task_type: str = Field(min_length=1, max_length=100)
         objective: str = Field(min_length=1, max_length=2000)
-        artifact_ids: list[str] = Field(min_length=1, max_length=100)
+        artifact_ids: list[str] = Field(min_length=1, max_length=1)
 
         @field_validator("task_id", "task_type", "objective")
         @classmethod
@@ -165,6 +169,8 @@ def _service_call(operation: Callable[[TaskService], _Result]) -> _Result:
         ModelGatewayConfigurationError,
         LangGraphCheckpointerNotReadyError,
         TaskExecutionError,
+        ArtifactNotFoundError,
+        ArtifactNotReadyError,
     ) as exc:
         _raise_http_error(exc)
 
@@ -172,7 +178,13 @@ def _service_call(operation: Callable[[TaskService], _Result]) -> _Result:
 def _raise_http_error(exc: Exception) -> NoReturn:
     if HTTPException is None:  # pragma: no cover - FastAPI-only path.
         raise RuntimeError("FastAPI is not installed") from exc
-    if isinstance(exc, TaskNotFoundError):
+    if isinstance(exc, (ArtifactNotFoundError, ArtifactNotReadyError)):
+        status_code = 422
+        detail = {
+            "code": "ARTIFACT_NOT_READY",
+            "message": "请先上传一张有效且已就绪的图片。",
+        }
+    elif isinstance(exc, TaskNotFoundError):
         status_code = 404
         detail = {"code": "TASK_NOT_FOUND", "message": "未找到指定任务。"}
     elif isinstance(exc, IdempotencyConflictError):
