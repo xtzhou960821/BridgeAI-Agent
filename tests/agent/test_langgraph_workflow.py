@@ -59,7 +59,7 @@ def test_graph_routes_unsuccessful_tool_to_failed():
     assert result["status"] == "failed"
     assert result["current_step"] == "failed"
     assert result["error_step"] == "image_quality_check"
-    assert result["error_code"] == "MISSING_REQUIRED_INPUT"
+    assert result["error_code"] == "missing_required_input"
     assert result["error_message"] == "Missing required input: camera_id"
     assert [item["step_name"] for item in result["workflow_history"]][-1] == "failed"
 
@@ -91,6 +91,25 @@ def test_initial_state_contains_only_serializer_safe_values():
     assert state["error_step"] is None
     assert state["error_code"] is None
     assert state["error_message"] is None
+
+
+@pytest.mark.parametrize(
+    "unsafe_artifact_id",
+    [
+        "/private/tmp/sensitive-bridge.jpg",
+        "redis://artifact-user:artifact-pass@cache.example/0",
+    ],
+)
+def test_initial_state_rejects_path_or_uri_artifact_ids(unsafe_artifact_id):
+    with pytest.raises(StateSerializationError, match=r"artifact_ids\[0\]"):
+        initial_bridge_inspection_state(
+            task_id="task_001",
+            run_id="run_unsafe_initial_artifact",
+            task_type="bridge_inspection",
+            objective="检查桥梁无人机影像质量",
+            artifact_ids=[unsafe_artifact_id],
+            agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+        )
 
 
 def test_graph_routes_failed_artifact_verification_without_running_tool():
@@ -452,7 +471,7 @@ def test_graph_rejects_unsafe_tool_wrapper_strings():
         tool_executor=_StaticToolExecutor(
             ToolResult(
                 tool_id="/private/tmp/image_quality_check",
-                version="redis://version-user:version-pass@cache.example/0",
+                version="0.1.0",
                 ok=True,
                 output={"artifact_id": "art_001", "quality_status": "pass"},
             )
@@ -464,6 +483,28 @@ def test_graph_rejects_unsafe_tool_wrapper_strings():
         graph.invoke(
             _initial_state("run_unsafe_tool_wrapper"),
             config={"configurable": {"thread_id": "run_unsafe_tool_wrapper"}},
+        )
+
+
+def test_graph_rejects_unsafe_tool_version_independently():
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=_verified_artifact,
+        tool_executor=_StaticToolExecutor(
+            ToolResult(
+                tool_id="image_quality_check",
+                version="redis://version-user:version-pass@cache.example/0",
+                ok=True,
+                output={"artifact_id": "art_001", "quality_status": "pass"},
+            )
+        ),
+        checkpointer=InMemorySaver(),
+    )
+
+    with pytest.raises(StateSerializationError, match="tool_result.version"):
+        graph.invoke(
+            _initial_state("run_unsafe_tool_version"),
+            config={"configurable": {"thread_id": "run_unsafe_tool_version"}},
         )
 
 

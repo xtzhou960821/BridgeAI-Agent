@@ -359,11 +359,11 @@ def tool_id_payload(value: object, *, path: str) -> str:
 
 
 def safe_error_code_payload(value: object, *, path: str, default: str) -> str:
-    """Normalize safe identifiers and replace arbitrary external error codes."""
+    """Preserve safe identifiers and replace arbitrary external error codes."""
 
     if not isinstance(value, str) or _ERROR_CODE.fullmatch(value) is None:
         return default
-    return value.upper()
+    return value
 
 
 def normalize_checkpoint_value(value: object, *, path: str) -> object:
