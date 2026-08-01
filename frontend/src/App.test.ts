@@ -2,15 +2,19 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import App from './App.vue'
-import type { HealthPayload, TaskRecord, TaskRunRecord } from './types'
+import type { ArtifactRecord, HealthPayload, TaskRecord, TaskRunRecord } from './types'
 
 const api = vi.hoisted(() => ({
+  artifactContentUrl: vi.fn((artifactId: string) =>
+    `http://127.0.0.1:8000/api/v1/artifacts/${encodeURIComponent(artifactId)}/content`,
+  ),
   createTask: vi.fn(),
   getTask: vi.fn(),
   listTaskRuns: vi.fn(),
   listTasks: vi.fn(),
   loadHealth: vi.fn(),
   runTask: vi.fn(),
+  uploadArtifact: vi.fn(),
 }))
 
 vi.mock('./api', () => api)
@@ -33,6 +37,18 @@ const taskTwo = task('task_002', '桥面病害检查', 'pending')
 const runOne = run('run_001', 1, '第一次任务理解')
 const runTwo = run('run_002', 2, '第二次任务理解')
 const newRun = run('run_003', 1, '新任务理解', 'task_002')
+const uploadedArtifact: ArtifactRecord = {
+  artifact_id: 'art_uploaded_001',
+  original_filename: 'bridge.jpg',
+  sha256: 'a'.repeat(64),
+  size_bytes: 1_572_864,
+  mime_type: 'image/jpeg',
+  width_px: 1920,
+  height_px: 1080,
+  status: 'ready',
+  content_url: '/api/v1/artifacts/art_uploaded_001/content',
+  created_at: '2026-08-02T01:00:00+00:00',
+}
 
 describe('persistent task workbench', () => {
   beforeEach(() => {
@@ -52,6 +68,7 @@ describe('persistent task workbench', () => {
     })
     api.createTask.mockResolvedValue(taskTwo)
     api.runTask.mockResolvedValue(newRun)
+    api.uploadArtifact.mockResolvedValue(uploadedArtifact)
   })
 
   it('restores, creates, runs, and switches persisted task history', async () => {
@@ -69,16 +86,21 @@ describe('persistent task workbench', () => {
 
     await wrapper.get('input[name="title"]').setValue('桥面病害检查')
     await wrapper.get('textarea[name="objective"]').setValue('检查桥面裂缝')
-    await wrapper.get('textarea[name="artifact_ids"]').setValue('art_002')
+    const file = new File(['jpeg-bytes'], 'bridge.jpg', { type: 'image/jpeg' })
+    const input = wrapper.get('input[type="file"]')
+    Object.defineProperty(input.element, 'files', { configurable: true, value: [file] })
+    await input.trigger('change')
+    await flushPromises()
     await wrapper.get('form').trigger('submit')
     await flushPromises()
 
+    expect(api.uploadArtifact).toHaveBeenCalledWith(file)
     expect(api.createTask).toHaveBeenCalledWith(
       {
         title: '桥面病害检查',
         task_type: 'bridge_inspection',
         objective: '检查桥面裂缝',
-        artifact_ids: ['art_002'],
+        artifact_ids: ['art_uploaded_001'],
       },
       'create-001',
     )

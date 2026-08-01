@@ -1,33 +1,39 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 
-import type { TaskCreateInput } from '../types'
+import type { ArtifactRecord, TaskCreateInput } from '../types'
+import ArtifactUploadField from './ArtifactUploadField.vue'
 
-defineProps<{ busy: boolean }>()
+const props = defineProps<{
+  busy: boolean
+  uploading: boolean
+  artifact: ArtifactRecord | null
+  uploadError: string
+}>()
 
 const emit = defineEmits<{
+  upload: [file: File]
   create: [input: TaskCreateInput]
 }>()
 
 const title = ref('')
 const taskType = ref('bridge_inspection')
 const objective = ref('')
-const artifactIds = ref('')
 const validationError = ref('')
 
+function selectArtifact(file: File) {
+  emit('upload', file)
+}
+
 function submit() {
-  const artifacts = artifactIds.value
-    .split(/[,\n]/)
-    .map((value) => value.trim())
-    .filter(Boolean)
   const input: TaskCreateInput = {
     title: title.value.trim(),
     task_type: taskType.value.trim(),
     objective: objective.value.trim(),
-    artifact_ids: artifacts,
+    artifact_ids: props.artifact ? [props.artifact.artifact_id] : [],
   }
   if (!input.title || !input.task_type || !input.objective || input.artifact_ids.length === 0) {
-    validationError.value = '请填写任务名称、任务类型、目标和至少一个 Artifact ID。'
+    validationError.value = '请填写任务名称、任务类型、目标并完成图片上传。'
     return
   }
   validationError.value = ''
@@ -55,20 +61,20 @@ function submit() {
           placeholder="说明本次巡检需要完成什么"
         />
       </label>
-      <label class="form-wide">
-        <span>Artifact ID</span>
-        <textarea
-          v-model="artifactIds"
-          name="artifact_ids"
-          rows="2"
-          placeholder="多个 ID 可用逗号或换行分隔"
+      <div class="form-wide">
+        <span class="field-label">巡检图片</span>
+        <ArtifactUploadField
+          :artifact="artifact"
+          :busy="uploading"
+          :error="uploadError"
+          @select="selectArtifact"
         />
-      </label>
+      </div>
     </div>
     <div class="form-actions">
       <p v-if="validationError" class="form-error" role="alert">{{ validationError }}</p>
-      <button class="primary-button" type="submit" :disabled="busy">
-        {{ busy ? '创建中...' : '创建任务' }}
+      <button class="primary-button" type="submit" :disabled="busy || uploading || !artifact">
+        {{ busy ? '创建中...' : uploading ? '正在上传图片...' : '创建任务' }}
       </button>
     </div>
   </form>
@@ -88,6 +94,14 @@ function submit() {
 label {
   display: grid;
   gap: 8px;
+  color: #526058;
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 8px;
   color: #526058;
   font-size: 0.88rem;
   font-weight: 700;

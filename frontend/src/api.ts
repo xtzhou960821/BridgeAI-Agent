@@ -1,4 +1,5 @@
 import type {
+  ArtifactRecord,
   HealthPayload,
   TaskCreateInput,
   TaskListPayload,
@@ -43,6 +44,20 @@ export function createTask(input: TaskCreateInput, idempotencyKey: string): Prom
     },
     body: JSON.stringify(input),
   })
+}
+
+export function uploadArtifact(file: File): Promise<ArtifactRecord> {
+  const body = new FormData()
+  body.append('file', file)
+  return request('/artifacts', { method: 'POST', body })
+}
+
+export function getArtifact(artifactId: string): Promise<ArtifactRecord> {
+  return request(`/artifacts/${encodeURIComponent(artifactId)}`)
+}
+
+export function artifactContentUrl(artifactId: string): string {
+  return `${apiBaseUrl}/artifacts/${encodeURIComponent(artifactId)}/content`
 }
 
 export function getTask(taskId: string): Promise<TaskRecord> {

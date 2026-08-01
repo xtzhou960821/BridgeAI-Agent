@@ -7,12 +7,19 @@ import {
   listTasks,
   loadHealth,
   runTask as executeTask,
+  uploadArtifact,
 } from './api'
 import TaskCreateForm from './components/TaskCreateForm.vue'
 import TaskList from './components/TaskList.vue'
 import TaskRunDetail from './components/TaskRunDetail.vue'
 import TaskRunHistory from './components/TaskRunHistory.vue'
-import type { HealthPayload, TaskCreateInput, TaskRecord, TaskRunRecord } from './types'
+import type {
+  ArtifactRecord,
+  HealthPayload,
+  TaskCreateInput,
+  TaskRecord,
+  TaskRunRecord,
+} from './types'
 
 const health = ref<HealthPayload | null>(null)
 const tasks = ref<TaskRecord[]>([])
@@ -20,6 +27,7 @@ const runs = ref<TaskRunRecord[]>([])
 const selectedTaskId = ref<string | null>(null)
 const selectedRunId = ref<string | null>(null)
 const isCreating = ref(false)
+const isUploadingArtifact = ref(false)
 const runningTaskId = ref<string | null>(null)
 const isLoadingTasks = ref(false)
 const isLoadingRuns = ref(false)
@@ -27,7 +35,9 @@ const isLoadingRuns = ref(false)
 const healthError = ref('')
 const taskListError = ref('')
 const createError = ref('')
+const artifactUploadError = ref('')
 const runError = ref('')
+const pendingArtifact = ref<ArtifactRecord | null>(null)
 
 const selectedTask = computed(
   () => tasks.value.find((task) => task.task_id === selectedTaskId.value) ?? null,
@@ -128,10 +138,23 @@ async function handleCreate(input: TaskCreateInput) {
     const created = await createTask(input, crypto.randomUUID())
     tasks.value = [created, ...tasks.value.filter((task) => task.task_id !== created.task_id)]
     await selectTask(created.task_id)
+    pendingArtifact.value = null
   } catch (error) {
     createError.value = messageOf(error, '创建任务失败')
   } finally {
     isCreating.value = false
+  }
+}
+
+async function handleArtifactUpload(file: File) {
+  artifactUploadError.value = ''
+  isUploadingArtifact.value = true
+  try {
+    pendingArtifact.value = await uploadArtifact(file)
+  } catch (error) {
+    artifactUploadError.value = messageOf(error, '图片上传失败')
+  } finally {
+    isUploadingArtifact.value = false
   }
 }
 
@@ -260,8 +283,15 @@ onMounted(() => {
           <h2 id="create-task-title">创建巡检任务</h2>
         </div>
       </div>
-      <TaskCreateForm :busy="isCreating" @create="handleCreate" />
-      <p v-if="createError" class="error-text">{{ createError }}</p>
+      <TaskCreateForm
+        :busy="isCreating"
+        :uploading="isUploadingArtifact"
+        :artifact="pendingArtifact"
+        :upload-error="artifactUploadError"
+        @upload="handleArtifactUpload"
+        @create="handleCreate"
+      />
+      <p v-if="createError" class="error-text" role="alert">{{ createError }}</p>
     </section>
 
     <section class="panel" aria-labelledby="task-list-title">

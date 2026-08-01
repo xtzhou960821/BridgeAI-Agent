@@ -13,6 +13,19 @@ export type TaskCreateInput = {
   artifact_ids: string[]
 }
 
+export type ArtifactRecord = {
+  artifact_id: string
+  original_filename: string
+  sha256: string
+  size_bytes: number
+  mime_type: 'image/jpeg' | 'image/png'
+  width_px: number
+  height_px: number
+  status: 'ready'
+  content_url: string
+  created_at: string
+}
+
 export type TaskRecord = TaskCreateInput & {
   task_id: string
   status: string
