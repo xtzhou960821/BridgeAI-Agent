@@ -55,20 +55,24 @@ class ArtifactService:
         try:
             with self._store.open_staged(staged) as stream:
                 image_format, width_px, height_px = _decode_image(stream.read())
+            details = _FORMAT_DETAILS.get(image_format)
+            if details is None:
+                raise _UnsupportedImageData
+            mime_type, extension = details
+            artifact_id = f"art_{uuid.uuid4().hex}"
+            storage_key = self._store.finalize(staged, artifact_id, extension)
         except _InvalidImageData as error:
             self._discard_stage(staged)
             raise InvalidImageArtifactError("Artifact content is not a valid image") from error
-
-        details = _FORMAT_DETAILS.get(image_format)
-        if details is None:
+        except _UnsupportedImageData:
             self._discard_stage(staged)
             raise UnsupportedArtifactTypeError(
                 "Only decoded JPEG and PNG Artifact content is supported"
-            )
+            ) from None
+        except Exception:
+            self._discard_stage(staged)
+            raise
 
-        mime_type, extension = details
-        artifact_id = f"art_{uuid.uuid4().hex}"
-        storage_key = self._store.finalize(staged, artifact_id, extension)
         record = ArtifactRecord(
             artifact_id=artifact_id,
             original_filename=Path(original_filename).name.strip()[:255],
@@ -156,6 +160,10 @@ def build_artifact_service_from_environment(
 
 class _InvalidImageData(Exception):
     """Internal marker that keeps malformed decoded content out of the service API."""
+
+
+class _UnsupportedImageData(Exception):
+    """Internal marker for valid but unsupported decoded image formats."""
 
 
 def _decode_image(content: bytes) -> tuple[str, int, int]:

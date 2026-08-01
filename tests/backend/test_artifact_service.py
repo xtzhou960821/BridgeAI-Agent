@@ -9,12 +9,16 @@ from backend.app.domain.artifact_errors import (
     ArtifactContentMissingError,
     ArtifactIntegrityMismatchError,
     ArtifactNotReadyError,
+    ArtifactStorageUnavailableError,
     ArtifactTooLargeError,
     InvalidImageArtifactError,
     UnsupportedArtifactTypeError,
 )
 from backend.app.domain.task_errors import DatabaseUnavailableError
+from backend.app.services.artifacts import ArtifactService
+from backend.app.storage.artifacts import LocalArtifactStore
 from tests.backend.artifact_test_support import (
+    InMemoryArtifactRepository,
     artifact_path,
     image_bytes,
     service_with_local_store,
@@ -150,3 +154,39 @@ def test_iter_content_yields_verified_bytes_in_requested_chunks(tmp_path):
     assert b"".join(service.iter_content(record.artifact_id, chunk_size=17)) == artifact_path(
         tmp_path, record.storage_key
     ).read_bytes()
+
+
+def test_upload_discards_stage_when_staged_content_cannot_be_read(tmp_path):
+    class ReadFailingStore(LocalArtifactStore):
+        def open_staged(self, staged):
+            raise ArtifactStorageUnavailableError("staged read failed")
+
+    service = ArtifactService(InMemoryArtifactRepository(), ReadFailingStore(tmp_path / "artifacts"))
+
+    with pytest.raises(ArtifactStorageUnavailableError, match="staged read failed"):
+        service.upload(
+            BytesIO(image_bytes("JPEG")),
+            original_filename="bridge.jpg",
+            claimed_content_type="image/jpeg",
+        )
+
+    assert list((tmp_path / "artifacts" / ".staging").glob("*")) == []
+
+
+def test_upload_discards_stage_when_finalization_fails_before_move(tmp_path):
+    class FinalizeFailingStore(LocalArtifactStore):
+        def finalize(self, staged, artifact_id, extension):
+            raise ArtifactStorageUnavailableError("finalization failed")
+
+    service = ArtifactService(
+        InMemoryArtifactRepository(), FinalizeFailingStore(tmp_path / "artifacts")
+    )
+
+    with pytest.raises(ArtifactStorageUnavailableError, match="finalization failed"):
+        service.upload(
+            BytesIO(image_bytes("JPEG")),
+            original_filename="bridge.jpg",
+            claimed_content_type="image/jpeg",
+        )
+
+    assert list((tmp_path / "artifacts" / ".staging").glob("*")) == []
