@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from agent.model_profile import default_model_profile
+from backend.app.repositories.postgres.connection import (
+    get_database_url,
+    probe_database,
+)
 
 
 def build_health_payload(
@@ -27,6 +31,7 @@ def build_health_payload(
 
 def build_local_health_payload(
     environ: Mapping[str, str] | None = None,
+    database_probe: Callable[[str], bool] = probe_database,
 ) -> dict[str, object]:
     """Build the local API health payload from runtime configuration."""
 
@@ -36,7 +41,7 @@ def build_local_health_payload(
         version=source.get("BRIDGEAI_API_VERSION", "0.2.0"),
         environment=source.get("BRIDGEAI_ENV", "local_dev"),
         components={
-            "database": _configured(source, "BRIDGEAI_DATABASE_URL"),
+            "database": _database_status(source, database_probe),
             "model_gateway": _model_gateway_status(source),
             "tool_registry": "ready",
             "workflow": "ready",
@@ -44,10 +49,16 @@ def build_local_health_payload(
     )
 
 
-def _configured(source: Mapping[str, str], *names: str) -> str:
-    if all(source.get(name, "").strip() for name in names):
-        return "configured"
-    return "not_configured"
+def _database_status(
+    source: Mapping[str, str],
+    database_probe: Callable[[str], bool],
+) -> str:
+    database_url = get_database_url(source)
+    if not database_url:
+        return "not_configured"
+    if database_probe(database_url):
+        return "ready"
+    return "unavailable"
 
 
 def _model_gateway_status(source: Mapping[str, str]) -> str:

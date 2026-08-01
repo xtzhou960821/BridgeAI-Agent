@@ -18,7 +18,7 @@ def test_health_payload_reports_service_version_environment_and_components():
     }
 
 
-def test_local_health_marks_database_and_model_gateway_configured_from_environment():
+def test_local_health_marks_database_ready_and_model_gateway_configured():
     payload = build_local_health_payload(
         {
             "BRIDGEAI_ENV": "local_dev",
@@ -27,10 +27,11 @@ def test_local_health_marks_database_and_model_gateway_configured_from_environme
             "BRIDGEAI_AGENT_API_BASE_URL": "https://omlx.cpolar.cn/v1",
             "BRIDGEAI_AGENT_API_KEY": "secret-token",
         },
+        database_probe=lambda _url: True,
     )
 
     assert payload["components"] == {
-        "database": "configured",
+        "database": "ready",
         "model_gateway": "configured",
         "tool_registry": "ready",
         "workflow": "ready",
@@ -38,7 +39,7 @@ def test_local_health_marks_database_and_model_gateway_configured_from_environme
 
 
 def test_local_health_keeps_database_and_model_gateway_not_configured_when_missing():
-    payload = build_local_health_payload({})
+    payload = build_local_health_payload({}, database_probe=lambda _url: True)
 
     assert payload["components"] == {
         "database": "not_configured",
@@ -49,6 +50,18 @@ def test_local_health_keeps_database_and_model_gateway_not_configured_when_missi
 
 
 def test_local_health_marks_stub_model_gateway_configured_without_api_key():
-    payload = build_local_health_payload({"BRIDGEAI_AGENT_MODEL_IS_STUB": "true"})
+    payload = build_local_health_payload(
+        {"BRIDGEAI_AGENT_MODEL_IS_STUB": "true"},
+        database_probe=lambda _url: True,
+    )
 
     assert payload["components"]["model_gateway"] == "configured"
+
+
+def test_local_health_marks_configured_but_unreachable_database_unavailable():
+    payload = build_local_health_payload(
+        {"BRIDGEAI_DATABASE_URL": "postgresql://db/bridgeai"},
+        database_probe=lambda _url: False,
+    )
+
+    assert payload["components"]["database"] == "unavailable"

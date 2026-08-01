@@ -12,6 +12,7 @@ dependencies = []
 [project.optional-dependencies]
 backend = [
   "fastapi>=0.115",
+  "psycopg[binary]>=3.2",
   "uvicorn[standard]>=0.30",
 ]
 dev = [
@@ -23,6 +24,9 @@ dev = [
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+  "postgres: requires the guarded bridgeai_agent_test PostgreSQL database",
+]
 
 [tool.setuptools.packages.find]
 include = ["agent*", "backend*", "tools*"]

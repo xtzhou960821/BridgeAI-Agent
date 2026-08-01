@@ -12,6 +12,14 @@ class _BlockFastAPIImport:
 
 
 def test_main_app_fails_fast_when_fastapi_is_not_installed():
+    importlib.import_module("backend.app.main")
+    backend_package = importlib.import_module("backend.app")
+    api_package = importlib.import_module("backend.app.api.v1")
+    cached_parent_attributes = {
+        (backend_package, "main"): backend_package.main,
+        (api_package, "health"): api_package.health,
+        (api_package, "tasks"): api_package.tasks,
+    }
     module_names = [
         name
         for name in sys.modules
@@ -35,3 +43,9 @@ def test_main_app_fails_fast_when_fastapi_is_not_installed():
         for name in module_names:
             sys.modules.pop(name, None)
         sys.modules.update(cached_modules)
+        for (parent_module, attribute), value in cached_parent_attributes.items():
+            setattr(parent_module, attribute, value)
+
+    assert backend_package.main is sys.modules["backend.app.main"]
+    assert api_package.health is sys.modules["backend.app.api.v1.health"]
+    assert api_package.tasks is sys.modules["backend.app.api.v1.tasks"]

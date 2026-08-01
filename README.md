@@ -43,26 +43,35 @@ BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭�
 
 ## 开发状态
 
-当前已进入 V0.2 工程骨架开发阶段。第一轮骨架包含：
+当前已进入 V0.2 可运行工作台阶段，已完成：
 
 - Tool SDK：Tool Manifest、注册表、执行器和必填输入校验；
 - Workflow：任务状态创建、推进、失败和恢复；
 - Agent Runner：桥梁巡检示例任务的最小单 Agent 调用循环，并在任务理解阶段通过 Model Gateway 调用当前 Agent 模型；
-- Backend：Health payload 与可选 FastAPI 入口；
-- Backend API：`POST /api/v1/tasks/runs` 可执行 V0.2 示例巡检任务；
-- Frontend：Vue + TypeScript 工作台已接入健康检查和示例任务执行结果；
-- Data：PostgreSQL 迁移占位和样例任务。
+- Backend：FastAPI 健康检查、任务创建、列表、详情、执行和历史接口；
+- Backend API：保留 `POST /api/v1/tasks/runs` 兼容接口，并将其纳入持久化执行链路；
+- Frontend：Vue + TypeScript 工作台支持创建任务、重复执行和切换历史快照；
+- Data：PostgreSQL 保存任务主记录，以及每次执行的模型、Workflow 和 Tool JSONB 快照。
 
 本地验证：
 
 ```bash
-python -m pytest -v
+BRIDGEAI_TEST_DATABASE_URL="$BRIDGEAI_TEST_DATABASE_URL" ./.venv/bin/python -m pytest -q
+npm test --prefix frontend
+npm run build --prefix frontend
 ```
 
-本地启动后端时建议使用：
+`BRIDGEAI_TEST_DATABASE_URL` 必须明确指向数据库 `bridgeai_agent_test`；测试保护会拒绝其他数据库名。
+
+本地首次启动前先显式应用迁移；后端不会在启动时自动修改数据库结构：
 
 ```bash
-python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
+set -a
+source .env
+set +a
+./.venv/bin/python -m backend.app.repositories.postgres.migrate
+./.venv/bin/python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
+npm run dev --prefix frontend -- --host 127.0.0.1 --port 5173
 ```
 
 详细说明见 `docs/development/v0.2-local-runbook.md`。
@@ -76,6 +85,6 @@ python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 - 建立样例项目、演示数据、评测集和部署 Runbook；
 - 根据实际研发进展修订 V1.1、V1.2 和 V2.0 规划。
 
-当前 `agent/`、`backend/`、`frontend/`、`tools/` 和 `examples/` 已开始承载 V0.2 工程骨架，后续将继续补齐真实后端 API、前端联调、Tool SDK 接入、Agent/Workflow 持久化和本地部署能力。
+当前 `agent/`、`backend/`、`frontend/`、`tools/` 和 `examples/` 已承载 V0.2 可运行工程。后续将继续补齐 Artifact 对象存储、异步执行、病害复核、报告闭环和部署能力。
 
 当前 Agent 默认模型配置为 oMLX 的 `DeepSeek-V4-Flash-4bit`，API base URL 为 `https://omlx.cpolar.cn/v1`。当前 V0.2 已在任务理解阶段通过 OpenAI-compatible Model Gateway 调用该模型，并随 Workflow 返回模型理解结果、模型 Profile 和 usage。
