@@ -1,7 +1,7 @@
 # BridgeAI-Agent LangGraph PostgreSQL Runtime Design
 
 **Date:** 2026-08-01
-**Status:** Confirmed design, pending written-spec review
+**Status:** Approved for implementation
 **Target:** First executable LangGraph slice after V0.2 PostgreSQL task history
 
 ## 1. Goal
