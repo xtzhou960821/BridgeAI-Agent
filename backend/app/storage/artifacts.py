@@ -68,6 +68,9 @@ class LocalArtifactStore:
         except OSError as error:
             self._unlink_stage(stage_path)
             raise ArtifactStorageUnavailableError("Artifact storage is unavailable") from error
+        except Exception:
+            self._unlink_stage(stage_path)
+            raise
 
         return StagedArtifact(
             staging_key=staging_key,

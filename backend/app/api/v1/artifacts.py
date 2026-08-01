@@ -6,6 +6,8 @@ from collections.abc import Callable
 from typing import NoReturn, TypeVar
 
 from backend.app.domain.artifact_errors import (
+    ArtifactContentMissingError,
+    ArtifactIntegrityMismatchError,
     ArtifactNotFoundError,
     ArtifactStorageUnavailableError,
     ArtifactTooLargeError,
@@ -37,6 +39,16 @@ ERROR_RESPONSES = {
     ArtifactTooLargeError: (413, "ARTIFACT_TOO_LARGE", "图片不得超过 20 MiB。"),
     InvalidImageArtifactError: (422, "INVALID_IMAGE_ARTIFACT", "文件不是有效图片或已损坏。"),
     ArtifactNotFoundError: (404, "ARTIFACT_NOT_FOUND", "未找到指定 Artifact。"),
+    ArtifactContentMissingError: (
+        410,
+        "ARTIFACT_CONTENT_MISSING",
+        "Artifact 内容已缺失，请重新上传图片。",
+    ),
+    ArtifactIntegrityMismatchError: (
+        409,
+        "ARTIFACT_INTEGRITY_MISMATCH",
+        "Artifact 内容完整性校验失败，请重新上传图片。",
+    ),
     ArtifactStorageUnavailableError: (
         503,
         "ARTIFACT_STORAGE_UNAVAILABLE",

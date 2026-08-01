@@ -20,7 +20,12 @@ from backend.app.domain.artifact_errors import (
 from backend.app.domain.artifacts import ArtifactRecord
 from backend.app.domain.task_errors import DatabaseUnavailableError
 from backend.app.main import create_app
-from tests.backend.artifact_test_support import image_bytes, service_with_local_store
+from tests.backend.artifact_test_support import (
+    artifact_path,
+    image_bytes,
+    service_with_local_store,
+    upload_jpeg,
+)
 
 
 def test_upload_metadata_and_content_routes(monkeypatch):
@@ -80,6 +85,58 @@ def test_upload_route_uses_real_service_for_multipart_image(monkeypatch, tmp_pat
     assert payload["content_url"] == f"/api/v1/artifacts/{payload['artifact_id']}/content"
     assert "storage_key" not in payload
     assert str(tmp_path) not in response.text
+
+
+def test_content_route_returns_gone_when_real_stored_content_is_missing(
+    monkeypatch,
+    tmp_path,
+):
+    from backend.app.api.v1 import artifacts
+
+    service, _repository = service_with_local_store(tmp_path)
+    record = upload_jpeg(service)
+    artifact_path(tmp_path, record.storage_key).unlink()
+    monkeypatch.setattr(
+        artifacts,
+        "build_artifact_service_from_environment",
+        lambda: service,
+    )
+
+    response = TestClient(create_app(), raise_server_exceptions=False).get(
+        f"/api/v1/artifacts/{record.artifact_id}/content"
+    )
+
+    assert response.status_code == 410
+    assert response.json()["detail"] == {
+        "code": "ARTIFACT_CONTENT_MISSING",
+        "message": "Artifact 内容已缺失，请重新上传图片。",
+    }
+
+
+def test_content_route_returns_conflict_when_real_stored_content_is_tampered(
+    monkeypatch,
+    tmp_path,
+):
+    from backend.app.api.v1 import artifacts
+
+    service, _repository = service_with_local_store(tmp_path)
+    record = upload_jpeg(service)
+    artifact_path(tmp_path, record.storage_key).write_bytes(b"tampered")
+    monkeypatch.setattr(
+        artifacts,
+        "build_artifact_service_from_environment",
+        lambda: service,
+    )
+
+    response = TestClient(create_app(), raise_server_exceptions=False).get(
+        f"/api/v1/artifacts/{record.artifact_id}/content"
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "ARTIFACT_INTEGRITY_MISMATCH",
+        "message": "Artifact 内容完整性校验失败，请重新上传图片。",
+    }
 
 
 @pytest.mark.parametrize(

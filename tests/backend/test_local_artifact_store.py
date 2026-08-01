@@ -35,6 +35,28 @@ def test_local_store_rejects_oversized_stream_and_removes_stage(tmp_path):
     assert list((tmp_path / "artifacts" / ".staging").glob("*")) == []
 
 
+def test_local_store_removes_stage_and_reraises_unexpected_source_read_error(tmp_path):
+    class FailingSource:
+        def __init__(self, error):
+            self.error = error
+            self.read_count = 0
+
+        def read(self, _size):
+            self.read_count += 1
+            if self.read_count == 1:
+                return b"partial-content"
+            raise self.error
+
+    store = LocalArtifactStore(tmp_path / "artifacts")
+    source_error = RuntimeError("source stream failed")
+
+    with pytest.raises(RuntimeError, match="source stream failed") as caught:
+        store.stage(FailingSource(source_error), max_bytes=20 * 1024 * 1024)
+
+    assert caught.value is source_error
+    assert list((tmp_path / "artifacts" / ".staging").glob("*")) == []
+
+
 def test_local_store_rejects_path_traversal_without_touching_outside_file(tmp_path):
     root = tmp_path / "artifacts"
     outside = tmp_path / "escape"

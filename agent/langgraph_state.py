@@ -75,6 +75,7 @@ _SENSITIVE_ASSIGNMENT = re.compile(
     flags=re.IGNORECASE,
 )
 _ARTIFACT_ID = re.compile(r"art_[A-Za-z0-9_-]+\Z")
+_LEGACY_ARTIFACT_REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SEMANTIC_VERSION = re.compile(
     r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?\Z"
@@ -484,9 +485,21 @@ def _artifact_ids(artifact_ids: list[str]) -> list[str]:
     if not isinstance(normalized, list) or not all(isinstance(item, str) for item in normalized):
         raise StateSerializationError("Unsupported checkpoint value at artifact_ids: expected strings")
     return [
-        artifact_id_payload(item, path=f"artifact_ids[{index}]")
+        _task_artifact_reference_payload(item, path=f"artifact_ids[{index}]")
         for index, item in enumerate(normalized)
     ]
+
+
+def _task_artifact_reference_payload(value: object, *, path: str) -> str:
+    text = _required_payload_string(value, path)
+    if text.startswith("art_"):
+        return artifact_id_payload(text, path=path)
+    return _format_string_payload(
+        text,
+        path=path,
+        pattern=_LEGACY_ARTIFACT_REFERENCE,
+        expected="bounded path-free legacy Artifact reference",
+    )
 
 
 def _required_string(value: str, path: str) -> str:

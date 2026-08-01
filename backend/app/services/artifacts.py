@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from typing import BinaryIO
 import uuid
+import warnings
 
 from PIL import Image, UnidentifiedImageError
 
@@ -170,14 +171,30 @@ def _decode_image(content: bytes) -> tuple[str, int, int]:
     """Verify and fully load image content before returning its decoded shape."""
 
     try:
-        with Image.open(BytesIO(content)) as image:
-            image.verify()
-        with Image.open(BytesIO(content)) as image:
-            image.load()
-            if image.format is None:
-                raise _InvalidImageData("Image has no decoded format")
-            return image.format, image.width, image.height
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(content)) as image:
+                _reject_multiframe_image(image)
+                image.verify()
+            with Image.open(BytesIO(content)) as image:
+                _reject_multiframe_image(image)
+                image.load()
+                if image.format is None:
+                    raise _InvalidImageData("Image has no decoded format")
+                return image.format, image.width, image.height
     except _InvalidImageData:
         raise
-    except (Image.DecompressionBombError, OSError, SyntaxError, UnidentifiedImageError, ValueError) as error:
+    except (
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        OSError,
+        SyntaxError,
+        UnidentifiedImageError,
+        ValueError,
+    ) as error:
         raise _InvalidImageData("Image decoding failed") from error
+
+
+def _reject_multiframe_image(image: Image.Image) -> None:
+    if bool(getattr(image, "is_animated", False)) or getattr(image, "n_frames", 1) != 1:
+        raise _UnsupportedImageData("Animated or multi-frame images are unsupported")

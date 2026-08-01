@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
 
 from agent.model_gateway import ModelGatewayConfigurationError
 from backend.app.domain.artifact_errors import (
@@ -18,6 +19,7 @@ from backend.app.domain.task_errors import (
 from backend.app.domain.tasks import TaskCreate
 from backend.app.repositories.postgres.migrate import apply_migrations
 from backend.app.repositories.postgres.tasks import PostgresTaskRepository
+from backend.app.services.task_runs import run_inspection_task
 from backend.app.services.tasks import TaskService
 from tests.backend.postgres_test_support import (
     require_test_database_url,
@@ -152,6 +154,46 @@ def test_persisted_legacy_task_bypasses_artifact_validation_and_persists_run_fai
 
     assert run.status == "failed"
     assert repository.list_runs("task_legacy") == [run]
+
+
+@pytest.mark.postgres
+def test_persisted_numeric_legacy_reference_reaches_data_check_and_persists_not_found(
+    repository,
+):
+    command = TaskCreate(
+        title="历史桥梁巡检",
+        task_type="bridge_inspection",
+        objective="检查历史影像",
+        artifact_ids=["1000"],
+    )
+    repository.create_task("task_legacy_1000", command, None)
+
+    def run_legacy_inspection(run_id, payload):
+        return run_inspection_task(
+            run_id,
+            payload,
+            model_gateway=_LegacyModelGateway(),
+            checkpointer=InMemorySaver(),
+            artifact_service=_MissingLegacyArtifactService(),
+        )
+
+    def unexpected_create_time_validation(_artifact_id):
+        raise AssertionError("persisted legacy tasks must bypass create-time validation")
+
+    service = TaskService(
+        repository,
+        run_inspection=run_legacy_inspection,
+        require_ready_artifact=unexpected_create_time_validation,
+    )
+
+    run = service.execute_legacy_task("task_legacy_1000", command)
+
+    assert run.status == "failed"
+    assert run.error_message == "Artifact 1000 does not exist"
+    assert run.workflow["error_step"] == "data_check"
+    assert run.workflow["error_code"] == "ARTIFACT_NOT_FOUND"
+    assert run.tool_results == []
+    assert repository.list_runs("task_legacy_1000") == [run]
 
 
 @pytest.mark.postgres
@@ -394,6 +436,34 @@ def _artifact_record() -> ArtifactRecord:
 
 def _ready_artifact(_artifact_id: str) -> ArtifactRecord:
     return _artifact_record()
+
+
+class _LegacyModelGateway:
+    def understand_task(self, request):
+        return _LegacyModelResult(
+            {
+                "ok": True,
+                "model_id": "test-model",
+                "provider": "test",
+                "runtime": "in-process",
+                "content": f"任务理解完成：{request.objective}",
+                "usage": {"total_tokens": 1},
+                "error_message": None,
+            }
+        )
+
+
+class _LegacyModelResult:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def as_payload(self):
+        return self._payload
+
+
+class _MissingLegacyArtifactService:
+    def verify(self, artifact_id):
+        raise ArtifactNotFoundError(f"Artifact {artifact_id} does not exist")
 
 
 def _successful_run(_run_id, payload):

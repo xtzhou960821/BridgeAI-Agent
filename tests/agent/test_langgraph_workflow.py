@@ -4,6 +4,8 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from agent.langgraph_state import (
     StateSerializationError,
+    artifact_verifier_payload,
+    image_quality_output_payload,
     initial_bridge_inspection_state,
     normalize_checkpoint_value,
 )
@@ -98,9 +100,13 @@ def test_initial_state_contains_only_serializer_safe_values():
     [
         "/private/tmp/sensitive-bridge.jpg",
         "redis://artifact-user:artifact-pass@cache.example/0",
+        "art_",
+        "x" * 129,
     ],
 )
-def test_initial_state_rejects_path_or_uri_artifact_ids(unsafe_artifact_id):
+def test_initial_state_rejects_unsafe_or_unbounded_artifact_references(
+    unsafe_artifact_id,
+):
     with pytest.raises(StateSerializationError, match=r"artifact_ids\[0\]"):
         initial_bridge_inspection_state(
             task_id="task_001",
@@ -110,6 +116,54 @@ def test_initial_state_rejects_path_or_uri_artifact_ids(unsafe_artifact_id):
             artifact_ids=[unsafe_artifact_id],
             agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
         )
+
+
+def test_graph_routes_bounded_safe_legacy_reference_to_data_check_failure():
+    verified_ids = []
+    graph = build_bridge_inspection_graph(
+        model_gateway=_FakeModelGateway(),
+        artifact_verifier=lambda artifact_id: verified_ids.append(artifact_id)
+        or {
+            "ok": False,
+            "error_code": "ARTIFACT_NOT_FOUND",
+            "error_message": "Artifact does not exist",
+        },
+        tool_executor=ToolExecutor(_registry(required=["artifact_id"])),
+        checkpointer=InMemorySaver(),
+    )
+
+    result = graph.invoke(
+        initial_bridge_inspection_state(
+            task_id="task_legacy",
+            run_id="run_legacy_reference",
+            task_type="bridge_inspection",
+            objective="检查历史桥梁影像",
+            artifact_ids=["1000"],
+            agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+        ),
+        config={"configurable": {"thread_id": "run_legacy_reference"}},
+    )
+
+    assert verified_ids == ["1000"]
+    assert result["status"] == "failed"
+    assert result["error_step"] == "data_check"
+    assert result["error_code"] == "ARTIFACT_NOT_FOUND"
+    assert result["tool_results"] == []
+
+
+def test_verified_artifact_records_still_require_generated_artifact_ids():
+    with pytest.raises(
+        StateSerializationError,
+        match="data_check_result.artifact.artifact_id",
+    ):
+        artifact_verifier_payload(
+            {"ok": True, "artifact": {"artifact_id": "1000"}},
+        )
+
+
+def test_tool_outputs_still_require_generated_artifact_ids():
+    with pytest.raises(StateSerializationError, match="tool_result.output.artifact_id"):
+        image_quality_output_payload({"artifact_id": "1000"})
 
 
 def test_graph_routes_failed_artifact_verification_without_running_tool():

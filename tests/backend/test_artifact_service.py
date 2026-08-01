@@ -4,6 +4,7 @@ from dataclasses import replace
 from io import BytesIO
 
 import pytest
+from PIL import Image
 
 from backend.app.domain.artifact_errors import (
     ArtifactContentMissingError,
@@ -84,6 +85,41 @@ def test_upload_rejects_a_decoded_but_unsupported_gif(tmp_path):
         )
 
     assert error.value.code == "UNSUPPORTED_ARTIFACT_TYPE"
+    assert list((tmp_path / "artifacts" / ".staging").glob("*")) == []
+
+
+def test_upload_rejects_animated_png_and_discards_the_stage(tmp_path):
+    service, repository = service_with_local_store(tmp_path)
+
+    with pytest.raises(UnsupportedArtifactTypeError) as error:
+        service.upload(
+            BytesIO(_animated_png_bytes()),
+            original_filename="bridge-animation.png",
+            claimed_content_type="image/png",
+        )
+
+    assert error.value.code == "UNSUPPORTED_ARTIFACT_TYPE"
+    assert repository.records == {}
+    assert list((tmp_path / "artifacts" / ".staging").glob("*")) == []
+
+
+def test_upload_rejects_decompression_bomb_warning_and_discards_the_stage(
+    monkeypatch,
+    tmp_path,
+):
+    content = image_bytes("PNG", size=(20, 20))
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 300)
+    service, repository = service_with_local_store(tmp_path)
+
+    with pytest.raises(InvalidImageArtifactError) as error:
+        service.upload(
+            BytesIO(content),
+            original_filename="oversized-dimensions.png",
+            claimed_content_type="image/png",
+        )
+
+    assert error.value.code == "INVALID_IMAGE_ARTIFACT"
+    assert repository.records == {}
     assert list((tmp_path / "artifacts" / ".staging").glob("*")) == []
 
 
@@ -190,3 +226,18 @@ def test_upload_discards_stage_when_finalization_fails_before_move(tmp_path):
         )
 
     assert list((tmp_path / "artifacts" / ".staging").glob("*")) == []
+
+
+def _animated_png_bytes() -> bytes:
+    stream = BytesIO()
+    first = Image.new("RGB", (16, 16), color="red")
+    second = Image.new("RGB", (16, 16), color="blue")
+    first.save(
+        stream,
+        format="PNG",
+        save_all=True,
+        append_images=[second],
+        duration=100,
+        loop=0,
+    )
+    return stream.getvalue()
