@@ -110,6 +110,7 @@ def test_migrations_apply_in_order_and_are_repeatable():
         "uq_inspection_artifacts_storage_key",
         "ck_inspection_artifacts_original_filename_nonblank",
         "ck_inspection_artifacts_storage_key_nonblank",
+        "ck_inspection_artifacts_storage_key_relative",
         "ck_inspection_artifacts_sha256",
         "ck_inspection_artifacts_size_bytes",
         "ck_inspection_artifacts_mime_type",

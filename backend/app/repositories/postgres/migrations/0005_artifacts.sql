@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS inspection_artifacts (
     CONSTRAINT ck_inspection_artifacts_storage_key_nonblank CHECK (
         btrim(storage_key) <> ''
     ),
+    CONSTRAINT ck_inspection_artifacts_storage_key_relative CHECK (
+        storage_key !~ '(^/|(^|/)[.][.](/|$))'
+    ),
     CONSTRAINT ck_inspection_artifacts_sha256 CHECK (
         sha256 ~ '^[0-9a-f]{64}$'
     ),

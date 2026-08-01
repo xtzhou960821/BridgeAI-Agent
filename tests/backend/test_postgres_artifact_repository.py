@@ -6,6 +6,7 @@ import pytest
 
 from backend.app.domain.artifact_errors import ArtifactNotFoundError
 from backend.app.domain.artifacts import ArtifactRecord
+from backend.app.domain.task_errors import DatabaseUnavailableError
 from backend.app.repositories.postgres.artifacts import PostgresArtifactRepository
 from backend.app.repositories.postgres.migrate import apply_migrations
 from tests.backend.postgres_test_support import (
@@ -62,6 +63,20 @@ def test_repository_reports_missing_artifact(repository):
         repository.get_artifact("art_missing")
 
     assert error.value.code == "ARTIFACT_NOT_FOUND"
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    "storage_key",
+    [
+        "/absolute/path.jpg",
+        "../outside.jpg",
+        "ab/../../outside.jpg",
+    ],
+)
+def test_repository_rejects_unsafe_storage_key(repository, storage_key):
+    with pytest.raises(DatabaseUnavailableError):
+        repository.create_artifact(artifact_record(storage_key=storage_key))
 
 
 def test_artifact_payloads_exclude_storage_key():
