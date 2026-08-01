@@ -4,6 +4,7 @@ import pytest
 
 from agent.model_gateway import ModelGatewayConfigurationError
 from backend.app.domain.task_errors import (
+    LangGraphCheckpointerNotReadyError,
     TaskExecutionError,
     TaskInputConflictError,
 )
@@ -54,9 +55,9 @@ def test_service_executes_saved_task_and_completes_run(repository):
     )
     calls = []
 
-    def run_inspection(payload):
-        calls.append(payload)
-        return _successful_run(payload)
+    def run_inspection(run_id, payload):
+        calls.append((run_id, payload))
+        return _successful_run(run_id, payload)
 
     service = TaskService(repository, run_inspection=run_inspection)
 
@@ -65,14 +66,15 @@ def test_service_executes_saved_task_and_completes_run(repository):
     assert run.status == "completed"
     assert run.run_number == 1
     assert run.agent_model["model_id"] == "DeepSeek-V4-Flash-4bit"
-    assert calls == [
-        {
+    assert calls[0][0] == run.run_id
+    assert calls[0][1] == {
             "task_id": "task_001",
             "task_type": "bridge_inspection",
             "objective": "检查影像",
             "artifact_ids": ["art_001"],
-        },
-    ]
+        }
+    assert run.workflow_runtime == "langgraph"
+    assert run.checkpoint_thread_id == run.run_id
     assert repository.list_runs(task.task_id) == [run]
     assert repository.get_task(task.task_id).status == "completed"
 
@@ -81,7 +83,7 @@ def test_service_executes_saved_task_and_completes_run(repository):
 def test_service_persists_failed_run_before_raising(repository):
     repository.create_task("task_001", _task_command(), None)
 
-    def fail(_payload):
+    def fail(_run_id, _payload):
         raise RuntimeError("gateway timeout")
 
     service = TaskService(repository, run_inspection=fail)
@@ -102,7 +104,7 @@ def test_service_persists_model_configuration_failure_and_preserves_error_type(
 ):
     repository.create_task("task_001", _task_command(), None)
 
-    def fail(_payload):
+    def fail(_run_id, _payload):
         raise ModelGatewayConfigurationError("API key is required")
 
     service = TaskService(repository, run_inspection=fail)
@@ -137,6 +139,41 @@ def test_legacy_execution_reuses_matching_task_and_rejects_input_conflict(reposi
         )
 
 
+@pytest.mark.postgres
+def test_service_persists_graph_terminal_tool_failure_without_raising(repository):
+    repository.create_task("task_001", _task_command(), None)
+
+    def graph_failure(run_id, payload):
+        return _failed_graph_run(run_id, payload)
+
+    run = TaskService(repository, run_inspection=graph_failure).execute_task("task_001")
+
+    assert run.status == "failed"
+    assert run.error_message == "inspection failed"
+    assert run.agent_model["model_id"] == "DeepSeek-V4-Flash-4bit"
+    assert run.workflow["current_step"] == "failed"
+    assert run.tool_results[0]["error_message"] == "inspection failed"
+    assert repository.get_task("task_001").status == "failed"
+
+
+@pytest.mark.postgres
+def test_service_persists_checkpointer_failure_and_preserves_error_type(repository):
+    repository.create_task("task_001", _task_command(), None)
+
+    def unavailable(run_id, _payload):
+        raise LangGraphCheckpointerNotReadyError(run_id, "checkpoint tables missing")
+
+    service = TaskService(repository, run_inspection=unavailable)
+
+    with pytest.raises(LangGraphCheckpointerNotReadyError) as error:
+        service.execute_task("task_001")
+
+    saved = repository.list_runs("task_001")[0]
+    assert saved.run_id == error.value.run_id
+    assert saved.status == "failed"
+    assert saved.checkpoint_thread_id == saved.run_id
+
+
 def _task_command() -> TaskCreate:
     return TaskCreate(
         title="检查影像",
@@ -146,7 +183,7 @@ def _task_command() -> TaskCreate:
     )
 
 
-def _successful_run(payload):
+def _successful_run(_run_id, payload):
     return {
         "task_id": payload["task_id"],
         "status": "completed",
@@ -181,3 +218,30 @@ def _successful_run(payload):
             },
         ],
     }
+
+
+def _failed_graph_run(run_id, payload):
+    result = _successful_run(run_id, payload)
+    result["status"] = "failed"
+    result["workflow"] = {
+        "task_id": payload["task_id"],
+        "status": "failed",
+        "current_step": "failed",
+        "history": [
+            {"step_name": "image_quality_check", "output": {"tool_id": "image_quality_check"}},
+            {"step_name": "failed", "output": {"tool_id": "image_quality_check"}},
+        ],
+        "error_step": "image_quality_check",
+        "error_message": "inspection failed",
+    }
+    result["tool_results"] = [
+        {
+            "tool_id": "image_quality_check",
+            "version": "0.1.0",
+            "ok": False,
+            "output": None,
+            "error_code": "TOOL_EXECUTION_FAILED",
+            "error_message": "inspection failed",
+        },
+    ]
+    return result

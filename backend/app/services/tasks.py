@@ -5,10 +5,12 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Callable, Mapping
+from functools import partial
 
 from agent.model_gateway import ModelGatewayConfigurationError
 from backend.app.domain.task_errors import (
     DatabaseUnavailableError,
+    LangGraphCheckpointerNotReadyError,
     TaskExecutionError,
     TaskInputConflictError,
     TaskNotFoundError,
@@ -24,7 +26,7 @@ from backend.app.repositories.postgres.tasks import PostgresTaskRepository
 from backend.app.services.task_runs import run_inspection_task
 
 
-RunInspection = Callable[[dict[str, object]], dict[str, object]]
+RunInspection = Callable[[str, dict[str, object]], dict[str, object]]
 
 
 class TaskService:
@@ -60,7 +62,13 @@ class TaskService:
 
     def execute_task(self, task_id: str) -> TaskRunRecord:
         task = self._repository.get_task(task_id)
-        started = self._repository.start_run(task_id, _new_id("run"))
+        run_id = _new_id("run")
+        started = self._repository.start_run(
+            task_id,
+            run_id,
+            workflow_runtime="langgraph",
+            checkpoint_thread_id=run_id,
+        )
         payload: dict[str, object] = {
             "task_id": task.task_id,
             "task_type": task.task_type,
@@ -68,14 +76,36 @@ class TaskService:
             "artifact_ids": task.artifact_ids,
         }
         try:
-            result = self._run_inspection(payload)
-            return self._repository.complete_run(
+            result = self._run_inspection(run_id, payload)
+            agent_model = dict(result["agent_model"])
+            workflow = dict(result["workflow"])
+            tool_results = [dict(item) for item in result["tool_results"]]
+            if result["status"] == "completed":
+                return self._repository.complete_run(
+                    started.run_id,
+                    agent_model,
+                    workflow,
+                    tool_results,
+                )
+            if result["status"] == "failed":
+                return self._repository.fail_run(
+                    started.run_id,
+                    _graph_failure_message(workflow, tool_results),
+                    agent_model=agent_model,
+                    workflow=workflow,
+                    tool_results=tool_results,
+                )
+            raise TaskExecutionError(
                 started.run_id,
-                dict(result["agent_model"]),
-                dict(result["workflow"]),
-                [dict(item) for item in result["tool_results"]],
+                f"Unsupported graph terminal status: {result['status']}",
             )
+        except LangGraphCheckpointerNotReadyError as exc:
+            self._repository.fail_run(started.run_id, _sanitize_error(exc))
+            raise
         except ModelGatewayConfigurationError as exc:
+            self._repository.fail_run(started.run_id, _sanitize_error(exc))
+            raise
+        except TaskExecutionError as exc:
             self._repository.fail_run(started.run_id, _sanitize_error(exc))
             raise
         except Exception as exc:
@@ -109,7 +139,7 @@ def build_task_service_from_environment(
         raise DatabaseUnavailableError("PostgreSQL task store is unavailable")
     return TaskService(
         PostgresTaskRepository(database_url),
-        run_inspection=run_inspection_task,
+        run_inspection=partial(run_inspection_task, database_url=database_url),
     )
 
 
@@ -135,3 +165,18 @@ def _sanitize_error(exc: Exception) -> str:
         flags=re.IGNORECASE,
     )
     return message[:500]
+
+
+def _graph_failure_message(
+    workflow: dict[str, object],
+    tool_results: list[dict[str, object]],
+) -> str:
+    workflow_message = workflow.get("error_message")
+    if isinstance(workflow_message, str) and workflow_message.strip():
+        return workflow_message.strip()
+    for tool_result in tool_results:
+        if tool_result.get("ok") is False:
+            tool_message = tool_result.get("error_message")
+            if isinstance(tool_message, str) and tool_message.strip():
+                return tool_message.strip()
+    return "workflow failed"

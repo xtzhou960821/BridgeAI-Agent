@@ -1,7 +1,11 @@
+from langgraph.checkpoint.memory import InMemorySaver
+
+
 def test_run_inspection_task_returns_completed_workflow_and_tool_result():
     from backend.app.services.task_runs import run_inspection_task
 
     result = run_inspection_task(
+        "run_001",
         {
             "task_id": "task_001",
             "task_type": "bridge_inspection",
@@ -9,6 +13,7 @@ def test_run_inspection_task_returns_completed_workflow_and_tool_result():
             "artifact_ids": ["art_001"],
         },
         model_gateway=_FakeModelGateway(),
+        checkpointer=InMemorySaver(),
     )
 
     assert result == {
@@ -47,6 +52,19 @@ def test_run_inspection_task_returns_completed_workflow_and_tool_result():
                 {
                     "step_name": "data_check",
                     "output": {"artifact_id": "art_001"},
+                },
+                {
+                    "step_name": "image_quality_check",
+                    "output": {
+                        "tool_result": {
+                            "tool_id": "image_quality_check",
+                            "version": "0.1.0",
+                            "ok": True,
+                            "output": {"quality_status": "pass", "artifact_id": "art_001"},
+                            "error_code": None,
+                            "error_message": None,
+                        },
+                    },
                 },
                 {
                     "step_name": "completed",
