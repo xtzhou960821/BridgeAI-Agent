@@ -31,6 +31,28 @@ describe('ArtifactUploadField', () => {
     expect(wrapper.emitted('select')).toEqual([[file]])
   })
 
+  it('allows the same file to be selected again after an upload error', async () => {
+    const wrapper = mount(ArtifactUploadField, {
+      props: { artifact: null, busy: false, error: '' },
+    })
+    const file = new File(['jpeg-bytes'], 'bridge.jpg', { type: 'image/jpeg' })
+    const input = wrapper.get('input[type="file"]')
+    Object.defineProperty(input.element, 'files', { configurable: true, value: [file] })
+    Object.defineProperty(input.element, 'value', {
+      configurable: true,
+      value: 'C:\\fakepath\\bridge.jpg',
+      writable: true,
+    })
+
+    await input.trigger('change')
+    await wrapper.setProps({ error: '上传失败，请重试。' })
+
+    expect(input.element).toHaveProperty('value', '')
+
+    await input.trigger('change')
+    expect(wrapper.emitted('select')).toEqual([[file], [file]])
+  })
+
   it('opens the file input when the upload area is clicked', async () => {
     const wrapper = mount(ArtifactUploadField, {
       props: { artifact: null, busy: false, error: '' },

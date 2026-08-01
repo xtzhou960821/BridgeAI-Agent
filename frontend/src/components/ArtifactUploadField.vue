@@ -25,7 +25,9 @@ function selectFirst(files: FileList | File[]) {
 
 function handleInput(event: Event) {
   const target = event.target as HTMLInputElement
-  if (target.files) selectFirst(target.files)
+  const file = target.files?.[0]
+  if (file) emit('select', file)
+  target.value = ''
 }
 
 function handleDrop(event: DragEvent) {
