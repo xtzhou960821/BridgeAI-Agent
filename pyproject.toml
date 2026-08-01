@@ -7,11 +7,14 @@ name = "bridgeai-agent"
 version = "0.2.0"
 description = "Engineering skeleton for BridgeAI-Agent bridge and road inspection AI Agent."
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+  "langgraph>=1.2.9,<1.3",
+]
 
 [project.optional-dependencies]
 backend = [
   "fastapi>=0.115",
+  "langgraph-checkpoint-postgres>=3.1,<3.2",
   "psycopg[binary]>=3.2",
   "uvicorn[standard]>=0.30",
 ]
