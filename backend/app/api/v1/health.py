@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from backend.app.services.health import build_health_payload
+from backend.app.services.health import build_local_health_payload
 
 try:
     from fastapi import APIRouter
@@ -11,16 +11,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised when FastAPI is inst
 
 
 def health_payload() -> dict[str, object]:
-    return build_health_payload(
-        service_name="bridgeai-api",
-        version="0.2.0",
-        environment="local_dev",
-        components={
-            "database": "not_configured",
-            "tool_registry": "ready",
-            "workflow": "ready",
-        },
-    )
+    return build_local_health_payload()
 
 
 if APIRouter is not None:

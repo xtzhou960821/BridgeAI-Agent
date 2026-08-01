@@ -15,6 +15,7 @@ backend = [
   "uvicorn[standard]>=0.30",
 ]
 dev = [
+  "httpx2>=2.9",
   "pytest>=7.4",
 ]
 

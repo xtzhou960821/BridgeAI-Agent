@@ -47,9 +47,10 @@ BridgeAI-Agent 是面向桥梁与道路巡检、病害检测和工程报告闭�
 
 - Tool SDK：Tool Manifest、注册表、执行器和必填输入校验；
 - Workflow：任务状态创建、推进、失败和恢复；
-- Agent Runner：桥梁巡检示例任务的最小单 Agent 调用循环；
+- Agent Runner：桥梁巡检示例任务的最小单 Agent 调用循环，并在任务理解阶段通过 Model Gateway 调用当前 Agent 模型；
 - Backend：Health payload 与可选 FastAPI 入口；
-- Frontend：Vue + TypeScript 工作台占位；
+- Backend API：`POST /api/v1/tasks/runs` 可执行 V0.2 示例巡检任务；
+- Frontend：Vue + TypeScript 工作台已接入健康检查和示例任务执行结果；
 - Data：PostgreSQL 迁移占位和样例任务。
 
 本地验证：
@@ -76,3 +77,5 @@ python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 - 根据实际研发进展修订 V1.1、V1.2 和 V2.0 规划。
 
 当前 `agent/`、`backend/`、`frontend/`、`tools/` 和 `examples/` 已开始承载 V0.2 工程骨架，后续将继续补齐真实后端 API、前端联调、Tool SDK 接入、Agent/Workflow 持久化和本地部署能力。
+
+当前 Agent 默认模型配置为 oMLX 的 `DeepSeek-V4-Flash-4bit`，API base URL 为 `https://omlx.cpolar.cn/v1`。当前 V0.2 已在任务理解阶段通过 OpenAI-compatible Model Gateway 调用该模型，并随 Workflow 返回模型理解结果、模型 Profile 和 usage。
