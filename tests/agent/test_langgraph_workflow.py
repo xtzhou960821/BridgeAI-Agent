@@ -114,7 +114,7 @@ def test_initial_state_rejects_unsafe_or_unbounded_artifact_references(
             task_type="bridge_inspection",
             objective="检查桥梁无人机影像质量",
             artifact_ids=[unsafe_artifact_id],
-            agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+            agent_model={"model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"},
         )
 
 
@@ -139,7 +139,7 @@ def test_graph_routes_bounded_safe_legacy_reference_to_data_check_failure():
             task_type="bridge_inspection",
             objective="检查历史桥梁影像",
             artifact_ids=["1000"],
-            agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+            agent_model={"model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"},
         ),
         config={"configurable": {"thread_id": "run_legacy_reference"}},
     )
@@ -572,7 +572,7 @@ def test_initial_state_redacts_connection_credentials_before_checkpointing():
             "host=db.example user=bridgeai password=dsn-sensitive dbname=bridgeai"
         ),
         artifact_ids=["art_001"],
-        agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+        agent_model={"model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"},
     )
 
     assert state["objective"] == (
@@ -653,7 +653,7 @@ def test_graph_drops_unapproved_tool_fields_and_serializes_with_strict_msgpack()
             objective="检查桥梁无人机影像质量",
             artifact_ids=["art_001"],
             agent_model={
-                "model_id": "DeepSeek-V4-Flash-4bit",
+                "model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX",
                 "api_key": "profile-secret",
                 "metadata": {"binary": b"untrusted"},
             },
@@ -661,7 +661,7 @@ def test_graph_drops_unapproved_tool_fields_and_serializes_with_strict_msgpack()
         config={"configurable": {"thread_id": "run_safe_msgpack"}},
     )
 
-    assert result["agent_model"] == {"model_id": "DeepSeek-V4-Flash-4bit"}
+    assert result["agent_model"] == {"model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"}
     assert "api_key" not in result["model_result"]
     assert result["tool_results"][0]["output"] == {"quality_status": "pass"}
     persisted = repr([item.checkpoint["channel_values"] for item in saver.list(None)])
@@ -713,7 +713,7 @@ def _initial_state(run_id: str):
         task_type="bridge_inspection",
         objective="检查桥梁无人机影像质量",
         artifact_ids=["art_001"],
-        agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+        agent_model={"model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"},
     )
 
 
@@ -776,7 +776,7 @@ class _FakeModelGateway:
     def understand_task(self, request):
         payload = {
             "ok": True,
-            "model_id": "DeepSeek-V4-Flash-4bit",
+            "model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX",
             "provider": "omlx",
             "runtime": "openai-compatible",
             "content": f"任务理解完成：{request.objective}",

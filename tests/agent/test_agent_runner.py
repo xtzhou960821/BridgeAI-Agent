@@ -9,7 +9,7 @@ class _FakeModelGateway:
         return _FakeModelResult(
             {
                 "ok": True,
-                "model_id": "DeepSeek-V4-Flash-4bit",
+                "model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX",
                 "provider": "omlx",
                 "runtime": "openai-compatible",
                 "content": f"任务理解完成：{request.objective}",
@@ -56,7 +56,7 @@ def test_agent_runner_executes_image_quality_tool_for_inspection_task():
 
     assert result.status == "completed"
     assert result.task_id == "task_001"
-    assert result.model_profile.model_id == "DeepSeek-V4-Flash-4bit"
+    assert result.model_profile.model_id == "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"
     assert result.model_profile.is_stub is False
     assert result.tool_results[0].tool_id == "image_quality_check"
     assert result.tool_results[0].ok is True
@@ -70,7 +70,7 @@ def test_agent_runner_executes_image_quality_tool_for_inspection_task():
     assert len(list(saver.list({"configurable": {"thread_id": "run_agent_001"}}))) >= 5
     assert result.workflow.history[0].output["model_result"] == {
         "ok": True,
-        "model_id": "DeepSeek-V4-Flash-4bit",
+        "model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX",
         "provider": "omlx",
         "runtime": "openai-compatible",
         "content": "任务理解完成：检查桥梁无人机影像质量",

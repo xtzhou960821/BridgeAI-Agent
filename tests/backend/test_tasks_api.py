@@ -318,7 +318,7 @@ class _FakeTaskService:
             task_id="task_001",
             run_number=1,
             status="completed",
-            agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+            agent_model={"model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"},
             workflow={"current_step": "completed", "history": []},
             tool_results=[{"tool_id": "image_quality_check", "ok": True}],
             error_message=None,

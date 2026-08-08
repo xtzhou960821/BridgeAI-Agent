@@ -92,7 +92,7 @@ def test_repository_persists_ordered_terminal_runs(repository):
     )
     completed = repository.complete_run(
         "run_001",
-        {"model_id": "DeepSeek-V4-Flash-4bit"},
+        {"model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"},
         {"current_step": "completed", "history": []},
         [{"tool_id": "image_quality_check", "ok": True}],
     )
@@ -105,7 +105,7 @@ def test_repository_persists_ordered_terminal_runs(repository):
     failed = repository.fail_run(
         "run_002",
         "image quality failed",
-        agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+        agent_model={"model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"},
         workflow={
             "status": "failed",
             "current_step": "failed",
@@ -121,7 +121,7 @@ def test_repository_persists_ordered_terminal_runs(repository):
     assert completed.completed_at is not None
     assert failed.status == "failed"
     assert failed.error_message == "image quality failed"
-    assert failed.agent_model["model_id"] == "DeepSeek-V4-Flash-4bit"
+    assert failed.agent_model["model_id"] == "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"
     assert failed.workflow["current_step"] == "failed"
     assert failed.tool_results[0]["ok"] is False
     assert repository.get_task("task_alpha").status == "failed"

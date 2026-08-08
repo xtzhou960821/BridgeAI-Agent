@@ -219,7 +219,7 @@ def test_service_executes_saved_task_and_completes_run(repository):
 
     assert run.status == "completed"
     assert run.run_number == 1
-    assert run.agent_model["model_id"] == "DeepSeek-V4-Flash-4bit"
+    assert run.agent_model["model_id"] == "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"
     assert calls[0][0] == run.run_id
     assert calls[0][1] == {
             "task_id": "task_001",
@@ -359,7 +359,7 @@ def test_service_persists_graph_terminal_tool_failure_without_raising(repository
 
     assert run.status == "failed"
     assert run.error_message == "inspection failed"
-    assert run.agent_model["model_id"] == "DeepSeek-V4-Flash-4bit"
+    assert run.agent_model["model_id"] == "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"
     assert run.workflow["current_step"] == "failed"
     assert run.tool_results[0]["error_message"] == "inspection failed"
     assert repository.get_task("task_001").status == "failed"
@@ -471,12 +471,12 @@ def _successful_run(_run_id, payload):
         "task_id": payload["task_id"],
         "status": "completed",
         "agent_model": {
-            "model_id": "DeepSeek-V4-Flash-4bit",
+            "model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX",
             "model_version": "omlx-current",
-            "alias": "omlx-deepseek-v4-flash",
+            "alias": "omlx-vontra-deepseek-v4-flash",
             "provider": "omlx",
             "runtime": "openai-compatible",
-            "api_base_url": "https://omlx.cpolar.cn/v1",
+            "api_base_url": "http://127.0.0.1:18000/v1",
             "is_stub": False,
         },
         "workflow": {

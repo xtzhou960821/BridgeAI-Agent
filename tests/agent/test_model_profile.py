@@ -5,12 +5,12 @@ def test_default_model_profile_uses_omlx_deepseek_chat_model():
     profile = default_model_profile({})
 
     assert profile.as_payload() == {
-        "model_id": "DeepSeek-V4-Flash-4bit",
+        "model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX",
         "model_version": "omlx-current",
-        "alias": "omlx-deepseek-v4-flash",
+        "alias": "omlx-vontra-deepseek-v4-flash",
         "provider": "omlx",
         "runtime": "openai-compatible",
-        "api_base_url": "https://omlx.cpolar.cn/v1",
+        "api_base_url": "http://127.0.0.1:18000/v1",
         "is_stub": False,
     }
 

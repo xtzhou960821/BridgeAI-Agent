@@ -186,7 +186,7 @@ function run(
     workflow_runtime: 'langgraph',
     checkpoint_thread_id: runId,
     agent_model: {
-      model_id: 'DeepSeek-V4-Flash-4bit',
+      model_id: 'Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX',
       runtime: 'openai-compatible',
       is_stub: false,
     },

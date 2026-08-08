@@ -214,7 +214,7 @@ def _initial_state(run_id: str):
         task_type="bridge_inspection",
         objective="检查桥梁无人机影像质量",
         artifact_ids=["art_001"],
-        agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+        agent_model={"model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"},
     )
 
 
@@ -621,7 +621,7 @@ Add a failed terminal snapshot test:
 failed = repository.fail_run(
     "run_001",
     "image quality failed",
-    agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+    agent_model={"model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"},
     workflow={
         "status": "failed",
         "current_step": "failed",
@@ -631,7 +631,7 @@ failed = repository.fail_run(
 )
 
 assert failed.status == "failed"
-assert failed.agent_model["model_id"] == "DeepSeek-V4-Flash-4bit"
+assert failed.agent_model["model_id"] == "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"
 assert failed.workflow["current_step"] == "failed"
 assert failed.tool_results[0]["ok"] is False
 ```

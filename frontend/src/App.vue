@@ -297,7 +297,7 @@ onMounted(() => {
         <dl class="meta-list">
           <div>
             <dt>Model</dt>
-            <dd>{{ selectedRun?.agent_model.model_id ?? 'DeepSeek-V4-Flash-4bit' }}</dd>
+            <dd>{{ selectedRun?.agent_model.model_id ?? 'Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX' }}</dd>
           </div>
           <div>
             <dt>Runtime</dt>

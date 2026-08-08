@@ -12,7 +12,7 @@ const run: TaskRunRecord = {
   workflow_runtime: 'langgraph',
   checkpoint_thread_id: 'run_001',
   agent_model: {
-    model_id: 'DeepSeek-V4-Flash-4bit',
+    model_id: 'Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX',
     runtime: 'openai-compatible',
     is_stub: false,
   },

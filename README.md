@@ -105,4 +105,4 @@ POST /api/v1/tasks/{task_id}/runs
 
 当前 `agent/`、`backend/`、`frontend/`、`tools/` 和 `examples/` 已承载 V0.2 可运行工程及第一段 V0.3 Artifact/图像质量切片。后续仍需补齐对象存储适配、更多巡检 Tool、异步执行、病害复核、报告闭环和部署能力。
 
-当前 Agent 默认模型配置为 oMLX 的 `DeepSeek-V4-Flash-4bit`，API base URL 为 `https://omlx.cpolar.cn/v1`。当前 V0.2 已在任务理解阶段通过 OpenAI-compatible Model Gateway 调用该模型，并随 Workflow 返回模型理解结果、模型 Profile 和 usage。
+当前 Agent 默认模型配置为 oMLX 的 `Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX`，API base URL 为 `http://127.0.0.1:18000/v1`。当前 V0.2 已在任务理解阶段通过 OpenAI-compatible Model Gateway 调用该模型，并随 Workflow 返回模型理解结果、模型 Profile 和 usage。

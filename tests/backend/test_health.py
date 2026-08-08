@@ -29,8 +29,8 @@ def test_local_health_marks_database_ready_and_model_gateway_configured():
         {
             "BRIDGEAI_ENV": "local_dev",
             "BRIDGEAI_DATABASE_URL": "postgresql://bridgeai:bridgeai@localhost:5432/bridgeai",
-            "BRIDGEAI_AGENT_MODEL_ID": "DeepSeek-V4-Flash-4bit",
-            "BRIDGEAI_AGENT_API_BASE_URL": "https://omlx.cpolar.cn/v1",
+            "BRIDGEAI_AGENT_MODEL_ID": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX",
+            "BRIDGEAI_AGENT_API_BASE_URL": "http://127.0.0.1:18000/v1",
             "BRIDGEAI_AGENT_API_KEY": "secret-token",
         },
         database_probe=lambda _url: True,

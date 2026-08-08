@@ -22,7 +22,7 @@ def test_openai_compatible_gateway_posts_task_understanding_request():
             },
         )
         return {
-            "model": "DeepSeek-V4-Flash-4bit",
+            "model": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX",
             "choices": [
                 {
                     "message": {
@@ -51,7 +51,7 @@ def test_openai_compatible_gateway_posts_task_understanding_request():
 
     assert result.as_payload() == {
         "ok": True,
-        "model_id": "DeepSeek-V4-Flash-4bit",
+        "model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX",
         "provider": "omlx",
         "runtime": "openai-compatible",
         "content": "任务理解：检查 Artifact 影像质量，并进入数据检查。",
@@ -60,13 +60,13 @@ def test_openai_compatible_gateway_posts_task_understanding_request():
     }
     assert calls == [
         {
-            "url": "https://omlx.cpolar.cn/v1/chat/completions",
+            "url": "http://127.0.0.1:18000/v1/chat/completions",
             "headers": {
                 "Authorization": "Bearer secret-token",
                 "Content-Type": "application/json",
             },
             "payload": {
-                "model": "DeepSeek-V4-Flash-4bit",
+                "model": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX",
                 "messages": [
                     {
                         "role": "system",

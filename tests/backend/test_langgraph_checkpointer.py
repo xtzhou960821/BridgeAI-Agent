@@ -64,7 +64,7 @@ def _initial_state(run_id: str):
         task_type="bridge_inspection",
         objective="检查桥梁无人机影像质量",
         artifact_ids=["art_001"],
-        agent_model={"model_id": "DeepSeek-V4-Flash-4bit"},
+        agent_model={"model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"},
     )
 
 
@@ -95,7 +95,7 @@ class _FakeModelGateway:
         return _FakeModelResult(
             {
                 "ok": True,
-                "model_id": "DeepSeek-V4-Flash-4bit",
+                "model_id": "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX",
                 "provider": "omlx",
                 "runtime": "openai-compatible",
                 "content": f"任务理解完成：{request.objective}",

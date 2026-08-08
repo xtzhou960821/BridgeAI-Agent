@@ -36,12 +36,12 @@ def default_model_profile(
 ) -> AgentModelProfile:
     source = os.environ if environ is None else environ
     return AgentModelProfile(
-        model_id=source.get("BRIDGEAI_AGENT_MODEL_ID", "DeepSeek-V4-Flash-4bit"),
+        model_id=source.get("BRIDGEAI_AGENT_MODEL_ID", "Vontra-DeepSeek-V4-Flash-0731-MXFP4-MLX"),
         model_version=source.get("BRIDGEAI_AGENT_MODEL_VERSION", "omlx-current"),
-        alias=source.get("BRIDGEAI_AGENT_MODEL_ALIAS", "omlx-deepseek-v4-flash"),
+        alias=source.get("BRIDGEAI_AGENT_MODEL_ALIAS", "omlx-vontra-deepseek-v4-flash"),
         provider=source.get("BRIDGEAI_AGENT_MODEL_PROVIDER", "omlx"),
         runtime=source.get("BRIDGEAI_AGENT_MODEL_RUNTIME", "openai-compatible"),
-        api_base_url=source.get("BRIDGEAI_AGENT_API_BASE_URL", "https://omlx.cpolar.cn/v1"),
+        api_base_url=source.get("BRIDGEAI_AGENT_API_BASE_URL", "http://127.0.0.1:18000/v1"),
         is_stub=_parse_bool(source.get("BRIDGEAI_AGENT_MODEL_IS_STUB", "false")),
     )
 
